@@ -1,233 +1,822 @@
-from flask import Flask, request, jsonify, redirect
-import os, json
+"""
+Nnanna Michael - single-file trading robot.
+Strategy: 30m major BOS -> liquidity (last OB/wick in the BOS leg) -> entry at TOP of the OB below it
+(bullish; bottom of the OB above it for bearish) -> SL at protected low/high -> TP at 1:RR.
+Everything (liquidity + entry OB) is taken from INSIDE the leg of the latest BOS.
+Env vars: ADMIN_PASSWORD, SECRET_KEY, WEBHOOK_SECRET (optional), AUTOSCAN=1, ANTHROPIC_API_KEY (optional, image analysis)
+"""
+import os, re, json, hmac, hashlib, time, datetime, threading, uuid, base64
+import urllib.request, urllib.parse, urllib.error
+from decimal import Decimal, ROUND_DOWN
+from flask import Flask, request, jsonify, redirect, session, send_from_directory, abort
+from markupsafe import escape
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
-PERMANENT_API = "https://trading-bot-api-isig.onrender.com"
-DATA_FILE = "bot_data.json"
+app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24).hex())
+app.config.update(SESSION_COOKIE_SAMESITE="Lax", SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SECURE=bool(os.environ.get("RENDER")),
+                  PERMANENT_SESSION_LIFETIME=datetime.timedelta(hours=12), MAX_CONTENT_LENGTH=8 * 1024 * 1024)
+DATA_DIR = os.environ.get("DATA_DIR", ".")      # on Render: mount a disk at /var/data and set DATA_DIR=/var/data
+DATA_FILE, UPLOADS = os.path.join(DATA_DIR, "bot_data.json"), os.path.join(DATA_DIR, "uploads")
+os.makedirs(UPLOADS, exist_ok=True)
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD") or "Mick@2008"   # first-login password; change it inside Admin > Security
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+LOCK = threading.Lock()
 
-default_settings = {
-    "platforms": ["MT5","MT4","CTRADER","TRADINGVIEW","BYBIT","BINANCE","OKX","DERIV","KUCOIN","EXNESS","FBS","FTMO","ICMARKETS"],
-    "admin_password": "isigadmin123",
-    "site_name": "ISIG BOT",
-    "max_accounts": 500
+DEFAULTS = {
+    "site_name": "Nnanna Michael", "tagline": "Automated Trading Robot",
+    "lead": "A smart-money trading bot that reads market structure for you: it spots the break of structure, finds the liquidity, and places the entry, stop loss and take profit automatically. Every trade is recorded so you can see the real results.",
+    "max_accounts": 500,
+    "platforms": ["BINANCE", "BYBIT", "OKX", "BITGET", "MT5", "MT4"],
+    "symbols": ["BTCUSDT", "ETHUSDT"], "timeframe": "30m",   # crypto = ends with USDT; anything else (EURUSD, XAUUSD...) is traded through MT4/MT5
+    "swing_n": 2, "min_bos": 2, "rr": 2.0, "ob_entry": "top",   # top | mid
+    "risk_pct": 1.0,
+    "mode": "paper",                                              # paper | live
+    "filters": {"liquidity": [], "session": [], "side": [], "bos_run": []},   # learned skips, e.g. {"session": ["Asia"]}
+    "strategy_text": "30m trend by consecutive major BOS. Liquidity = last order block (or wick) before the latest BOS. "
+                     "Entry = top of the OB below the liquidity (bullish), bottom of the OB above it (bearish). "
+                     "SL at protected low/high of the BOS leg. TP = 1:2.",
 }
 
-def load_data():
+BRAND_KEYS = ("site_name", "tagline", "lead")
+
+# ---------------- storage ----------------
+def load():
+    d = {"settings": {}, "accounts": [], "orders": [], "seen": [], "journal": [], "lessons": "", "admin_hash": None}
     if os.path.exists(DATA_FILE):
         try:
-            with open(DATA_FILE,'r') as f: return json.load(f)
-        except: pass
-    return {"settings": default_settings, "accounts": [], "orders": []}
+            with open(DATA_FILE) as f: d.update(json.load(f))
+        except Exception: pass
+    d["settings"] = {**DEFAULTS, **d["settings"]}
+    if d["settings"].get("site_name") in ("", "ISIG BOT"): d["settings"]["site_name"] = DEFAULTS["site_name"]   # rename old saved brand
+    return d
 
-def save_data(data):
-    with open(DATA_FILE,'w') as f: json.dump(f,data, indent=2)
+def save(d):
+    tmp = DATA_FILE + ".tmp"
+    with open(tmp, "w") as f: json.dump(d, f, indent=2)
+    os.replace(tmp, DATA_FILE)
 
-def layout(title, content):
-    s = load_data()['settings']
-    return f"""
-<html><head><meta name='viewport' content='width=device-width, initial-scale=1'>
-<title>{title} - {s['site_name']}</title>
-<style>
-*{{margin:0;padding:0;box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif}}
-body{{background:#f8fafc;color:#0f172a;line-height:1.6}}
-.nav{{background:white;border-bottom:1px solid #e2e8f0;padding:14px 20px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:99}}
-.logo{{font-weight:900;font-size:20px;color:#2563eb}} .logo b{{color:#0f172a}}
-.links a{{text-decoration:none;color:#475569;font-weight:600;font-size:13px;margin-left:14px;padding:8px 12px;border-radius:8px}} .links a:hover{{background:#f1f5f9;color:#2563eb}}
-.links a.active{{background:#0f172a;color:white}}
-.card{{background:white;border:1px solid #e2e8f0;border-radius:14px;padding:22px;margin:16px auto;max-width:1100px;box-shadow:0 2px 10px rgba(0,0,0,0.03)}}
-.btn{{background:#2563eb;color:white;padding:12px 20px;border-radius:10px;text-decoration:none;font-weight:700;border:none;display:inline-block;cursor:pointer;font-size:14px}}
-.btn-dark{{background:#0f172a}} .btn-green{{background:#16a34a}} .btn-outline{{background:white;color:#0f172a;border:1px solid #e2e8f0}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}}
-.input{{width:100%;padding:12px;border:1px solid #e2e8f0;border-radius:10px;margin-top:6px}} label{{font-weight:600;font-size:13px;color:#334155}}
-.badge{{background:#dcfce7;color:#16a34a;padding:4px 10px;border-radius:20px;font-size:11px;font-weight:700}} .muted{{color:#64748b;font-size:13px}}
-.hero{{background:white;text-align:center;padding:40px 20px;border-bottom:1px solid #e2e8f0}}
-.step{{background:#f8fafc;border:1px dashed #cbd5e1;padding:14px;border-radius:10px;margin:10px 0}}
-.platform{{display:inline-block;border:1px solid #e2e8f0;background:white;padding:5px 10px;border-radius:20px;font-size:11px;font-weight:700;margin:3px}}
-.footer{{text-align:center;padding:20px;color:#94a3b8;font-size:11px}}
-</style></head><body>
-<div class='nav'>
-  <div class='logo'>{s['site_name']} <b>PRO</b></div>
-  <div class='links'>
-    <a href='/'>HOME</a><a href='/setup'>SETUP</a><a href='/api'>API</a><a href='/orders'>ORDERS</a><a href='/settings'>SETTINGS</a><a href='/admin'>ADMIN</a>
-  </div>
-</div>
-{content}
-<div class='footer'>Permanent API: {PERMANENT_API} | {s['site_name']} © 2026 | Live: trading-bot-api-isig.onrender.com</div>
-</body></html>
+# ---------------- strategy engine ----------------
+def fetch_candles(symbol, interval="30m", limit=300):
+    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    with urllib.request.urlopen(url, timeout=10) as r: rows = json.loads(r.read())[:-1]   # drop forming candle
+    return [{"t": x[0], "o": float(x[1]), "h": float(x[2]), "l": float(x[3]), "c": float(x[4])} for x in rows]
+
+def _swing(c, i, n, kind):
+    k = "h" if kind == "high" else "l"
+    w = [x[k] for x in c[i - n:i + n + 1]]
+    return c[i][k] == (max(w) if kind == "high" else min(w))
+
+def bos_events(c, n):
+    ev, hi, lo = [], None, None
+    for i in range(2 * n, len(c)):
+        j = i - n
+        if _swing(c, j, n, "high"): hi = (j, c[j]["h"])
+        if _swing(c, j, n, "low"): lo = (j, c[j]["l"])
+        if hi and c[i]["c"] > hi[1]: ev.append({"dir": "bull", "i": i, "broken": hi}); hi = None
+        elif lo and c[i]["c"] < lo[1]: ev.append({"dir": "bear", "i": i, "broken": lo}); lo = None
+    return ev
+
+def find_setup(c, s):
+    n, rr, min_bos = s["swing_n"], s["rr"], s["min_bos"]
+    ev = bos_events(c, n)
+    if len(ev) < min_bos: return None
+    last = ev[-1]
+    if any(e["dir"] != last["dir"] for e in ev[-min_bos:]): return None      # no clear trend
+    run = 0
+    for e in reversed(ev):
+        if e["dir"] != last["dir"]: break
+        run += 1
+    bull, bos_i, broken_i = last["dir"] == "bull", last["i"], last["broken"][0]
+
+    prior = [j for j in range(n, broken_i) if _swing(c, j, n, "low" if bull else "high")]
+    start = prior[-1] if prior else max(0, broken_i - 10)
+    leg = range(start, bos_i + 1)                                              # the BOS leg
+    origin = min(leg, key=lambda k: c[k]["l"]) if bull else max(leg, key=lambda k: c[k]["h"])
+    protected = c[origin]["l"] if bull else c[origin]["h"]
+
+    is_ob = (lambda x: x["c"] < x["o"]) if bull else (lambda x: x["c"] > x["o"])
+    obs = [k for k in range(origin, bos_i) if is_ob(c[k])]                     # only candles inside the leg
+    if obs:
+        liq = obs[-1]; kind = "order_block"
+        lower = [k for k in obs if k < liq and (c[k]["l"] < c[liq]["l"] if bull else c[k]["h"] > c[liq]["h"])]
+        ent = lower[-1] if lower else origin
+    else:
+        wick = (lambda x: min(x["o"], x["c"]) - x["l"]) if bull else (lambda x: x["h"] - max(x["o"], x["c"]))
+        liq = max(range(origin, bos_i), key=lambda k: wick(c[k]), default=origin); kind, ent = "wick", origin
+    ob = c[ent]
+    if bull: entry, sl = (ob["h"] if s["ob_entry"] == "top" else (ob["h"] + ob["l"]) / 2), protected
+    else:    entry, sl = (ob["l"] if s["ob_entry"] == "top" else (ob["h"] + ob["l"]) / 2), protected
+    risk = (entry - sl) if bull else (sl - entry)
+    if risk <= 0: return None
+    tp = entry + rr * risk if bull else entry - rr * risk
+
+    after, price = c[bos_i + 1:], c[-1]["c"]
+    if bull and (any(x["l"] <= entry for x in after) or price <= entry): return None   # already tapped / stale
+    if not bull and (any(x["h"] >= entry for x in after) or price >= entry): return None
+    h = datetime.datetime.utcnow().hour
+    sess = "Asia" if h < 7 else "London" if h < 13 else "NY" if h < 21 else "Late"
+    return {"side": "BUY" if bull else "SELL", "entry": entry, "sl": sl, "tp": tp, "rr": rr, "liquidity": kind,
+            "session": sess, "bos_run": min(run, 5), "key": f"{last['dir']}-{c[bos_i]['t']}", "last_t": c[-1]["t"]}
+
+def resolve(o, candles):
+    """Walk candles since the order was created: PENDING -> OPEN -> WIN/LOSS/EXPIRED. SL wins ties (conservative)."""
+    if o.get("outcome") not in ("PENDING", "OPEN"): return False
+    bull, ch = o["side"] == "BUY", False
+    for k in candles:
+        if k["t"] <= o["last_t"]: continue
+        o["last_t"] = k["t"]; o["bars"] = o.get("bars", 0) + 1
+        if o["outcome"] == "PENDING":
+            if (k["l"] <= o["entry"]) if bull else (k["h"] >= o["entry"]): o["outcome"] = "OPEN"; ch = True
+            elif o["bars"] > 150: o["outcome"] = "EXPIRED"; return True
+            else: continue
+        sl_hit = (k["l"] <= o["sl"]) if bull else (k["h"] >= o["sl"])
+        tp_hit = (k["h"] >= o["tp"]) if bull else (k["l"] <= o["tp"])
+        if sl_hit: o["outcome"], o["r"] = "LOSS", -1.0; return True
+        if tp_hit: o["outcome"], o["r"] = "WIN", o["rr"]; return True
+    return ch
+
+def stats(orders):
+    seen, rows = set(), []
+    for o in orders:
+        if o.get("outcome") in ("WIN", "LOSS") and o.get("key") not in seen: seen.add(o["key"]); rows.append(o)
+    out = {}
+    for f in ("side", "liquidity", "session", "bos_run"):
+        g = {}
+        for o in rows: g.setdefault(str(o.get(f)), []).append(o["r"])
+        out[f] = {k: {"n": len(v), "win": round(100 * sum(x > 0 for x in v) / len(v)), "exp": round(sum(v) / len(v), 2)} for k, v in g.items()}
+    return out, len(rows)
+
+def perf(orders, view="all"):
+    """Track record. R-stats count each signal once; money sums every placed order (risk_amount x R)."""
+    paper = lambda o: str(o.get("status", "")).startswith("PAPER")
+    sel = [o for o in orders if o.get("outcome") in ("WIN", "LOSS") and (view == "all" or (view == "paper") == paper(o))]
+    sel.sort(key=lambda o: o.get("time", ""))
+    seen, sig = set(), []
+    for o in sel:
+        if o.get("key") not in seen: seen.add(o.get("key")); sig.append(o)
+    wins, losses = [o["r"] for o in sig if o["r"] > 0], [o["r"] for o in sig if o["r"] <= 0]
+    curve, tot, peak, dd = [0.0], 0.0, 0.0, 0.0
+    for o in sig:
+        tot += o["r"]; curve.append(round(tot, 2)); peak = max(peak, tot); dd = max(dd, peak - tot)
+    n = len(sig)
+    return {"trades": n, "wins": len(wins), "losses": len(losses), "win_rate": round(100 * len(wins) / n, 1) if n else 0,
+            "total_r": round(tot, 2), "avg_r": round(tot / n, 2) if n else 0, "avg_win_r": round(sum(wins) / len(wins), 2) if wins else 0,
+            "avg_loss_r": round(sum(losses) / len(losses), 2) if losses else 0,
+            "profit_factor": round(sum(wins) / abs(sum(losses)), 2) if losses and sum(losses) else None,
+            "max_drawdown_r": round(dd, 2), "money": round(sum(o.get("risk_amount", 0) * o["r"] for o in sel), 2), "curve": curve}
+
+# ---------------- execution ----------------
+def bn(acc, method, path, params=None, signed=True):
+    base = "https://testnet.binancefuture.com" if acc.get("server", "").lower() == "testnet" else "https://fapi.binance.com"
+    p, hdr = dict(params or {}), {}
+    if signed:
+        p.update(timestamp=int(time.time() * 1000), recvWindow=5000)
+        q = urllib.parse.urlencode(p)
+        q += "&signature=" + hmac.new(acc["password"].encode(), q.encode(), hashlib.sha256).hexdigest()
+        hdr["X-MBX-APIKEY"] = acc["login"]
+    else: q = urllib.parse.urlencode(p)
+    try:
+        with urllib.request.urlopen(urllib.request.Request(f"{base}{path}?{q}", method=method, headers=hdr), timeout=15) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e: raise RuntimeError(e.read().decode()[:300])
+
+_filters = {}
+def sym_filters(acc, sym):
+    k = (acc.get("server", ""), sym)
+    if k not in _filters:
+        info = bn(acc, "GET", "/fapi/v1/exchangeInfo", signed=False)
+        for s_ in info["symbols"]:
+            f = {x["filterType"]: x for x in s_["filters"]}
+            _filters[(acc.get("server", ""), s_["symbol"])] = {"tick": f["PRICE_FILTER"]["tickSize"], "step": f["LOT_SIZE"]["stepSize"], "min": f["LOT_SIZE"]["minQty"]}
+    return _filters[k]
+
+def q_floor(x, step): return str((Decimal(str(x)) / Decimal(step)).to_integral_value(ROUND_DOWN) * Decimal(step))
+
+def live_binance(acc, o):
+    f = sym_filters(acc, o["symbol"])
+    qty, side = q_floor(o["size"], f["step"]), o["side"]
+    if Decimal(qty) < Decimal(f["min"]): raise RuntimeError(f"size {qty} below min {f['min']}")
+    opp = "SELL" if side == "BUY" else "BUY"
+    bn(acc, "POST", "/fapi/v1/order", {"symbol": o["symbol"], "side": side, "type": "LIMIT", "timeInForce": "GTC", "quantity": qty, "price": q_floor(o["entry"], f["tick"])})
+    bn(acc, "POST", "/fapi/v1/order", {"symbol": o["symbol"], "side": opp, "type": "STOP_MARKET", "stopPrice": q_floor(o["sl"], f["tick"]), "closePosition": "true", "workingType": "MARK_PRICE"})
+    bn(acc, "POST", "/fapi/v1/order", {"symbol": o["symbol"], "side": opp, "type": "TAKE_PROFIT_MARKET", "stopPrice": q_floor(o["tp"], f["tick"]), "closePosition": "true", "workingType": "MARK_PRICE"})
+
+def by(acc, method, path, params=None, body=None):
+    base = "https://api-testnet.bybit.com" if acc.get("server", "").lower() == "testnet" else "https://api.bybit.com"
+    ts, rw = str(int(time.time() * 1000)), "5000"
+    if method == "GET": payload = urllib.parse.urlencode(params or {}); url, data = f"{base}{path}?{payload}", None
+    else: payload = json.dumps(body or {}); url, data = base + path, payload.encode()
+    sign = hmac.new(acc["password"].encode(), (ts + acc["login"] + rw + payload).encode(), hashlib.sha256).hexdigest()
+    hdr = {"X-BAPI-API-KEY": acc["login"], "X-BAPI-TIMESTAMP": ts, "X-BAPI-SIGN": sign, "X-BAPI-RECV-WINDOW": rw, "Content-Type": "application/json"}
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, data=data, method=method, headers=hdr), timeout=15) as r: j = json.loads(r.read())
+    except urllib.error.HTTPError as e: raise RuntimeError(e.read().decode()[:300])
+    if j.get("retCode") != 0: raise RuntimeError(str(j.get("retMsg")))
+    return j["result"]
+
+def live_bybit(acc, o):
+    """USDT perpetuals (category=linear), one-way mode. Entry limit order with SL/TP attached to it."""
+    r = by(acc, "GET", "/v5/market/instrument-info", {"category": "linear", "symbol": o["symbol"]})["list"][0]
+    step, mn, tick = r["lotSizeFilter"]["qtyStep"], r["lotSizeFilter"]["minOrderQty"], r["priceFilter"]["tickSize"]
+    qty = q_floor(o["size"], step)
+    if Decimal(qty) < Decimal(mn): raise RuntimeError(f"size {qty} below min {mn}")
+    by(acc, "POST", "/v5/order/create", body={"category": "linear", "symbol": o["symbol"], "side": "Buy" if o["side"] == "BUY" else "Sell",
+        "orderType": "Limit", "qty": qty, "price": q_floor(o["entry"], tick), "timeInForce": "GTC", "positionIdx": 0,
+        "stopLoss": q_floor(o["sl"], tick), "takeProfit": q_floor(o["tp"], tick), "slTriggerBy": "MarkPrice", "tpTriggerBy": "MarkPrice"})
+
+def _http(url, method="GET", data=None, hdr=None):
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, data=data, method=method, headers=hdr or {}), timeout=20) as r:
+            return json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e: raise RuntimeError(e.read().decode()[:300])
+
+def _b64sign(secret, msg): return base64.b64encode(hmac.new(secret.encode(), msg.encode(), hashlib.sha256).digest()).decode()
+
+def okx(acc, method, path, body=None, params=None):
+    if params: path += "?" + urllib.parse.urlencode(params)
+    now = datetime.datetime.utcnow(); ts = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+    payload = json.dumps(body) if body else ""
+    hdr = {"OK-ACCESS-KEY": acc["login"], "OK-ACCESS-SIGN": _b64sign(acc["password"], ts + method + path + payload), "OK-ACCESS-TIMESTAMP": ts,
+           "OK-ACCESS-PASSPHRASE": acc.get("extra", ""), "Content-Type": "application/json"}
+    if acc.get("server", "").lower() == "testnet": hdr["x-simulated-trading"] = "1"
+    j = _http("https://www.okx.com" + path, method, payload.encode() if payload else None, hdr)
+    if j.get("code") != "0": raise RuntimeError(j.get("msg") or str(j)[:200])
+    return j["data"]
+
+def live_okx(acc, o):
+    inst = o["symbol"][:-4] + "-USDT-SWAP"
+    i = okx(acc, "GET", "/api/v5/public/instruments", params={"instType": "SWAP", "instId": inst})[0]
+    sz = q_floor(Decimal(str(o["size"])) / Decimal(i["ctVal"]), i["lotSz"])
+    if Decimal(sz) < Decimal(i["minSz"]): raise RuntimeError(f"size {sz} below min {i['minSz']}")
+    tick = i["tickSz"]
+    r = okx(acc, "POST", "/api/v5/trade/order", body={"instId": inst, "tdMode": "cross", "side": o["side"].lower(), "ordType": "limit", "sz": sz,
+        "px": q_floor(o["entry"], tick), "attachAlgoOrds": [{"tpTriggerPx": q_floor(o["tp"], tick), "tpOrdPx": "-1", "slTriggerPx": q_floor(o["sl"], tick), "slOrdPx": "-1"}]})
+    if r[0].get("sCode") != "0": raise RuntimeError(r[0].get("sMsg"))
+    return r[0]["ordId"]
+
+def bitget(acc, method, path, body=None, params=None):
+    if params: path += "?" + urllib.parse.urlencode(params)
+    ts = str(int(time.time() * 1000)); payload = json.dumps(body) if body else ""
+    hdr = {"ACCESS-KEY": acc["login"], "ACCESS-SIGN": _b64sign(acc["password"], ts + method + path + payload), "ACCESS-TIMESTAMP": ts,
+           "ACCESS-PASSPHRASE": acc.get("extra", ""), "Content-Type": "application/json", "locale": "en-US"}
+    j = _http("https://api.bitget.com" + path, method, payload.encode() if payload else None, hdr)
+    if j.get("code") != "00000": raise RuntimeError(j.get("msg") or str(j)[:200])
+    return j["data"]
+
+def live_bitget(acc, o):
+    c = bitget(acc, "GET", "/api/v2/mix/market/contracts", params={"productType": "USDT-FUTURES", "symbol": o["symbol"]})[0]
+    vp, pp = int(c["volumePlace"]), int(c["pricePlace"])
+    step = max(Decimal(str(c.get("sizeMultiplier") or 0)), Decimal(1).scaleb(-vp))
+    qty = q_floor(o["size"], str(step))
+    if Decimal(qty) < Decimal(str(c["minTradeNum"])): raise RuntimeError(f"size {qty} below min {c['minTradeNum']}")
+    tick = str(Decimal(1).scaleb(-pp))
+    r = bitget(acc, "POST", "/api/v2/mix/order/place-order", body={"symbol": o["symbol"], "productType": "USDT-FUTURES", "marginMode": "crossed", "marginCoin": "USDT",
+        "size": qty, "price": q_floor(o["entry"], tick), "side": o["side"].lower(), "orderType": "limit", "force": "gtc",
+        "presetStopLossPrice": q_floor(o["sl"], tick), "presetStopSurplusPrice": q_floor(o["tp"], tick)})
+    return r.get("orderId")
+
+TF_MS = lambda tf: int(tf[:-1]) * {"m": 60000, "h": 3600000, "d": 86400000}[tf[-1]]
+
+def meta(acc, method, path, body=None, market=False):
+    """MetaApi.cloud REST: one connection for ANY MT4/MT5 broker (Exness, FBS, FTMO, IC Markets...). login=API token, extra=accountId, server=region."""
+    host = ("mt-market-data-client-api-v1." if market else "mt-client-api-v1.") + (acc.get("server") or "new-york") + ".agiliumtrade.ai"
+    return _http(f"https://{host}/users/current/accounts/{acc['extra']}{path}", method, json.dumps(body).encode() if body else None,
+                 {"auth-token": acc["login"], "Content-Type": "application/json"})
+
+def fetch_candles_meta(acc, symbol, tf):
+    now = datetime.datetime.utcnow()
+    st = urllib.parse.quote(now.strftime("%Y-%m-%dT%H:%M:%S.000Z"))
+    rows = meta(acc, "GET", f"/historical-market-data/symbols/{symbol}/timeframes/{tf}/candles?startTime={st}&limit=300", market=True)
+    out = [{"t": int(datetime.datetime.strptime(k["time"][:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc).timestamp() * 1000),
+            "o": k["open"], "h": k["high"], "l": k["low"], "c": k["close"]} for k in rows]
+    out.sort(key=lambda x: x["t"])
+    if out and out[-1]["t"] + TF_MS(tf) > time.time() * 1000: out.pop()        # drop forming candle
+    return out
+
+def live_meta(acc, o):
+    sym = o["symbol"]; core = re.sub(r"[a-z._#]+$", "", sym)                  # EURUSDm -> EURUSD
+    try: sp = meta(acc, "GET", f"/symbols/{sym}/specification")
+    except Exception: sp = {}
+    cs = float(sp.get("contractSize") or (100 if core.startswith("XAU") else 100000))
+    step, mn, digits = float(sp.get("volumeStep") or 0.01), float(sp.get("minVolume") or 0.01), int(sp.get("digits") or 5)
+    dist = abs(o["entry"] - o["sl"])
+    if core.endswith("USD"): per_lot = dist * cs
+    elif core.startswith("USD"): per_lot = dist * cs / o["entry"]
+    else: raise RuntimeError("cross pairs not supported for auto lot sizing (USD account)")
+    lots = int(o["risk_amount"] / per_lot / step + 1e-9) * step
+    if lots < mn: raise RuntimeError(f"lot size {lots:.3f} below broker minimum {mn} (balance too small for this stop)")
+    r = meta(acc, "POST", "/trade", {"actionType": "ORDER_TYPE_BUY_LIMIT" if o["side"] == "BUY" else "ORDER_TYPE_SELL_LIMIT", "symbol": sym,
+        "volume": round(lots, 3), "openPrice": round(o["entry"], digits), "stopLoss": round(o["sl"], digits), "takeProfit": round(o["tp"], digits), "comment": "ISIGBOT"})
+    if r.get("stringCode") not in ("TRADE_RETCODE_DONE", "TRADE_RETCODE_PLACED"): raise RuntimeError(str(r.get("message") or r)[:200])
+    return r.get("orderId")
+
+LIVE = {"BINANCE": live_binance, "BYBIT": live_bybit, "OKX": live_okx, "BITGET": live_bitget, "MT4": live_meta, "MT5": live_meta}
+
+def cancel_orders(a, o):
+    p, sym = a["platform"], o["symbol"]
+    if p == "BINANCE": bn(a, "DELETE", "/fapi/v1/allOpenOrders", {"symbol": sym})
+    elif p == "BYBIT": by(a, "POST", "/v5/order/cancel-all", body={"category": "linear", "symbol": sym})
+    elif p == "OKX": okx(a, "POST", "/api/v5/trade/cancel-order", body={"instId": sym[:-4] + "-USDT-SWAP", "ordId": o["ext_id"]})
+    elif p == "BITGET": bitget(a, "POST", "/api/v2/mix/order/cancel-order", body={"symbol": sym, "productType": "USDT-FUTURES", "orderId": o["ext_id"]})
+    elif p in ("MT4", "MT5"): meta(a, "POST", "/trade", {"actionType": "ORDER_CANCEL", "orderId": o["ext_id"]})
+
+def balance(acc):
+    p = acc["platform"]
+    if p == "BINANCE": return float(next(x for x in bn(acc, "GET", "/fapi/v2/balance") if x["asset"] == "USDT")["balance"])
+    if p == "BYBIT": return float(by(acc, "GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED"})["list"][0]["totalEquity"])
+    if p == "OKX": return float(okx(acc, "GET", "/api/v5/account/balance")[0]["totalEq"])
+    if p == "BITGET": return float(next(x for x in bitget(acc, "GET", "/api/v2/mix/account/accounts", params={"productType": "USDT-FUTURES"}) if x["marginCoin"] == "USDT")["accountEquity"])
+    if p in ("MT4", "MT5"): return float(meta(acc, "GET", "/account-information")["balance"])
+    raise RuntimeError("unsupported platform")
+
+def is_fx(sym): return not sym.endswith("USDT")
+
+def place_order(acc, sig, sym, s):
+    bal = float(acc.get("balance") or 0)
+    if s["mode"] == "live":
+        try: bal = balance(acc)                                                # use the real balance for sizing
+        except Exception: pass
+    risk_amt = bal * s["risk_pct"] / 100
+    dist = abs(sig["entry"] - sig["sl"])
+    o = {"id": uuid.uuid4().hex[:8], "time": str(datetime.datetime.utcnow()), "account": acc["id"], "platform": acc["platform"],
+         "symbol": sym, "size": round(risk_amt / dist, 6) if dist else 0, "risk_amount": round(risk_amt, 2),
+         "outcome": "PENDING", "bars": 0, **sig}
+    if s["mode"] == "paper": o["status"] = "PAPER"
+    elif acc["platform"] in LIVE:
+        try: o["ext_id"] = LIVE[acc["platform"]](acc, o); o["status"] = "LIVE: orders sent"
+        except Exception as e: o["status"], o["outcome"] = f"LIVE FAILED: {e}", "REJECTED"
+    else: o["status"], o["outcome"] = f"REJECTED: no live adapter for {acc['platform']}", "REJECTED"
+    return o
+
+def run_scan():
+    with LOCK:
+        d = load(); s = d["settings"]; new, cache = [], {}
+        def candles(sym):
+            if sym not in cache:
+                if is_fx(sym):
+                    ma = next((a for a in d["accounts"] if a["platform"] in ("MT4", "MT5")), None)
+                    if not ma: raise RuntimeError(f"{sym}: add an MT4/MT5 account (via MetaApi) to get forex/gold candles")
+                    cache[sym] = fetch_candles_meta(ma, sym, s["timeframe"])
+                else: cache[sym] = fetch_candles(sym, s["timeframe"])
+            return cache[sym]
+        for o in d["orders"]:                                                  # 1) resolve open trades
+            if o.get("outcome") in ("PENDING", "OPEN"):
+                try:
+                    resolve(o, candles(o["symbol"]))
+                    if o["outcome"] == "EXPIRED" and o["status"].startswith("LIVE"):
+                        a = next((a for a in d["accounts"] if a["id"] == o["account"]), None)
+                        if a: cancel_orders(a, o)
+                except Exception: pass
+        for sym in s["symbols"]:                                               # 2) look for new setups
+            try: sig = find_setup(candles(sym), s)
+            except Exception as e:
+                new.append({"id": uuid.uuid4().hex[:8], "time": str(datetime.datetime.utcnow()), "symbol": sym, "status": f"DATA ERROR: {e}", "outcome": "ERROR"}); continue
+            if not sig or f"{sym}-{sig['key']}" in d["seen"]: continue
+            d["seen"] = (d["seen"] + [f"{sym}-{sig['key']}"])[-500:]
+            if any(str(sig[f]) in s["filters"].get(f, []) for f in s["filters"] if f in sig): continue   # learned filters
+            accs = [a for a in d["accounts"] if (a["platform"] in ("MT4", "MT5")) == is_fx(sym)] or [{"id": "-", "platform": "SIGNAL", "balance": 0}]
+            for a in accs:
+                busy = any(o.get("account") == a["id"] and o.get("symbol") == sym and o.get("outcome") in ("PENDING", "OPEN") for o in d["orders"] + new)
+                if not busy: new.append(place_order(a, sig, sym, s))
+        d["orders"] = (d["orders"] + new)[-5000:]; save(d); return new
+
+def autoscan():
+    while True:
+        try: run_scan()
+        except Exception as e: print("scan error", e)
+        time.sleep(300)
+if os.environ.get("AUTOSCAN") == "1": threading.Thread(target=autoscan, daemon=True).start()
+
+# ---------------- Claude (optional) for screenshot analysis ----------------
+def claude(content, system):
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key: return "Set ANTHROPIC_API_KEY to enable analysis."
+    body = json.dumps({"model": os.environ.get("ANALYSIS_MODEL", "claude-sonnet-5-5"), "max_tokens": 1500, "system": system,
+                       "messages": [{"role": "user", "content": content}]}).encode()
+    req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, method="POST",
+                                 headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=90) as r: j = json.loads(r.read())
+        return "".join(b.get("text", "") for b in j["content"])
+    except Exception as e: return f"Analysis failed: {e}"
+
+# ---------------- UI ----------------
+CSS = """
+:root{--bg:#f4f7fb;--ink:#0f172a;--mut:#64748b;--line:#e2e8f0;--brand:#2563eb;--brand2:#7c3aed}
+*{margin:0;padding:0;box-sizing:border-box;font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif}
+html{scroll-behavior:smooth}body{background:var(--bg);color:var(--ink);line-height:1.5}
+a{color:var(--brand)}
+.nav{position:sticky;top:0;z-index:50;background:rgba(255,255,255,.88);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-bottom:1px solid var(--line);padding:12px 24px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
+.logo{display:flex;align-items:center;gap:10px;font-weight:800;font-size:18px;color:var(--ink);text-decoration:none;letter-spacing:-.01em}
+.mark{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,var(--brand),var(--brand2));display:grid;place-items:center;box-shadow:0 6px 16px rgba(37,99,235,.35)}
+.links a{margin-left:4px;text-decoration:none;color:#475569;font-weight:700;font-size:12px;letter-spacing:.04em;padding:8px 12px;border-radius:999px;transition:.2s}
+.links a:hover{background:#eef2ff;color:var(--brand)}
+.card{background:#fff;border:1px solid var(--line);border-radius:18px;padding:22px;margin:16px auto;max-width:1100px;box-shadow:0 8px 30px rgba(15,23,42,.05);animation:fade .5s ease both}
+@keyframes fade{from{opacity:0;translate:0 10px}to{opacity:1;translate:0 0}}
+.btn{background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;padding:11px 18px;border-radius:12px;border:none;font-weight:700;cursor:pointer;text-decoration:none;display:inline-block;transition:.2s;box-shadow:0 8px 20px rgba(37,99,235,.25)}
+.btn:hover{transform:translateY(-2px);box-shadow:0 12px 28px rgba(37,99,235,.35)}
+.input{width:100%;padding:11px;border:1px solid var(--line);border-radius:12px;margin-top:4px;background:#fff;transition:.2s}
+.input:focus{outline:none;border-color:var(--brand);box-shadow:0 0 0 4px rgba(37,99,235,.12)}
+label{font-weight:600;font-size:12px;color:#334155}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}.muted{color:var(--mut);font-size:13px}
+pre{white-space:pre-wrap;background:#f1f5f9;padding:12px;border-radius:10px;font-size:12px;margin-top:6px}h2,h3{margin-bottom:8px}
+table th{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.05em}
+table tr:hover td{background:#f8fafc}
+.foot{text-align:center;color:var(--mut);font-size:12px;padding:30px 20px 40px}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 """
 
-@app.route('/')
-def home():
-    data=load_data()
-    plats="".join([f"<span class='platform'>{p}</span>" for p in data['settings']['platforms']])
-    return layout("Home", f"""
-<div class='hero'>
-  <div><span class='badge'>● LIVE - READY TO TRADE</span></div>
-  <div style='font-size:64px;margin:10px 0'>🚀🤖✨</div>
-  <h1 style='font-size:32px;font-weight:900;letter-spacing:-1px;'>Are you ready to start<br>trading with ISIG BOT?</h1>
-  <p class='muted' style='max-width:600px;margin:12px auto;font-size:15px;'>Connect to your <b>MT5 using your laptop</b> and automate trading across 13 platforms. No coding needed - just follow the simple steps below.</p>
-  <div style='margin-top:18px'><a href='#guide' class='btn'>👉 YES, SHOW ME HOW TO CONNECT MY MT5</a> <a href='/setup' class='btn btn-outline' style='margin-left:6px'>Go to Setup</a></div>
-  <div style='margin-top:20px'>{plats}</div>
-</div>
+LOGO_SVG = "<svg width='18' height='18' viewBox='0 0 18 18'><rect x='2' y='8' width='3' height='8' rx='1' fill='#fff'/><rect x='7.5' y='3' width='3' height='13' rx='1' fill='#fff'/><rect x='13' y='6' width='3' height='10' rx='1' fill='#fff' opacity='.85'/></svg>"
 
-<div class='card' id='guide'>
-<h2>📘 Complete Guide: How To Connect Your MT5 - Step By Step (Simple English)</h2>
-<p class='muted'>Follow these 5 steps only. After this, your bot will start trading automatically.</p>
+def layout(title, body):
+    name = escape(load()["settings"]["site_name"])
+    links = "".join(f"<a href='{h}'>{t}</a>" for h, t in (("/", "HOME"), ("/setup", "SETUP"), ("/performance", "PERFORMANCE"), ("/orders", "ORDERS"), ("/admin", "ADMIN")))
+    return (f"<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>{escape(title)} · {name}</title>"
+            f"<link rel='preconnect' href='https://fonts.googleapis.com'><link href='https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap' rel='stylesheet'>"
+            f"<style>{CSS}</style></head><body><div class='nav'><a class='logo' href='/'><span class='mark'>{LOGO_SVG}</span>{name}</a><div class='links'>{links}</div></div>{body}"
+            f"<div class='foot'>© {datetime.datetime.utcnow().year} {name} · Trading involves risk. Past results do not guarantee future results. Not financial advice.</div></body></html>")
 
-<div class='step'><b>STEP 1: Prepare Your Laptop & MT5</b><br>
-<span class='muted'>1. Open your laptop<br>2. Open your MT5 app (MetaTrader 5) - from Exness, FBS, Deriv, etc.<br>3. Login to your MT5 account - you should see your balance<br>4. At top of MT5, click <b>Tools → Options → Expert Advisors →</b> Tick <b>"Allow WebRequest for listed URL"</b> and add:<br><code>{PERMANENT_API}</code></span></div>
+FAILS = {}
+def _ip(): return (request.headers.get("X-Forwarded-For", request.remote_addr or "").split(",")[0]).strip()
+def _pw_hash(pw, salt): return hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), 200000).hex()
+def check_admin(pw):
+    """Password changed in the admin panel (stored hashed) wins; otherwise ADMIN_PASSWORD env var / built-in default."""
+    h = load().get("admin_hash")
+    if h: return hmac.compare_digest(_pw_hash(pw, h["salt"]).encode(), h["hash"].encode())
+    return hmac.compare_digest(pw.encode(), ADMIN_PASSWORD.encode())
 
-<div class='step'><b>STEP 2: Get Your MT5 Details</b><br>
-<span class='muted'>You need 3 things from MT5:<br>1. <b>Login ID</b> - your MT5 account number (e.g. 12345678)<br>2. <b>Password</b> - your MT5 trading password<br>3. <b>Server</b> - e.g. Exness-Real, FBS-Real, Deriv-Real. You can see server name in MT5 bottom right.<br>Write them down.</span></div>
+def admin_only(f):
+    def w(*a, **k):
+        if session.get("admin") is not True: return redirect("/admin")
+        return f(*a, **k)
+    w.__name__ = f.__name__; return w
 
-<div class='step'><b>STEP 3: Add Account In This Website</b><br>
-<span class='muted'>1. Click <a href='/setup'><b>SETUP</b></a> at top menu<br>2. Select how many accounts you want (e.g. Account 1)<br>3. Choose Platform: <b>MT5</b><br>4. Paste your Login ID, Password, Server<br>5. Click <b>Save Account</b> - it will be saved securely.</span></div>
+def _hero_chart(n=40, cw=22, h=300):
+    """Seamless, endlessly scrolling candlestick chart (pure SVG + CSS)."""
+    import random
+    r = random.Random(11); v = [0.0]
+    for _ in range(n): v.append(v[-1] + r.uniform(-14, 14))
+    drift = v[-1] / n
+    v = [x - drift * i for i, x in enumerate(v)]                 # detrend so the loop has no jump
+    rows = [(v[i], v[i + 1], max(v[i], v[i + 1]) + r.uniform(2, 9), min(v[i], v[i + 1]) - r.uniform(2, 9)) for i in range(n)]
+    lo, hi = min(x[3] for x in rows), max(x[2] for x in rows)
+    y = lambda val: 30 + (hi - val) / ((hi - lo) or 1) * (h - 90)
+    def grp(off):
+        g = ""
+        for i, (o, c, hh, ll) in enumerate(rows):
+            x = off + i * cw; col = "#22c55e" if c >= o else "#ef4444"; top, bot = y(max(o, c)), y(min(o, c))
+            g += f"<line x1='{x + 8:.1f}' x2='{x + 8:.1f}' y1='{y(hh):.1f}' y2='{y(ll):.1f}' stroke='{col}' stroke-width='2'/><rect x='{x:.1f}' y='{top:.1f}' width='16' height='{max(bot - top, 2):.1f}' rx='3' fill='{col}'/>"
+        return g
+    grid = "".join(f"<line x1='0' x2='520' y1='{gy}' y2='{gy}' stroke='#1e293b' stroke-width='1'/>" for gy in range(40, h, 50))
+    lv = lambda yy, col, txt: (f"<g class='lvl'><line x1='0' x2='520' y1='{yy}' y2='{yy}' stroke='{col}' stroke-width='1.5' stroke-dasharray='6 5'/>"
+                               f"<rect x='440' y='{yy - 10}' width='72' height='20' rx='10' fill='{col}'/><text x='476' y='{yy + 4}' text-anchor='middle' font-size='10' font-weight='800' fill='#fff'>{txt}</text></g>")
+    return (f"<svg viewBox='0 0 520 {h}' preserveAspectRatio='xMidYMid slice'><rect width='520' height='{h}' fill='#0b1220'/>{grid}"
+            f"<g class='scroll'>{grp(0)}{grp(n * cw)}</g>{lv(60, '#22c55e', 'TP 1:2')}{lv(150, '#3b82f6', 'ENTRY')}{lv(235, '#ef4444', 'SL')}</svg>")
 
-<div class='step'><b>STEP 4: Connect Using Your Laptop (Final Step)</b><br>
-<span class='muted'>Your bot lives online at <b>{PERMANENT_API}</b> - it is already connected to internet.<br>To link your MT5 on laptop to online bot, you need to run a small connector EA (Expert Advisor) on your MT5 chart.<br><b>Easy method:</b> In MT5, open any chart (e.g. EURUSD), drag any EA that sends WebRequest to your API. Or use my API endpoint: <code>/api/status</code> to test.<br>Once connected, you will see your MT5 account show <b>Connected ✅</b> in <a href='/setup'><b>SETUP page</b></a>.</span></div>
-
-<div class='step'><b>STEP 5: Start Trading</b><br>
-<span class='muted'>1. Go to <a href='/orders'><b>ORDERS page</b></a> - you will see live trades<br>2. Your bot will now copy signals or auto-trade based on your settings<br>3. You can leave laptop ON, MT5 running. Bot runs 24/7.<br><br><b>💡 Tip:</b> Keep MT5 open on laptop with internet. If laptop sleeps, use VPS.</span></div>
-
-<div style='background:#eff6ff;padding:14px;border-radius:10px;margin-top:12px'><b>❓ Need Help?</b><br><span class='muted'>Your Permanent API never changes: <b>{PERMANENT_API}</b><br>Use it in MT5 WebRequest. Go to ADMIN page to change platforms or add more accounts up to 500. Default admin password: isigadmin123 (you can change it in SETTINGS).</span></div>
-
-<div style='text-align:center;margin-top:18px'><a href='/setup' class='btn btn-green' style='padding:14px 28px;font-size:16px'>✅ I UNDERSTAND - GO TO SETUP NOW →</a></div>
-</div>
-
-<div class='card'><div class='grid'>
-<div><div class='muted'>Accounts</div><div style='font-size:24px;font-weight:800'>{len(data['accounts'])} / {data['settings']['max_accounts']}</div></div>
-<div><div class='muted'>Platforms</div><div style='font-size:24px;font-weight:800'>{len(data['settings']['platforms'])} Supported</div></div>
-<div><div class='muted'>API Status</div><div style='font-size:18px;font-weight:800;color:#16a34a'>● LIVE & ONLINE</div></div>
+HOME_TPL = """
+<style>
+.hero{position:relative;overflow:hidden;background:radial-gradient(1100px 560px at 85% -10%,#3730a3 0,transparent 60%),linear-gradient(135deg,#0b1220,#101a36 60%,#0b1220);color:#fff;padding:64px 24px 80px}
+.hero .in{max-width:1100px;margin:auto;display:grid;grid-template-columns:1.05fr .95fr;gap:40px;align-items:center;position:relative;z-index:2}
+@media(max-width:860px){.hero .in{grid-template-columns:1fr}.hero{padding-top:44px}}
+.orb{position:absolute;border-radius:50%;filter:blur(70px);opacity:.5;animation:float 10s ease-in-out infinite}
+.o1{width:340px;height:340px;background:#2563eb;left:-90px;top:-70px}.o2{width:300px;height:300px;background:#7c3aed;right:-70px;bottom:-90px;animation-delay:-5s}
+@keyframes float{50%{transform:translate(34px,-28px) scale(1.1)}}
+.badge{display:inline-flex;gap:8px;align-items:center;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.18);padding:6px 14px;border-radius:999px;font-size:12px;font-weight:700;letter-spacing:.04em}
+.dot{width:8px;height:8px;border-radius:50%;background:#22c55e;animation:pulse 1.8s infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(34,197,94,.7)}70%,100%{box-shadow:0 0 0 10px rgba(34,197,94,0)}}
+.hero h1{font-size:clamp(36px,6.4vw,60px);font-weight:900;line-height:1.04;margin:18px 0 14px;letter-spacing:-.02em}
+.grad{background:linear-gradient(90deg,#60a5fa,#c084fc,#22d3ee,#60a5fa);background-size:250% auto;-webkit-background-clip:text;background-clip:text;color:transparent;animation:shine 7s linear infinite}
+@keyframes shine{to{background-position:250% center}}
+.lead{color:#cbd5e1;font-size:17px;max-width:520px}
+.cta{display:flex;gap:10px;flex-wrap:wrap;margin-top:24px}
+.btn.ghost{background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.28);box-shadow:none}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:32px}
+@media(max-width:520px){.kpis{grid-template-columns:repeat(2,1fr)}}
+.kpi{background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.14);border-radius:14px;padding:12px 14px}
+.kpi b{display:block;font-size:24px;font-weight:800}.kpi span{font-size:11px;color:#94a3b8}
+.chartbox{position:relative;background:rgba(15,23,42,.7);border:1px solid rgba(255,255,255,.14);border-radius:22px;padding:14px;box-shadow:0 30px 80px rgba(0,0,0,.5);animation:bobbox 7s ease-in-out infinite}
+@keyframes bobbox{50%{transform:translateY(-8px)}}
+.chartbox svg{width:100%;height:auto;display:block;border-radius:14px}
+.chart-top{display:flex;justify-content:space-between;font-size:12px;font-weight:700;color:#94a3b8;margin:0 4px 10px}
+.chip{position:absolute;background:#fff;color:#0f172a;font-weight:800;font-size:11px;padding:7px 12px;border-radius:999px;box-shadow:0 10px 30px rgba(0,0,0,.4);animation:bob 4s ease-in-out infinite;white-space:nowrap}
+@keyframes bob{50%{transform:translateY(-12px)}}
+.c1{left:-12px;top:54px}.c2{right:-10px;top:120px;animation-delay:-1s}.c3{left:24px;bottom:-14px;animation-delay:-2s}.c4{right:34px;bottom:28px;animation-delay:-3s}
+.scroll{animation:scrollx 18s linear infinite}
+@keyframes scrollx{to{transform:translateX(-880px)}}
+.lvl{animation:blink 2.6s ease-in-out infinite}
+@keyframes blink{50%{opacity:.5}}
+.marq{overflow:hidden;background:#fff;border-bottom:1px solid var(--line);padding:16px 0}
+.tr{display:flex;width:max-content;animation:mq 28s linear infinite}
+.tr span{font-weight:800;color:#475569;letter-spacing:.14em;font-size:13px;margin-right:48px}
+@keyframes mq{to{transform:translateX(-50%)}}
+.sec{max-width:1100px;margin:52px auto;padding:0 20px}
+.sec h2{font-size:30px;font-weight:800;text-align:center;letter-spacing:-.01em}.sec .sub{text-align:center;color:var(--mut);margin:6px auto 26px;max-width:560px}
+.steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:16px}
+.step{background:#fff;border:1px solid var(--line);border-radius:20px;padding:22px;box-shadow:0 8px 24px rgba(15,23,42,.05);transition:transform .25s,box-shadow .25s;animation:up .7s both}
+@keyframes up{from{opacity:0;translate:0 22px}to{opacity:1;translate:0 0}}
+.step:hover{transform:translateY(-6px);box-shadow:0 18px 40px rgba(37,99,235,.18)}
+.step .n{width:42px;height:42px;border-radius:12px;background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;display:grid;place-items:center;font-weight:800;margin-bottom:14px}
+.step h3{font-size:17px}.step p{color:var(--mut);font-size:14px}
+.band{max-width:1060px;margin:56px auto;border-radius:24px;padding:42px 28px;text-align:center;color:#fff;background:linear-gradient(135deg,#1d4ed8,#7c3aed);position:relative;overflow:hidden}
+.band h2{font-size:28px;font-weight:800}.band p{opacity:.9;margin:8px 0 20px}
+.band .btn{background:#fff;color:#1d4ed8;box-shadow:none}
+.band::before{content:'';position:absolute;width:260px;height:260px;border-radius:50%;background:rgba(255,255,255,.12);right:-60px;top:-80px;animation:float 9s ease-in-out infinite}
+</style>
+<section class='hero'><div class='orb o1'></div><div class='orb o2'></div>
+<div class='in'>
+ <div>
+  <span class='badge'><span class='dot'></span>@@MODE@@ MODE · SCANNING THE MARKET</span>
+  <h1><span class='grad'>@@NAME@@</span><br>@@TAGLINE@@</h1>
+  <p class='lead'>@@LEAD@@</p>
+  <div class='cta'><a class='btn' href='/setup'>CONNECT ACCOUNT →</a><a class='btn ghost' href='/performance'>VIEW PERFORMANCE</a></div>
+  <div class='kpis'>
+   <div class='kpi'><b data-to='@@TRADES@@'>0</b><span>Closed trades</span></div>
+   <div class='kpi'><b data-to='@@WIN@@' data-dec='1' data-suf='%'>0</b><span>Win rate</span></div>
+   <div class='kpi'><b data-to='@@TOTALR@@' data-dec='2' data-pre='@@PRE@@' data-suf='R'>0</b><span>Total result</span></div>
+   <div class='kpi'><b data-to='@@NPLAT@@'>0</b><span>Platforms supported</span></div>
+  </div>
+ </div>
+ <div class='chartbox'>
+  <div class='chart-top'><span>@@META@@</span><span style='color:#22c55e'>● LIVE SETUP</span></div>
+  @@CHART@@
+  <span class='chip c1'>✔ Break of Structure</span><span class='chip c2'>💧 Liquidity</span><span class='chip c3'>🎯 Order Block Entry</span><span class='chip c4'>🛡 Protected SL</span>
+ </div>
+</div></section>
+<div class='marq'><div class='tr'>@@PLATS@@@@PLATS@@</div></div>
+<div class='sec'><h2>How the robot trades</h2><p class='sub'>Four clear steps, applied the same way every time, with no emotion and no guessing.</p>
+<div class='steps'>
+ <div class='step' style='animation-delay:.05s'><div class='n'>01</div><h3>Break of Structure</h3><p>Reads the @@TF@@ chart and confirms the trend from consecutive major breaks of structure.</p></div>
+ <div class='step' style='animation-delay:.15s'><div class='n'>02</div><h3>Finds the liquidity</h3><p>Marks the last order block or wick inside the latest break, where the big money sits.</p></div>
+ <div class='step' style='animation-delay:.25s'><div class='n'>03</div><h3>Precise entry</h3><p>Places a limit order at the order block below (or above) that liquidity zone.</p></div>
+ <div class='step' style='animation-delay:.35s'><div class='n'>04</div><h3>Risk managed</h3><p>Stop loss at the protected low or high, take profit at 1:@@RR@@, sized to risk only @@RISK@@% per trade.</p></div>
 </div></div>
-""")
+<div class='card'><h3>Strategy rules</h3><pre>@@STRAT@@</pre></div>
+<div class='band'><h2>Start with paper trading, go live when you trust it</h2><p>Connect your account, watch every trade get logged with its result, and judge the numbers yourself.</p><a class='btn' href='/setup'>CONNECT ACCOUNT →</a></div>
+<script>
+(function(){var reduce=window.matchMedia&&matchMedia('(prefers-reduced-motion: reduce)').matches;
+document.querySelectorAll('[data-to]').forEach(function(el){var to=parseFloat(el.dataset.to)||0,dec=+(el.dataset.dec||0),suf=el.dataset.suf||'',pre=el.dataset.pre||'';
+function show(v){el.textContent=pre+v.toFixed(dec)+suf}
+if(reduce){show(to);return}var t0=null;function f(t){if(!t0)t0=t;var k=Math.min((t-t0)/1500,1);show(to*(1-Math.pow(1-k,3)));if(k<1)requestAnimationFrame(f)}requestAnimationFrame(f)})})();
+</script>
+"""
 
-@app.route('/setup', methods=['GET'])
+@app.route("/")
+def home():
+    d = load(); s = d["settings"]; p = perf(d["orders"])
+    rep = {"@@NAME@@": str(escape(s["site_name"])), "@@MODE@@": str(escape(s["mode"])).upper(), "@@RR@@": str(s["rr"]), "@@RISK@@": str(s["risk_pct"]),
+           "@@TF@@": str(escape(s["timeframe"])), "@@TRADES@@": str(p["trades"]), "@@WIN@@": str(p["win_rate"]), "@@TOTALR@@": str(p["total_r"]),
+           "@@PRE@@": "+" if p["total_r"] >= 0 else "", "@@NPLAT@@": str(len(s["platforms"])), "@@CHART@@": _hero_chart(),
+           "@@META@@": str(escape(f"{s['timeframe']} · {', '.join(s['symbols'])}")), "@@PLATS@@": "".join(f"<span>{escape(x)}</span>" for x in s["platforms"]) * 3,
+           "@@STRAT@@": str(escape(s["strategy_text"])), "@@TAGLINE@@": str(escape(s["tagline"])), "@@LEAD@@": str(escape(s["lead"]))}
+    html = HOME_TPL
+    for k, v in rep.items(): html = html.replace(k, v)
+    return layout("Home", html)
+
+@app.route("/setup")
 def setup():
-    data=load_data()
-    max_acc=data['settings']['max_accounts']
-    opts="".join([f"<option value='{i}'>Account {i}</option>" for i in range(1, max_acc+1)])
-    plat_opts="".join([f"<option value='{p}'>{p}</option>" for p in data['settings']['platforms']])
-    acc_list="".join([f"<div style='border:1px solid #e2e8f0;padding:12px;border-radius:10px;margin:6px 0;background:#fcfdfe'><b>Account {a.get('id')}</b> - {a.get('platform')} - Login: {a.get('login')} - Server: {a.get('server')} <span class='badge'>Saved</span></div>" for a in data['accounts']]) or "<p class='muted'>No accounts saved yet. Add your first MT5 below.</p>"
-    return layout("Setup", f"""
-<div class='card'>
-<h2>Setup - Manage Trading Accounts (1 to {max_acc})</h2>
-<p class='muted'>Your saved accounts:</p>
-<div style='margin:12px 0'>{acc_list}</div>
-<hr style='margin:16px 0;border:none;border-top:1px solid #e2e8f0'>
-<h3>Add New Account</h3>
-<form action='/save_account' method='post' style='margin-top:12px'>
-<div class='grid'>
-<div><label>Account Number</label><select name='id' class='input'>{opts}</select></div>
-<div><label>Platform</label><select name='platform' class='input'>{plat_opts}</select></div>
-</div>
-<div class='grid' style='margin-top:10px'>
-<div><label>Login ID / API Key</label><input name='login' class='input' placeholder='e.g. 12345678' required></div>
-<div><label>Password / Secret</label><input name='password' type='password' class='input' placeholder='MT5 password' required></div>
-</div>
-<label style='margin-top:10px;display:block'>Server Name (for MT5/MT4)</label><input name='server' class='input' placeholder='e.g. Exness-Real, FBS-Real, Deriv-Real'>
-<br><br><button class='btn' type='submit'>💾 Save This Account</button> <a href='/' class='btn btn-outline'>Back to Guide</a>
-</form>
-<p class='muted' style='margin-top:12px'>Supports: MT5, MT4, cTrader, TradingView, Bybit, Binance, OKX, Deriv, Kucoin, Exness, FBS, FTMO, IC Markets - up to {max_acc} accounts.</p>
-</div>
-""")
+    d = load(); s = d["settings"]
+    if session.get("admin") is True:
+        saved = "".join(f"<div style='border:1px solid #e2e8f0;padding:10px;border-radius:10px;margin:6px 0'><b>#{escape(a['id'])} {escape(a['platform'])}</b> · key {escape(str(a['login'])[:4])}**** · balance {escape(str(a.get('balance','0')))} · {escape(a.get('server',''))} <form action='/test_account/{escape(a['id'])}' method='post' style='display:inline'><button class='btn' style='padding:4px 10px;font-size:12px;margin-left:8px'>Test connection</button></form></div>" for a in d["accounts"]) or "<p class='muted'>No account yet.</p>"
+    else: saved = "<p class='muted'>Fill the form to connect your account. Saved accounts are visible to the admin only.</p>"
+    plats = "".join(f"<option>{escape(p)}</option>" for p in s["platforms"])
+    return layout("Setup", f"""<div class='card'><h2>Accounts</h2>{saved}<hr style='margin:14px 0;border:none;border-top:1px solid #e2e8f0'>
+<form action='/save_account' method='post' class='grid'><div><label>Account #</label><input class='input' name='id' type='number' min='1' max='{s['max_accounts']}' required></div>
+<div><label>Platform</label><select class='input' name='platform'>{plats}</select></div>
+<div><label>API key / login</label><input class='input' name='login' required></div><div><label>API secret (MT4/MT5: type any text)</label><input class='input' name='password' type='password'></div>
+<div><label>Extra: passphrase (OKX, Bitget) · MetaApi account ID (MT4/MT5)</label><input class='input' name='extra'></div>
+<div><label>Server (Binance: type testnet for test money, blank for real)</label><input class='input' name='server'></div>
+<div><label>Account balance (USDT) used for sizing</label><input class='input' name='balance' type='number' step='any' required></div><div><button class='btn'>Save</button></div></form>
+<div class='muted' style='margin-top:12px;line-height:1.7'><b>What to enter</b><br>
+<b>BINANCE / BYBIT:</b> API key + secret. Server: blank = real, <code>testnet</code> = test money.<br>
+<b>OKX / BITGET:</b> API key + secret + passphrase (in Extra). OKX Server <code>testnet</code> = demo keys.<br>
+<b>MT5 / MT4</b> (Exness, FBS, FTMO, IC Markets, any broker): create a free account at metaapi.cloud, add your MT login there, then paste its <b>API token</b> into "API key", its <b>account ID</b> into Extra, and your region (e.g. <code>new-york</code>, <code>london</code>) into Server.<br>
+Use trade-only keys with withdrawals disabled.</div></div>""")
 
-@app.route('/save_account', methods=['POST'])
+@app.route("/save_account", methods=["POST"])
 def save_account():
-    data=load_data()
-    new_acc={{"id": request.form.get('id'), "platform": request.form.get('platform'), "login": request.form.get('login'), "password": request.form.get('password'), "server": request.form.get('server')}}
-    # remove if exists same id
-    data['accounts']=[a for a in data['accounts'] if a['id']!=new_acc['id']]
-    data['accounts'].append(new_acc)
-    save_data(data)
-    return redirect('/setup')
+    with LOCK:
+        d = load(); f = request.form
+        acc = {k: f.get(k, "").strip() for k in ("id", "platform", "login", "password", "server", "balance", "extra")}
+        if not acc["id"].isdigit() or acc["platform"] not in d["settings"]["platforms"]: return "Invalid account", 400
+        if any(a["id"] == acc["id"] for a in d["accounts"]) and session.get("admin") is not True: return "Account number already used", 403
+        d["accounts"] = [a for a in d["accounts"] if a["id"] != acc["id"]] + [acc]; save(d)
+    return redirect("/setup")
 
-@app.route('/api')
-def api_page():
-    return layout("API", f"""
-<div class='card'>
-<h2>🔌 Your Permanent API</h2>
-<p class='muted'>This URL never changes. Use it everywhere.</p>
-<div style='background:#0f172a;color:#22c55e;padding:16px;border-radius:10px;font-family:monospace;margin-top:12px;word-break:break-all;'>{PERMANENT_API}</div>
-<div class='grid' style='margin-top:16px'>
-<div class='step'><b>GET /api/status</b><br><span class='muted'>Check if bot is live</span><br><a href='/api/status' target='_blank'><span class='badge'>Test Now</span></a></div>
-<div class='step'><b>GET /setup</b><br><span class='muted'>View accounts</span></div>
-<div class='step'><b>POST /save_account</b><br><span class='muted'>Add account via API</span></div>
-</div>
-<div style='margin-top:14px;background:#fffbeb;border:1px solid #fde68a;padding:12px;border-radius:10px'><b>⚠️ For MT5 WebRequest:</b><br><span class='muted'>Add this URL to MT5: Tools → Options → Expert Advisors → Allow WebRequest → Add: {PERMANENT_API}</span></div>
-</div>
-""")
+@app.route("/test_account/<aid>", methods=["POST"])
+@admin_only
+def test_account(aid):
+    with LOCK:
+        d = load(); a = next((x for x in d["accounts"] if x["id"] == aid), None)
+        if not a: abort(404)
+        try: b = balance(a); a["balance"] = str(round(b, 2)); save(d); msg = f"✅ Connected. Balance synced: {b:,.2f}"
+        except Exception as e: msg = f"❌ Could not connect: {escape(str(e))}"
+    return layout("Test", f"<div class='card'><h2>Connection test</h2><p style='margin:10px 0'>{msg}</p><a class='btn' href='/setup'>Back</a></div>")
 
-@app.route('/orders')
+@app.route("/webhook", methods=["POST", "GET"])
+def webhook():
+    if not WEBHOOK_SECRET or not hmac.compare_digest(request.args.get("key", ""), WEBHOOK_SECRET): return jsonify({"error": "unauthorized"}), 401
+    return jsonify({"status": "scanned", "new": len(run_scan())})
+
+def _curve_svg(c):
+    if len(c) < 2: return "<p class='muted'>Chart appears after 2+ closed trades.</p>"
+    w, h, lo, hi = 640, 180, min(c + [0]), max(c + [0]); span = (hi - lo) or 1
+    pts = " ".join(f"{i * w / (len(c) - 1):.1f},{h - 10 - (v - lo) / span * (h - 20):.1f}" for i, v in enumerate(c))
+    zero = h - 10 - (0 - lo) / span * (h - 20)
+    col = "#16a34a" if c[-1] >= 0 else "#dc2626"
+    return f"<svg viewBox='0 0 {w} {h}' style='width:100%;height:auto'><line x1='0' x2='{w}' y1='{zero:.1f}' y2='{zero:.1f}' stroke='#cbd5e1' stroke-dasharray='4'/><polyline fill='none' stroke='{col}' stroke-width='2.5' points='{pts}'/></svg>"
+
+# ---------------- trade log (closed trades table + CSV) ----------------
+def closed_trades(orders, view="all"):
+    paper = lambda o: str(o.get("status", "")).startswith("PAPER")
+    rows = [o for o in orders if o.get("outcome") in ("WIN", "LOSS") and (view == "all" or (view == "paper") == paper(o))]
+    return sorted(rows, key=lambda o: o.get("time", ""), reverse=True)
+
+def trade_table(trs):
+    if not trs: return "<div class='card'><h2>Trade log</h2><p class='muted'>No closed trades yet.</p></div>"
+    h = "<tr>" + "".join(f"<th style='text-align:left;padding:6px'>{x}</th>" for x in ("Time", "Symbol", "Side", "Entry", "SL", "TP", "Result", "Money", "Type")) + "</tr>"
+    rows = ""
+    for o in trs:
+        col = "#16a34a" if o["r"] > 0 else "#dc2626"
+        typ = "PAPER" if str(o.get("status", "")).startswith("PAPER") else "LIVE"
+        cells = [escape(o["time"][:16]), escape(o["symbol"]), o["side"], f"{o['entry']:.6g}", f"{o['sl']:.6g}", f"{o['tp']:.6g}",
+                 f"<b style='color:{col}'>{o['outcome']} {o['r']:+}R</b>", f"{o.get('risk_amount', 0) * o['r']:+,.2f}", typ]
+        rows += "<tr style='border-top:1px solid #f1f5f9'>" + "".join(f"<td style='padding:6px'>{c}</td>" for c in cells) + "</tr>"
+    return f"<div class='card'><h2>Trade log ({len(trs)})</h2><p class='muted'><a href='/trades.csv'>Download CSV</a></p><div style='overflow-x:auto;font-size:12px'><table style='width:100%;border-collapse:collapse'>{h}{rows}</table></div></div>"
+
+@app.route("/trades.csv")
+def trades_csv():
+    import csv, io
+    buf = io.StringIO(); w = csv.writer(buf)
+    w.writerow(["time", "symbol", "side", "entry", "sl", "tp", "outcome", "r", "money", "type"])
+    for o in closed_trades(load()["orders"]):
+        w.writerow([o["time"], o["symbol"], o["side"], o["entry"], o["sl"], o["tp"], o["outcome"], o["r"],
+                    round(o.get("risk_amount", 0) * o["r"], 2), "PAPER" if str(o.get("status", "")).startswith("PAPER") else "LIVE"])
+    return buf.getvalue(), 200, {"Content-Type": "text/csv", "Content-Disposition": "attachment; filename=trades.csv"}
+
+@app.route("/performance")
+def performance():
+    view = request.args.get("view", "all"); view = view if view in ("all", "paper", "live") else "all"
+    orders_all = load()["orders"]
+    p = perf(orders_all, view)
+    good = lambda v: "#16a34a" if v >= 0 else "#dc2626"
+    box = lambda label, val, col="#0f172a": f"<div style='border:1px solid #e2e8f0;border-radius:12px;padding:14px'><div class='muted'>{label}</div><div style='font-size:24px;font-weight:800;color:{col}'>{val}</div></div>"
+    tabs = "".join(f"<a class='btn' style='padding:6px 14px;margin-right:6px;{'' if v == view else 'background:#e2e8f0;color:#0f172a'}' href='/performance?view={v}'>{v.upper()}</a>" for v in ("all", "paper", "live"))
+    pf = p["profit_factor"] if p["profit_factor"] is not None else "-"
+    money = f"{p['money']:+,.2f}" if p["money"] else "n/a (paper results carry no money)"
+    body = f"""<div class='card'><h2>Bot performance</h2><div style='margin:10px 0'>{tabs}</div>
+<div class='grid'>{box('Closed trades', p['trades'])}{box('Win rate', str(p['win_rate']) + '%', good(p['win_rate'] - 33.4))}{box('Total result', f"{p['total_r']:+}R", good(p['total_r']))}
+{box('Profit / loss (money)', money, good(p['money']))}{box('Avg win / avg loss', f"{p['avg_win_r']:+}R / {p['avg_loss_r']:+}R")}{box('Profit factor', pf)}{box('Max drawdown', f"-{p['max_drawdown_r']}R", '#dc2626')}{box('Avg per trade', f"{p['avg_r']:+}R", good(p['avg_r']))}</div>
+<h3 style='margin-top:16px'>Equity curve (cumulative R)</h3>{_curve_svg(p['curve'])}
+<p class='muted' style='margin-top:12px'>1R = the amount risked on one trade. Results are measured from market price data after each signal, not from broker statements. PAPER trades are simulated. Past results do not guarantee future results; this is not financial advice.</p></div>"""
+    body += trade_table(closed_trades(orders_all, view))
+    return layout("Performance", body)
+
+@app.route("/api/performance")
+def api_performance():
+    v = request.args.get("view", "all"); return jsonify(perf(load()["orders"], v if v in ("all", "paper", "live") else "all"))
+
+@app.route("/orders")
 def orders():
-    data=load_data()
-    order_html="".join([f"<div style='padding:10px;border-bottom:1px solid #f1f5f9'>{o}</div>" for o in data['orders']]) or "<div style='padding:40px;text-align:center;color:#94a3b8'>No orders yet.<br>Once you connect MT5, orders will appear here automatically.</div>"
-    return layout("Orders", f"<div class='card'><h2>📊 Live Orders & Trades</h2><div style='margin-top:12px'>{order_html}</div><br><a href='/setup' class='btn'>Connect MT5 First</a></div>")
+    d = load(); st, n = stats(d["orders"])
+    def row(r):
+        if "entry" not in r: return f"<div style='padding:8px;font-size:12px'>{escape(r.get('status',''))}</div>"
+        return f"<div style='padding:8px;border-bottom:1px solid #f1f5f9;font-size:12px'>{escape(r.get('time','')[:16])} · {escape(r.get('symbol',''))} {escape(r.get('side',''))} · E {r['entry']:.6g} SL {r['sl']:.6g} TP {r['tp']:.6g} · acct {escape(str(r.get('account','-')))} · <b>{escape(r.get('outcome',''))}</b> {escape(r.get('status',''))}</div>"
+    rows = "".join(row(r) for r in d["orders"][-40:][::-1])
+    return layout("Orders", f"<div class='card'><h2>Orders</h2><p class='muted'>{n} resolved trades</p>{rows or '<p class=muted>No signals yet.</p>'}</div>")
 
-@app.route('/settings')
-def settings_page():
-    return layout("Settings", """
-<div class='card' style='max-width:500px'><h2>🔒 Change Admin Password</h2>
-<form action='/save_password' method='post' style='margin-top:14px'>
-<label>Old Password</label><input name='old' type='password' class='input' required>
-<label style='margin-top:10px;display:block'>New Password</label><input name='new' type='password' class='input' required>
-<br><br><button class='btn' style='width:100%'>Update Password</button>
-</form></div>
-""")
-
-@app.route('/admin')
+@app.route("/admin", methods=["GET", "POST"])
 def admin():
-    return layout("Admin", """
-<div class='card' style='max-width:450px;text-align:center'><h2>🛡️ Admin Panel</h2><p class='muted'>Default: isigadmin123</p>
-<form action='/admin_login' method='post' style='margin-top:14px'>
-<input name='pw' type='password' class='input' placeholder='Enter admin password' required><br><br><button class='btn btn-dark' style='width:100%'>Unlock Admin</button>
-</form></div>
-""")
+    if request.method == "POST":
+        ip, now = _ip(), time.time()
+        FAILS[ip] = [t for t in FAILS.get(ip, []) if now - t < 600]
+        if len(FAILS[ip]) >= 5: session["msg"] = "Too many wrong attempts. Try again in 10 minutes."
+        elif check_admin(request.form.get("pw", "")): session["admin"] = True; session.permanent = True; FAILS.pop(ip, None)
+        else: FAILS[ip].append(now); session["msg"] = "Wrong password."
+        return redirect("/admin")
+    if session.get("admin") is not True:
+        m = session.pop("msg", None)
+        note = f"<p style='color:#dc2626;margin:8px 0;font-weight:600'>{escape(m)}</p>" if m else ""
+        return layout("Admin", f"<div class='card' style='max-width:420px'><h2>Admin login</h2><p class='muted'>Only the owner can open this panel.</p>{note}<form method='post'><input class='input' name='pw' type='password' placeholder='Password' autofocus><br><br><button class='btn'>Unlock</button></form></div>")
+    d = load(); s = d["settings"]; st, n = stats(d["orders"])
+    fields = ""
+    for k in DEFAULTS:
+        if k in BRAND_KEYS: continue
+        cur = s[k]; val = json.dumps(cur) if isinstance(cur, (list, dict)) else cur
+        fields += f"<div><label>{k}</label><input class='input' name='{k}' value='{escape(str(val))}'></div>"
+    m = session.pop("msg", None)
+    msg = f"<div class='card' style='background:#ecfdf5;border-color:#a7f3d0;font-weight:600'>{escape(m)}</div>" if m else ""
+    brand = f"""<div class='card'><h2>Branding</h2><p class='muted' style='margin-bottom:10px'>Changes show on the whole site immediately.</p><form action='/admin/save' method='post' class='grid'>
+<div><label>App name</label><input class='input' name='site_name' maxlength='60' value='{escape(s['site_name'])}'></div>
+<div><label>Headline under the name</label><input class='input' name='tagline' maxlength='80' value='{escape(s['tagline'])}'></div>
+<div style='grid-column:1/-1'><label>Homepage description</label><textarea class='input' name='lead' rows='3' maxlength='400'>{escape(s['lead'])}</textarea></div>
+<div><button class='btn'>Save branding</button></div></form></div>"""
+    security = """<div class='card'><h2>Security</h2><p class='muted' style='margin-bottom:10px'>Change the admin password (at least 8 characters). Only someone with the password can open this panel.</p><form action='/admin/password' method='post' class='grid'>
+<div><label>Current password</label><input class='input' name='cur' type='password' required></div>
+<div><label>New password</label><input class='input' name='new' type='password' minlength='8' required></div>
+<div><label>Repeat new password</label><input class='input' name='new2' type='password' minlength='8' required></div>
+<div><button class='btn'>Change password</button></div></form>
+<form action='/admin/logout' method='post' style='margin-top:12px'><button class='btn' style='background:#0f172a'>Log out</button></form></div>"""
+    tbl, tips = "", []
+    for f, g in st.items():
+        for k, m in g.items():
+            tbl += f"<div class='muted'>{f}={escape(k)}: {m['n']} trades · win {m['win']}% · avg {m['exp']}R</div>"
+            if m["n"] >= 10 and m["exp"] < 0: tips.append(f"Consider filtering {f}={k} ({m['n']} trades, {m['exp']}R avg)")
+    jr = "".join(f"<div style='border-top:1px solid #e2e8f0;padding:10px 0'><img src='/uploads/{escape(j['file'])}' style='max-width:100%;max-height:260px;border-radius:8px'><div class='muted'>{escape(j['symbol'])} · {escape(j['result'])} · {escape(j['note'])}</div><pre>{escape(j.get('analysis','(not analysed)'))}</pre><form action='/admin/analyze/{j['id']}' method='post'><button class='btn' style='padding:6px 12px'>Analyse with Claude</button></form></div>" for j in d["journal"][::-1][:15])
+    return layout("Admin", f"""{msg}{brand}<div class='card'><h2>1. Settings</h2><form action='/admin/save' method='post' class='grid'>{fields}
+<div><label>Type LIVE here to allow mode=live</label><input class='input' name='confirm'></div><div><button class='btn'>Save settings</button></div></form>
+<p class='muted' style='margin-top:8px'>Lists/filters are JSON. Example filter: {{"session": ["Asia"]}}</p>
+<form action='/admin/scan' method='post' style='margin-top:10px'><button class='btn' style='background:#0f172a'>Run scan now</button></form></div>
+<div class='card'><h2>2. Learning from results ({n} resolved trades)</h2>{tbl or '<p class=muted>Needs resolved trades.</p>'}<pre>{escape(chr(10).join(tips) or 'No suggestions yet (needs 10+ trades per group).')}</pre>
+<form action='/admin/synthesize' method='post' style='margin-top:8px'><button class='btn'>Ask Claude for improvements</button></form><pre>{escape(d['lessons'])}</pre></div>
+<div class='card'><h2>3. Screenshot journal</h2><form action='/admin/upload' method='post' enctype='multipart/form-data' class='grid'>
+<div><label>Chart screenshot (entry, SL, TP drawn)</label><input class='input' type='file' name='img' accept='image/*' required></div>
+<div><label>Symbol</label><input class='input' name='symbol'></div><div><label>Result</label><select class='input' name='result'><option>WIN</option><option>LOSS</option><option>BREAKEVEN</option></select></div>
+<div><label>Notes (what happened)</label><input class='input' name='note'></div><div><button class='btn'>Upload</button></div></form>{jr}</div>{security}""")
 
-@app.route('/admin_login', methods=['POST'])
-def admin_login():
-    data=load_data()
-    if request.form.get('pw')==data['settings']['admin_password']:
-        plats=",".join(data['settings']['platforms'])
-        return layout("Admin Edit", f"""
-<div class='card'><h2>Admin Control Center - Edit Everything</h2>
-<form action='/admin_save' method='post' style='margin-top:14px'>
-<div class='grid'><div><label>Site Name</label><input name='site_name' value='{data['settings']['site_name']}' class='input'></div>
-<div><label>Max Accounts</label><input name='max_accounts' type='number' value='{data['settings']['max_accounts']}' class='input'></div></div>
-<label style='margin-top:12px;display:block'>Platforms (comma separated, you can type anything)</label><input name='platforms' value='{plats}' class='input'>
-<label style='margin-top:12px;display:block'>New Admin Password (leave empty to keep old)</label><input name='new_pw' class='input' placeholder='New password'>
-<br><br><button class='btn btn-green'>Save Changes</button> <a href='/' class='btn btn-outline'>Cancel</a>
-</form></div>
-""")
-    return layout("Failed", "<div class='card'><h3>❌ Wrong password</h3><a href='/admin' class='btn'>Try Again</a></div>")
-
-@app.route('/admin_save', methods=['POST'])
+@app.route("/admin/save", methods=["POST"])
+@admin_only
 def admin_save():
-    data=load_data()
-    data['settings']['site_name']=request.form.get('site_name')
-    data['settings']['platforms']=[p.strip().upper() for p in request.form.get('platforms').split(',') if p.strip()]
-    try: data['settings']['max_accounts']=int(request.form.get('max_accounts'))
-    except: pass
-    if request.form.get('new_pw'): data['settings']['admin_password']=request.form.get('new_pw')
-    save_data(data)
-    return redirect('/')
+    with LOCK:
+        d = load(); s = d["settings"]
+        for k, v in DEFAULTS.items():
+            raw = request.form.get(k)
+            if raw is None: continue
+            try:
+                new = json.loads(raw) if isinstance(v, (list, dict)) else type(v)(raw)
+                if isinstance(v, (list, dict)) and not isinstance(new, type(v)): continue
+                if k == "mode" and (new not in ("paper", "live") or (new == "live" and request.form.get("confirm") != "LIVE")): continue
+                if k == "ob_entry" and new not in ("top", "mid"): continue
+                if k in BRAND_KEYS: new = new.strip()[:400 if k == "lead" else 80] or DEFAULTS[k]
+                s[k] = new
+            except Exception: pass
+        save(d)
+    session["msg"] = "Saved."
+    return redirect("/admin")
 
-@app.route('/save_password', methods=['POST'])
-def save_password():
-    data=load_data()
-    if request.form.get('old')==data['settings']['admin_password']:
-        data['settings']['admin_password']=request.form.get('new')
-        save_data(data)
-        return layout("Success", "<div class='card'><h3>✅ Password Changed!</h3><a href='/' class='btn'>Go Home</a></div>")
-    return layout("Error", "<div class='card'><h3>Old password wrong</h3><a href='/settings' class='btn'>Retry</a></div>")
+@app.route("/admin/password", methods=["POST"])
+@admin_only
+def admin_password():
+    f = request.form
+    if not check_admin(f.get("cur", "")): session["msg"] = "Current password is wrong."
+    elif len(f.get("new", "")) < 8 or f.get("new") != f.get("new2"): session["msg"] = "New passwords must match and be at least 8 characters."
+    else:
+        with LOCK:
+            d = load(); salt = os.urandom(16).hex(); d["admin_hash"] = {"salt": salt, "hash": _pw_hash(f["new"], salt)}; save(d)
+        session["msg"] = "Password changed."
+    return redirect("/admin")
 
-@app.route('/api/status')
-def status(): 
-    d=load_data()
-    return jsonify({"status":"live","api":PERMANENT_API,"accounts_count":len(d['accounts']),"platforms":d['settings']['platforms']})
+@app.route("/admin/logout", methods=["POST"])
+def admin_logout(): session.clear(); return redirect("/admin")
 
-@app.route('/api/accounts')
-def api_accounts():
-    return jsonify(load_data()['accounts'])
+@app.route("/admin/scan", methods=["POST"])
+@admin_only
+def admin_scan(): run_scan(); return redirect("/orders")
 
-if __name__=='__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT',10000)))
+@app.route("/admin/upload", methods=["POST"])
+@admin_only
+def upload():
+    f = request.files.get("img")
+    ext = os.path.splitext(secure_filename(f.filename or ""))[1].lower() if f else ""
+    if ext not in (".png", ".jpg", ".jpeg", ".webp"): return "Unsupported file", 400
+    name = uuid.uuid4().hex + ext; f.save(os.path.join(UPLOADS, name))
+    with LOCK:
+        d = load(); fm = request.form
+        d["journal"].append({"id": uuid.uuid4().hex[:8], "file": name, "symbol": fm.get("symbol", ""), "result": fm.get("result", ""), "note": fm.get("note", "")[:500], "time": str(datetime.datetime.utcnow())}); save(d)
+    return redirect("/admin")
+
+@app.route("/uploads/<name>")
+@admin_only
+def uploads(name): return send_from_directory(UPLOADS, secure_filename(name))
+
+@app.route("/admin/analyze/<jid>", methods=["POST"])
+@admin_only
+def analyze(jid):
+    d = load(); j = next((x for x in d["journal"] if x["id"] == jid), None)
+    if not j: abort(404)
+    ext = j["file"].rsplit(".", 1)[-1]; mt = {"png": "image/png", "webp": "image/webp"}.get(ext, "image/jpeg")
+    with open(os.path.join(UPLOADS, j["file"]), "rb") as fh: b64 = base64.b64encode(fh.read()).decode()
+    sysmsg = "You review trading chart screenshots against the user's rules: " + d["settings"]["strategy_text"]
+    txt = f"Symbol {j['symbol']}, result {j['result']}. Notes: {j['note']}. Identify the BOS, the liquidity, the entry order block, SL and TP shown. Say whether each follows the rules, what went wrong or right, and one concrete rule/filter change to test. Be specific; say if the image is unclear."
+    out = claude([{"type": "image", "source": {"type": "base64", "media_type": mt, "data": b64}}, {"type": "text", "text": txt}], sysmsg)
+    with LOCK:
+        d = load()
+        for x in d["journal"]:
+            if x["id"] == jid: x["analysis"] = out
+        save(d)
+    return redirect("/admin")
+
+@app.route("/admin/synthesize", methods=["POST"])
+@admin_only
+def synthesize():
+    d = load(); st, n = stats(d["orders"])
+    notes = "\n---\n".join(f"{j['symbol']} {j['result']}: {j.get('analysis','')[:700]}" for j in d["journal"][-10:])
+    out = claude(f"Strategy rules: {d['settings']['strategy_text']}\nBot stats ({n} trades): {json.dumps(st)}\nScreenshot reviews:\n{notes}\n\nFind repeating patterns in the losses and propose at most 3 testable changes (settings or filters). Flag small sample sizes honestly.", "You are a careful quantitative trading reviewer. Do not overfit; recommend paper-testing every change.")
+    with LOCK: d = load(); d["lessons"] = out; save(d)
+    return redirect("/admin")
+
+@app.route("/api/status")
+def status(): d = load(); return jsonify({"status": "live", "mode": d["settings"]["mode"], "accounts": len(d["accounts"])})
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
