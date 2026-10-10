@@ -427,6 +427,41 @@ table tr:hover td{background:#f8fafc}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 """
 
+# ---------------- installable app (PWA): manifest, service worker, icons ----------------
+import zlib, struct, functools
+@functools.lru_cache(maxsize=4)
+def _icon_png(size):
+    bars = [(.24, .47, .34, .76), (.45, .26, .55, .76), (.66, .38, .76, .76)]
+    raw = bytearray()
+    for yy in range(size):
+        raw.append(0); fy = yy / size
+        for xx in range(size):
+            fx = xx / size
+            if any(x0 <= fx <= x1 and y0 <= fy <= y1 for x0, y0, x1, y1 in bars): raw += b"\xff\xff\xff"
+            else:
+                t = (fx + fy) / 2; raw += bytes((int(37 + 87 * t), int(99 - 41 * t), int(235 + 2 * t)))
+    chunk = lambda tag, data: struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b"")
+
+@app.route("/icon-<int:size>.png")
+def icon(size):
+    if size not in (192, 512): abort(404)
+    return _icon_png(size), 200, {"Content-Type": "image/png", "Cache-Control": "public, max-age=86400"}
+
+@app.route("/manifest.webmanifest")
+def manifest():
+    name = load()["settings"]["site_name"]
+    return jsonify({"name": name, "short_name": name[:12], "start_url": "/", "scope": "/", "display": "standalone", "background_color": "#0b1220", "theme_color": "#2563eb",
+                    "icons": [{"src": f"/icon-{z}.png", "sizes": f"{z}x{z}", "type": "image/png", "purpose": "any maskable"} for z in (192, 512)]}), 200, {"Content-Type": "application/manifest+json"}
+
+@app.route("/sw.js")
+def service_worker():
+    js = "self.addEventListener('install',function(){self.skipWaiting()});self.addEventListener('activate',function(e){e.waitUntil(self.clients.claim())});" \
+         "self.addEventListener('fetch',function(e){e.respondWith(fetch(e.request).catch(function(){return new Response('You are offline. Reconnect to open the app.',{headers:{'Content-Type':'text/plain'}})}))});"
+    return js, 200, {"Content-Type": "application/javascript", "Service-Worker-Allowed": "/", "Cache-Control": "no-cache"}
+
+PWA_JS = "<script>if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js');var dp;addEventListener('beforeinstallprompt',function(e){e.preventDefault();dp=e;var b=document.getElementById('inst');b.style.display='inline-block';b.onclick=function(x){x.preventDefault();dp.prompt();b.style.display='none'}});</script>"
+
 LOGO_SVG = "<svg width='18' height='18' viewBox='0 0 18 18'><rect x='2' y='8' width='3' height='8' rx='1' fill='#fff'/><rect x='7.5' y='3' width='3' height='13' rx='1' fill='#fff'/><rect x='13' y='6' width='3' height='10' rx='1' fill='#fff' opacity='.85'/></svg>"
 
 def layout(title, body):
@@ -434,8 +469,8 @@ def layout(title, body):
     links = "".join(f"<a href='{h}'>{t}</a>" for h, t in (("/", "HOME"), ("/setup", "SETUP"), ("/performance", "PERFORMANCE"), ("/orders", "ORDERS"), ("/admin", "ADMIN")))
     return (f"<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>{escape(title)} · {name}</title>"
             f"<link rel='preconnect' href='https://fonts.googleapis.com'><link href='https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap' rel='stylesheet'>"
-            f"<style>{CSS}</style></head><body><div class='nav'><a class='logo' href='/'><span class='mark'>{LOGO_SVG}</span>{name}</a><div class='links'>{links}</div></div>{body}"
-            f"<div class='foot'>© {datetime.datetime.utcnow().year} {name} · Trading involves risk. Past results do not guarantee future results. Not financial advice.</div></body></html>")
+            f"<link rel='manifest' href='/manifest.webmanifest'><meta name='theme-color' content='#2563eb'><link rel='apple-touch-icon' href='/icon-192.png'><style>{CSS}</style></head><body><div class='nav'><a class='logo' href='/'><span class='mark'>{LOGO_SVG}</span>{name}</a><div class='links'>{links}<a href='#' id='inst' style='display:none'>⬇ INSTALL APP</a></div></div>{body}"
+            f"<div class='foot'>© {datetime.datetime.utcnow().year} {name} · Trading involves risk. Past results do not guarantee future results. Not financial advice.</div>{PWA_JS}</body></html>")
 
 FAILS = {}
 def _ip(): return (request.headers.get("X-Forwarded-For", request.remote_addr or "").split(",")[0]).strip()
@@ -452,27 +487,62 @@ def admin_only(f):
         return f(*a, **k)
     w.__name__ = f.__name__; return w
 
-def _hero_chart(n=40, cw=22, h=300):
-    """Seamless, endlessly scrolling candlestick chart (pure SVG + CSS)."""
-    import random
-    r = random.Random(11); v = [0.0]
-    for _ in range(n): v.append(v[-1] + r.uniform(-14, 14))
-    drift = v[-1] / n
-    v = [x - drift * i for i, x in enumerate(v)]                 # detrend so the loop has no jump
-    rows = [(v[i], v[i + 1], max(v[i], v[i + 1]) + r.uniform(2, 9), min(v[i], v[i + 1]) - r.uniform(2, 9)) for i in range(n)]
-    lo, hi = min(x[3] for x in rows), max(x[2] for x in rows)
-    y = lambda val: 30 + (hi - val) / ((hi - lo) or 1) * (h - 90)
-    def grp(off):
-        g = ""
-        for i, (o, c, hh, ll) in enumerate(rows):
-            x = off + i * cw; col = "#22c55e" if c >= o else "#ef4444"; top, bot = y(max(o, c)), y(min(o, c))
-            g += f"<line x1='{x + 8:.1f}' x2='{x + 8:.1f}' y1='{y(hh):.1f}' y2='{y(ll):.1f}' stroke='{col}' stroke-width='2'/><rect x='{x:.1f}' y='{top:.1f}' width='16' height='{max(bot - top, 2):.1f}' rx='3' fill='{col}'/>"
-        return g
-    grid = "".join(f"<line x1='0' x2='520' y1='{gy}' y2='{gy}' stroke='#1e293b' stroke-width='1'/>" for gy in range(40, h, 50))
-    lv = lambda yy, col, txt: (f"<g class='lvl'><line x1='0' x2='520' y1='{yy}' y2='{yy}' stroke='{col}' stroke-width='1.5' stroke-dasharray='6 5'/>"
-                               f"<rect x='440' y='{yy - 10}' width='72' height='20' rx='10' fill='{col}'/><text x='476' y='{yy + 4}' text-anchor='middle' font-size='10' font-weight='800' fill='#fff'>{txt}</text></g>")
-    return (f"<svg viewBox='0 0 520 {h}' preserveAspectRatio='xMidYMid slice'><rect width='520' height='{h}' fill='#0b1220'/>{grid}"
-            f"<g class='scroll'>{grp(0)}{grp(n * cw)}</g>{lv(60, '#22c55e', 'TP 1:2')}{lv(150, '#3b82f6', 'ENTRY')}{lv(235, '#ef4444', 'SL')}</svg>")
+def _hero_chart(rr=2.0):
+    """Animated illustration of ONE bullish setup, drawn with the bot's real rules:
+    SL = protected low (bottom of the leg) -> liquidity = last order block before the BOS ->
+    ENTRY = top of the order block BELOW the liquidity (so entry sits between liquidity and SL) -> TP = 1:RR."""
+    T, X0, DX, W = 16.0, 20, 26, 14
+    SL_Y, EN_Y = 250, 200
+    TP_Y = max(EN_Y - rr * (SL_Y - EN_Y), 22)
+    # candles as (open_y, close_y, high_y, low_y); smaller y = higher price
+    C = [(238, 228, 224, 250), (202, 222, 200, 226), (222, 186, 182, 226), (188, 166, 162, 192), (166, 178, 162, 182), (176, 146, 142, 180),
+         (148, 124, 112, 152), (124, 132, 118, 136), (130, 98, 94, 134), (98, 128, 96, 132), (128, 164, 126, 168), (164, 198, 162, 204),
+         (198, 150, 146, 202), (152, 108, 104, 156), (110, 82, 78, 114), (84, 58, 52, 88)]
+    css, n = [], [0]
+
+    def show(t, scale=False):
+        n[0] += 1; k = n[0]; a = t / T * 100; b = a + 1.5
+        f, g = ("transform:scaleY(.2);", "transform:scaleY(1);") if scale else ("", "")
+        css.append(f"@keyframes k{k}{{0%,{a:.2f}%{{opacity:0;{f}}}{b:.2f}%,92%{{opacity:1;{g}}}100%{{opacity:0;{g}}}}}")
+        return f"class='sq{' cd' if scale else ''}' style='animation-name:k{k}'"
+
+    def level(y, col, txt, t):
+        return (f"<g {show(t)}><line x1='0' x2='520' y1='{y}' y2='{y}' stroke='{col}' stroke-width='1.5' stroke-dasharray='6 5'/>"
+                f"<rect x='434' y='{y - 10}' width='78' height='20' rx='10' fill='{col}'/>"
+                f"<text x='473' y='{y + 4}' text-anchor='middle' font-size='10' font-weight='800' fill='#fff'>{txt}</text></g>")
+
+    def pill(x, y, w, txt, col, t, tc="#fff"):
+        return (f"<g {show(t)}><rect x='{x}' y='{y}' width='{w}' height='18' rx='9' fill='{col}'/>"
+                f"<text x='{x + w / 2}' y='{y + 12.5}' text-anchor='middle' font-size='10' font-weight='800' fill='{tc}'>{txt}</text></g>")
+
+    cx = lambda i: X0 + i * DX
+    p = [f"<rect width='520' height='300' fill='#0b1220'/>"]
+    p.append("".join(f"<line x1='0' x2='520' y1='{gy}' y2='{gy}' stroke='#1e293b'/>" for gy in range(40, 300, 50)))
+    p.append(level(round(TP_Y), "#22c55e", f"TP 1:{rr:g}", 7.4))
+    p.append(level(EN_Y, "#3b82f6", "ENTRY", 5.6))
+    p.append(level(SL_Y, "#ef4444", "SL", 6.6))
+    # BOS line (the swing high that gets broken)
+    p.append(f"<g {show(3.7)}><line x1='{cx(6) - 6}' x2='{cx(8) + 40}' y1='112' y2='112' stroke='#eab308' stroke-width='1.5' stroke-dasharray='4 4'/></g>")
+    p.append(pill(cx(6) - 50, 86, 44, "BOS", "#eab308", 3.7, "#0b1220"))
+    # liquidity = last order block before the BOS (purple); order block = entry zone below it (blue)
+    p.append(f"<g {show(4.6)}><rect x='{cx(4) - 4}' y='160' width='22' height='24' rx='3' fill='rgba(168,85,247,.28)' stroke='#a855f7' stroke-width='1.5'/>"
+             f"<line x1='98' y1='137' x2='{cx(4) - 2}' y2='162' stroke='#a855f7' stroke-width='1.2'/></g>")
+    p.append(pill(24, 128, 76, "LIQUIDITY", "#a855f7", 4.6))
+    p.append(f"<g {show(5.6)}><rect x='{cx(1) - 4}' y='{EN_Y}' width='22' height='26' rx='3' fill='rgba(59,130,246,.3)' stroke='#3b82f6' stroke-width='1.5'/>"
+             f"<line x1='{cx(1) + 7}' y1='226' x2='{cx(1) + 7}' y2='268' stroke='#3b82f6' stroke-width='1.2'/></g>")
+    p.append(pill(18, 268, 98, "ORDER BLOCK", "#3b82f6", 5.6))
+    for i, (o, c, h, l) in enumerate(C):
+        t = 0.3 + i * 0.4 if i < 9 else 8.4 + (i - 9) * 0.5
+        col = "#22c55e" if c < o else "#ef4444"; top, bot = min(o, c), max(o, c); x = cx(i)
+        p.append(f"<g {show(t, True)}><line x1='{x + W / 2}' x2='{x + W / 2}' y1='{h}' y2='{l}' stroke='{col}' stroke-width='2'/>"
+                 f"<rect x='{x}' y='{top}' width='{W}' height='{max(bot - top, 2)}' rx='2' fill='{col}'/></g>")
+    # price taps the entry, then reaches the target
+    p.append(f"<g {show(9.6)}><circle class='ring' cx='{cx(11) + 7}' cy='{EN_Y}' r='7' fill='none' stroke='#3b82f6' stroke-width='2.5'/></g>")
+    p.append(f"<g {show(10.9)}><circle class='ring' cx='{cx(14) + 7}' cy='{round(TP_Y)}' r='7' fill='none' stroke='#22c55e' stroke-width='2.5'/></g>")
+    style = (f"<style>.sq{{animation-duration:{T:g}s;animation-iteration-count:infinite;animation-timing-function:linear}}"
+             ".cd{transform-box:fill-box;transform-origin:50% 100%}.ring{transform-box:fill-box;transform-origin:center;animation:rg 1.5s ease-out infinite}"
+             "@keyframes rg{from{transform:scale(.6);opacity:1}to{transform:scale(2.4);opacity:0}}" + "".join(css) + "</style>")
+    return f"<svg viewBox='0 0 520 300'>{style}{''.join(p)}</svg>"
 
 HOME_TPL = """
 <style>
@@ -566,7 +636,7 @@ def home():
     d = load(); s = d["settings"]; p = perf(d["orders"])
     rep = {"@@NAME@@": str(escape(s["site_name"])), "@@MODE@@": str(escape(s["mode"])).upper(), "@@RR@@": str(s["rr"]), "@@RISK@@": str(s["risk_pct"]),
            "@@TF@@": str(escape(s["timeframe"])), "@@TRADES@@": str(p["trades"]), "@@WIN@@": str(p["win_rate"]), "@@TOTALR@@": str(p["total_r"]),
-           "@@PRE@@": "+" if p["total_r"] >= 0 else "", "@@NPLAT@@": str(len(s["platforms"])), "@@CHART@@": _hero_chart(),
+           "@@PRE@@": "+" if p["total_r"] >= 0 else "", "@@NPLAT@@": str(len(s["platforms"])), "@@CHART@@": _hero_chart(s["rr"]),
            "@@META@@": str(escape(f"{s['timeframe']} · {', '.join(s['symbols'])}")), "@@PLATS@@": "".join(f"<span>{escape(x)}</span>" for x in s["platforms"]) * 3,
            "@@STRAT@@": str(escape(s["strategy_text"])), "@@TAGLINE@@": str(escape(s["tagline"])), "@@LEAD@@": str(escape(s["lead"]))}
     html = HOME_TPL
