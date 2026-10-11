@@ -50,6 +50,55 @@ SENSITIVE = ("login", "password", "extra")          # API key, secret, passphras
 
 def _h(k): return hashlib.sha256(k.encode()).hexdigest()   # EA keys are random 32-char secrets: only their hash is stored
 
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+_TEXT, _SIG, _DB_LOADED, _DB_RETRY = None, None, False, 0.0
+DB_STATUS = {"ok": None, "err": ""}
+LAST_SEEN = {}                                   # EA last-contact times live in memory only (so they never trigger a database write)
+
+def _db():
+    import pg8000.native, ssl
+    u = urllib.parse.urlparse(DATABASE_URL)
+    con = pg8000.native.Connection(user=urllib.parse.unquote(u.username or ""), password=urllib.parse.unquote(u.password or ""), host=u.hostname,
+                                   port=u.port or 5432, database=(u.path or "/").lstrip("/"), ssl_context=ssl.create_default_context(), timeout=20)
+    con.run("CREATE TABLE IF NOT EXISTS bot_state (id INTEGER PRIMARY KEY, data TEXT NOT NULL)")
+    return con
+
+def _db_read():
+    con = _db()
+    try:
+        rows = con.run("SELECT data FROM bot_state WHERE id = 1")
+        return rows[0][0] if rows else None
+    finally: con.close()
+
+def _db_write(text):
+    con = _db()
+    try: con.run("INSERT INTO bot_state (id, data) VALUES (1, :d) ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data", d=text)
+    finally: con.close()
+
+def _file_text():
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE) as f: return f.read()
+    return None
+
+def _raw():
+    """The stored data as text. With a database: read it once at start-up, never overwrite it with a stale local copy."""
+    global _TEXT, _DB_LOADED, _DB_RETRY
+    if DATABASE_URL and not _DB_LOADED and time.time() >= _DB_RETRY:
+        try:
+            t = _db_read()
+            if t is None:                                  # brand-new database: carry over whatever the local file has
+                t = _file_text()
+                if t: _db_write(t)
+            _TEXT, _DB_LOADED = t or "", True; DB_STATUS.update(ok=True, err="")
+        except Exception as e:
+            DB_STATUS.update(ok=False, err=str(e)[:200]); _DB_RETRY = time.time() + 30; print("database read failed:", e)
+    if _TEXT is None: _TEXT = _file_text() or ""      # no database (or it is unreachable): use the local file for now
+    return _TEXT
+
+def crypto_ready():
+    """Encrypt only if the key will still exist after a restart (DATA_KEY/SECRET_KEY), or the data lives on a persistent local disk."""
+    return CRYPTO and (bool(os.environ.get("DATA_KEY") or os.environ.get("SECRET_KEY")) or not DATABASE_URL)
+
 def _fkeys():
     ks = []
     for name in ("DATA_KEY", "SECRET_KEY"):
@@ -58,7 +107,7 @@ def _fkeys():
     kf = os.path.join(DATA_DIR, ".datakey")
     if os.path.exists(kf):
         with open(kf, "rb") as fh: ks.append(fh.read().strip())
-    elif not ks:                                      # no env key at all: create a key file as a last resort
+    elif not ks and not DATABASE_URL:                 # no env key at all: create a key file as a last resort
         k = Fernet.generate_key(); fd = os.open(kf, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600); os.write(fd, k); os.close(fd); ks.append(k)
     return ks
 
@@ -79,7 +128,7 @@ def _protect(accs):
     for a in accs:
         b = dict(a)
         if b.get("platform") == "EA": b.pop("login", None)          # never write an EA key to disk
-        elif CRYPTO:
+        elif crypto_ready():
             for k in SENSITIVE:
                 v = b.get(k)
                 if v and not str(v).startswith("enc:"): b[k] = "enc:" + _enc(str(v))
@@ -91,10 +140,8 @@ BRAND_KEYS = ("site_name", "tagline", "lead")
 # ---------------- storage ----------------
 def load():
     d = {"settings": {}, "accounts": [], "orders": [], "seen": [], "journal": [], "lessons": "", "admin_hash": None}
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE) as f: d.update(json.load(f))
-        except Exception: pass
+    try: d.update(json.loads(_raw() or "{}"))
+    except Exception: pass
     d["settings"] = {**DEFAULTS, **d["settings"]}
     if d["settings"].get("site_name") in ("", "ISIG BOT"): d["settings"]["site_name"] = DEFAULTS["site_name"]   # rename old saved brand
     if "EA" not in d["settings"]["platforms"]: d["settings"]["platforms"] = d["settings"]["platforms"] + ["EA"]
@@ -106,11 +153,25 @@ def load():
     return d
 
 def save(d):
-    tmp = DATA_FILE + ".tmp"
-    with open(tmp, "w") as f: json.dump({**d, "accounts": _protect(d["accounts"])}, f, indent=2)
-    try: os.chmod(tmp, 0o600)
-    except Exception: pass
-    os.replace(tmp, DATA_FILE)
+    global _TEXT, _SIG
+    sig = json.dumps(d, sort_keys=True, default=str)
+    if sig == _SIG: return                           # nothing changed: no write (keeps the free database asleep)
+    text = json.dumps({**d, "accounts": _protect(d["accounts"])}, indent=2)
+    stored = not DATABASE_URL
+    if DATABASE_URL:
+        _raw()                                       # make sure the saved data was read before we write anything
+        if _DB_LOADED:
+            try: _db_write(text); DB_STATUS.update(ok=True, err=""); stored = True
+            except Exception as e: DB_STATUS.update(ok=False, err=str(e)[:200]); print("database write failed:", e)
+    tmp = DATA_FILE + ".tmp"                         # local copy too (a backup; on Render's free plan it disappears on restart)
+    try:
+        with open(tmp, "w") as f: f.write(text)
+        try: os.chmod(tmp, 0o600)
+        except Exception: pass
+        os.replace(tmp, DATA_FILE)
+    except OSError as e: print("local save failed:", e)
+    _TEXT = text
+    if stored: _SIG = sig
 
 # ---------------- strategy engine ----------------
 def fetch_candles(symbol, interval="30m", limit=300):
@@ -565,8 +626,12 @@ def _warnings(d):
     w = []
     if not d.get("admin_hash"): w.append("You are still using the built-in admin password. Change it under Security below.")
     if not CRYPTO: w.append("Encryption library missing: add 'cryptography' to requirements.txt and redeploy. New exchange keys are refused until then.")
+    if not DATABASE_URL: w.append("Render's free plan erases this app's files every time it restarts. Add a free Neon database (environment variable DATABASE_URL) so accounts, orders and results survive.")
+    elif DB_STATUS["ok"] is False: w.append("The database is not reachable right now: " + DB_STATUS["err"] + " (the app keeps running; it retries automatically)")
+    if DATABASE_URL and not (os.environ.get("DATA_KEY") or os.environ.get("SECRET_KEY")): w.append("With a database you MUST set DATA_KEY on Render, otherwise new exchange accounts are refused.")
     if not os.environ.get("DATA_KEY"): w.append("Set a DATA_KEY environment variable on Render (any long random text) so stored keys are encrypted with a key that is not on the disk.")
-    return "".join(f"<div class='card' style='background:#fef2f2;border-color:#fecaca;font-weight:600;color:#991b1b'>⚠️ {escape(x)}</div>" for x in w)
+    ok = "<div class='card' style='background:#ecfdf5;border-color:#a7f3d0;font-weight:600'>✅ Data is stored in your external database, so restarts will not erase it.</div>" if DATABASE_URL and DB_STATUS["ok"] else ""
+    return ok + "".join(f"<div class='card' style='background:#fef2f2;border-color:#fecaca;font-weight:600;color:#991b1b'>⚠️ {escape(x)}</div>" for x in w)
 
 def admin_only(f):
     def w(*a, **k):
@@ -734,7 +799,7 @@ def home():
 def setup():
     d = load(); s = d["settings"]
     if session.get("admin") is True:
-        saved = "".join(f"<div style='border:1px solid #e2e8f0;padding:10px;border-radius:10px;margin:6px 0'><b>#{escape(a['id'])} {escape(a['platform'])}</b> · key {escape('hidden' if a['platform'] == 'EA' else str(a['login'])[:4] + '****')}{' · EA last heard ' + escape(a.get('last_seen', 'never')) if a['platform'] == 'EA' else ''} · balance {escape(str(a.get('balance','0')))} · {escape(a.get('server',''))} <form action='/test_account/{escape(a['id'])}' method='post' style='display:inline'><button class='btn' style='padding:4px 10px;font-size:12px;margin-left:8px'>Test connection</button></form></div>" for a in d["accounts"]) or "<p class='muted'>No account yet.</p>"
+        saved = "".join(f"<div style='border:1px solid #e2e8f0;padding:10px;border-radius:10px;margin:6px 0'><b>#{escape(a['id'])} {escape(a['platform'])}</b> · key {escape('hidden' if a['platform'] == 'EA' else str(a['login'])[:4] + '****')}{' · EA last heard ' + escape(LAST_SEEN.get(a['id'], 'never')) if a['platform'] == 'EA' else ''} · balance {escape(str(a.get('balance','0')))} · {escape(a.get('server',''))} <form action='/test_account/{escape(a['id'])}' method='post' style='display:inline'><button class='btn' style='padding:4px 10px;font-size:12px;margin-left:8px'>Test connection</button></form></div>" for a in d["accounts"]) or "<p class='muted'>No account yet.</p>"
     else: saved = "<p class='muted'>Fill the form to connect your account. Saved accounts are visible to the admin only.</p>"
     plats = "".join(f"<option>{escape(p)}</option>" for p in s["platforms"])
     return layout("Setup", f"""<div class='card'><h2>Accounts</h2>{saved}<hr style='margin:14px 0;border:none;border-top:1px solid #e2e8f0'>
@@ -763,7 +828,7 @@ def save_account():
         if acc["platform"] == "EA":
             acc["login"] = secrets.token_urlsafe(24); acc["key_hash"] = _h(acc["login"]); acc["password"] = acc["extra"] = ""
         elif not acc["login"]: return "API key / login is required", 400
-        elif not CRYPTO: return "Secure storage is not ready on this server yet. Please try again later.", 503
+        elif not crypto_ready(): return "Secure storage is not ready on this server yet. Please try again later.", 503
         exists = any(a["id"] == acc["id"] for a in d["accounts"])
         if exists and not is_admin: return "Account number already used", 403
         if not exists and len(d["accounts"]) >= int(d["settings"]["max_accounts"]): return "This app has reached its account limit", 403
@@ -783,7 +848,7 @@ def test_account(aid):
         d = load(); a = next((x for x in d["accounts"] if x["id"] == aid), None)
         if not a: abort(404)
         if a["platform"] == "EA":
-            msg = (f"✅ EA connected. Last heard from it: {escape(a['last_seen'])} UTC. Balance: {escape(str(a.get('balance', '0')))}" if a.get("last_seen")
+            msg = (f"✅ EA connected. Last heard from it: {escape(LAST_SEEN[a['id']])} UTC. Balance: {escape(str(a.get('balance', '0')))}" if LAST_SEEN.get(a["id"])
                    else "⚠️ The EA has not contacted the app yet. Attach it to a chart in MT5 and read the Experts tab.")
         else:
             try: b = balance(a); a["balance"] = str(round(b, 2)); save(d); msg = f"✅ Connected. Balance synced: {b:,.2f}"
@@ -825,7 +890,7 @@ def ea_sync():
         try: bal = float(head.get("BAL", 0))
         except ValueError: bal = 0
         if bal > 0: a["balance"] = str(round(bal, 2))
-        a["last_seen"] = str(datetime.datetime.utcnow())[:19]
+        LAST_SEEN[a["id"]] = str(datetime.datetime.utcnow())[:19]
         mine = [o for o in d["orders"] if o.get("account") == a["id"] and o.get("symbol") == sym]
         for o in mine:
             if o["id"] in placed: o["ea_ack"] = True
@@ -883,7 +948,7 @@ def my_status():
                 if x: x["balance"] = a["balance"]; save(dd)
         except Exception as e: tested = False; note = "Could not connect: " + str(e)[:200]
     if ee:
-        ls = a.get("last_seen", "")
+        ls = LAST_SEEN.get(a["id"], "")
         try: on = bool(ls) and (datetime.datetime.utcnow() - datetime.datetime.strptime(ls, "%Y-%m-%d %H:%M:%S")).total_seconds() < 180
         except ValueError: on = False
         badge = (f"<b style='color:#16a34a'>● Connected</b> <span class='muted'>(EA last heard {escape(ls)} UTC)</span>" if on else
@@ -1141,7 +1206,7 @@ def synthesize():
     return redirect("/admin")
 
 @app.route("/api/status")
-def status(): d = load(); return jsonify({"status": "live", "mode": d["settings"]["mode"], "accounts": len(d["accounts"])})
+def status(): d = load(); return jsonify({"status": "live", "mode": d["settings"]["mode"], "accounts": len(d["accounts"]), "storage": ("database" if DATABASE_URL and DB_STATUS["ok"] else "database unreachable" if DATABASE_URL else "local file")})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
