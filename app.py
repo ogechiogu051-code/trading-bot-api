@@ -5,20 +5,23 @@ Strategy: 30m major BOS -> liquidity (last OB/wick in the BOS leg) -> entry at T
 Everything (liquidity + entry OB) is taken from INSIDE the leg of the latest BOS.
 Env vars: ADMIN_PASSWORD, SECRET_KEY, WEBHOOK_SECRET (optional), AUTOSCAN=1, ANTHROPIC_API_KEY (optional, image analysis)
 """
-import os, re, json, hmac, hashlib, time, datetime, threading, uuid, base64
+import os, re, json, hmac, hashlib, time, datetime, threading, uuid, base64, secrets
 import urllib.request, urllib.parse, urllib.error
 from decimal import Decimal, ROUND_DOWN
-from flask import Flask, request, jsonify, redirect, session, send_from_directory, abort
+from flask import Flask, request, jsonify, redirect, session, send_from_directory, abort, Response
 from markupsafe import escape
 from werkzeug.utils import secure_filename
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)      # correct https address behind Render's proxy
 app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24).hex())
 app.config.update(SESSION_COOKIE_SAMESITE="Lax", SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SECURE=bool(os.environ.get("RENDER")),
                   PERMANENT_SESSION_LIFETIME=datetime.timedelta(hours=12), MAX_CONTENT_LENGTH=8 * 1024 * 1024)
 DATA_DIR = os.environ.get("DATA_DIR", ".")      # on Render: mount a disk at /var/data and set DATA_DIR=/var/data
 DATA_FILE, UPLOADS = os.path.join(DATA_DIR, "bot_data.json"), os.path.join(DATA_DIR, "uploads")
 os.makedirs(UPLOADS, exist_ok=True)
+EA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ISIG_EA.mq5")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD") or "Mick@2008"   # first-login password; change it inside Admin > Security
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 LOCK = threading.Lock()
@@ -27,7 +30,7 @@ DEFAULTS = {
     "site_name": "Nnanna Michael", "tagline": "Automated Trading Robot",
     "lead": "A smart-money trading bot that reads market structure for you: it spots the break of structure, finds the liquidity, and places the entry, stop loss and take profit automatically. Every trade is recorded so you can see the real results.",
     "max_accounts": 500,
-    "platforms": ["BINANCE", "BYBIT", "OKX", "BITGET", "MT5", "MT4"],
+    "platforms": ["BINANCE", "BYBIT", "OKX", "BITGET", "MT5", "MT4", "EA"],
     "symbols": ["BTCUSDT", "ETHUSDT"], "timeframe": "30m",   # crypto = ends with USDT; anything else (EURUSD, XAUUSD...) is traded through MT4/MT5
     "swing_n": 2, "min_bos": 2, "rr": 2.0, "ob_entry": "top",   # top | mid
     "risk_pct": 1.0,
@@ -37,6 +40,51 @@ DEFAULTS = {
                      "Entry = top of the OB below the liquidity (bullish), bottom of the OB above it (bearish). "
                      "SL at protected low/high of the BOS leg. TP = 1:2.",
 }
+
+try:
+    from cryptography.fernet import Fernet, MultiFernet
+    CRYPTO = True
+except Exception:
+    CRYPTO = False
+SENSITIVE = ("login", "password", "extra")          # API key, secret, passphrase / MetaApi id: stored encrypted (AES + HMAC via Fernet)
+
+def _h(k): return hashlib.sha256(k.encode()).hexdigest()   # EA keys are random 32-char secrets: only their hash is stored
+
+def _fkeys():
+    ks = []
+    for name in ("DATA_KEY", "SECRET_KEY"):
+        raw = os.environ.get(name)
+        if raw: ks.append(base64.urlsafe_b64encode(hashlib.sha256(raw.encode()).digest()))
+    kf = os.path.join(DATA_DIR, ".datakey")
+    if os.path.exists(kf):
+        with open(kf, "rb") as fh: ks.append(fh.read().strip())
+    elif not ks:                                      # no env key at all: create a key file as a last resort
+        k = Fernet.generate_key(); fd = os.open(kf, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600); os.write(fd, k); os.close(fd); ks.append(k)
+    return ks
+
+_FER = None
+def _enc(v):
+    global _FER
+    if _FER is None: _FER = MultiFernet([Fernet(k) for k in _fkeys()])
+    return _FER.encrypt(v.encode()).decode()
+def _dec(v):
+    global _FER
+    try:
+        if _FER is None: _FER = MultiFernet([Fernet(k) for k in _fkeys()])
+        return _FER.decrypt(v.encode()).decode()
+    except Exception: return ""
+
+def _protect(accs):
+    out = []
+    for a in accs:
+        b = dict(a)
+        if b.get("platform") == "EA": b.pop("login", None)          # never write an EA key to disk
+        elif CRYPTO:
+            for k in SENSITIVE:
+                v = b.get(k)
+                if v and not str(v).startswith("enc:"): b[k] = "enc:" + _enc(str(v))
+        out.append(b)
+    return out
 
 BRAND_KEYS = ("site_name", "tagline", "lead")
 
@@ -49,11 +97,19 @@ def load():
         except Exception: pass
     d["settings"] = {**DEFAULTS, **d["settings"]}
     if d["settings"].get("site_name") in ("", "ISIG BOT"): d["settings"]["site_name"] = DEFAULTS["site_name"]   # rename old saved brand
+    if "EA" not in d["settings"]["platforms"]: d["settings"]["platforms"] = d["settings"]["platforms"] + ["EA"]
+    for a in d["accounts"]:
+        for k in SENSITIVE:
+            v = a.get(k)
+            if isinstance(v, str) and v.startswith("enc:"): a[k] = _dec(v[4:]) if CRYPTO else ""
+        if a.get("platform") == "EA" and a.get("login") and not a.get("key_hash"): a["key_hash"] = _h(a.pop("login"))   # upgrade older plaintext EA keys
     return d
 
 def save(d):
     tmp = DATA_FILE + ".tmp"
-    with open(tmp, "w") as f: json.dump(d, f, indent=2)
+    with open(tmp, "w") as f: json.dump({**d, "accounts": _protect(d["accounts"])}, f, indent=2)
+    try: os.chmod(tmp, 0o600)
+    except Exception: pass
     os.replace(tmp, DATA_FILE)
 
 # ---------------- strategy engine ----------------
@@ -328,6 +384,7 @@ def balance(acc):
     if p == "OKX": return float(okx(acc, "GET", "/api/v5/account/balance")[0]["totalEq"])
     if p == "BITGET": return float(next(x for x in bitget(acc, "GET", "/api/v2/mix/account/accounts", params={"productType": "USDT-FUTURES"}) if x["marginCoin"] == "USDT")["accountEquity"])
     if p in ("MT4", "MT5"): return float(meta(acc, "GET", "/account-information")["balance"])
+    if p == "EA": return float(acc.get("balance") or 0)                       # the EA reports its own balance
     raise RuntimeError("unsupported platform")
 
 def is_fx(sym): return not sym.endswith("USDT")
@@ -343,6 +400,7 @@ def place_order(acc, sig, sym, s):
          "symbol": sym, "size": round(risk_amt / dist, 6) if dist else 0, "risk_amount": round(risk_amt, 2),
          "outcome": "PENDING", "bars": 0, **sig}
     if s["mode"] == "paper": o["status"] = "PAPER"
+    elif acc["platform"] == "EA": o["status"], o["ea_ack"] = "LIVE: queued for EA", False
     elif acc["platform"] in LIVE:
         try: o["ext_id"] = LIVE[acc["platform"]](acc, o); o["status"] = "LIVE: orders sent"
         except Exception as e: o["status"], o["outcome"] = f"LIVE FAILED: {e}", "REJECTED"
@@ -361,7 +419,7 @@ def run_scan():
                 else: cache[sym] = fetch_candles(sym, s["timeframe"])
             return cache[sym]
         for o in d["orders"]:                                                  # 1) resolve open trades
-            if o.get("outcome") in ("PENDING", "OPEN"):
+            if o.get("outcome") in ("PENDING", "OPEN") and o.get("platform") != "EA":      # EA orders are resolved from the EA's own candles
                 try:
                     resolve(o, candles(o["symbol"]))
                     if o["outcome"] == "EXPIRED" and o["status"].startswith("LIVE"):
@@ -375,7 +433,7 @@ def run_scan():
             if not sig or f"{sym}-{sig['key']}" in d["seen"]: continue
             d["seen"] = (d["seen"] + [f"{sym}-{sig['key']}"])[-500:]
             if any(str(sig[f]) in s["filters"].get(f, []) for f in s["filters"] if f in sig): continue   # learned filters
-            accs = [a for a in d["accounts"] if (a["platform"] in ("MT4", "MT5")) == is_fx(sym)] or [{"id": "-", "platform": "SIGNAL", "balance": 0}]
+            accs = [a for a in d["accounts"] if a["platform"] != "EA" and (a["platform"] in ("MT4", "MT5")) == is_fx(sym)] or [{"id": "-", "platform": "SIGNAL", "balance": 0}]
             for a in accs:
                 busy = any(o.get("account") == a["id"] and o.get("symbol") == sym and o.get("outcome") in ("PENDING", "OPEN") for o in d["orders"] + new)
                 if not busy: new.append(place_order(a, sig, sym, s))
@@ -466,13 +524,35 @@ LOGO_SVG = "<svg width='18' height='18' viewBox='0 0 18 18'><rect x='2' y='8' wi
 
 def layout(title, body):
     name = escape(load()["settings"]["site_name"])
-    links = "".join(f"<a href='{h}'>{t}</a>" for h, t in (("/", "HOME"), ("/setup", "SETUP"), ("/performance", "PERFORMANCE"), ("/orders", "ORDERS"), ("/admin", "ADMIN")))
+    links = "".join(f"<a href='{h}'>{t}</a>" for h, t in (("/", "HOME"), ("/setup", "SETUP"), ("/performance", "PERFORMANCE"), ("/orders", "ORDERS"), ("/status", "MY ACCOUNT"), ("/admin", "ADMIN")))
     return (f"<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>{escape(title)} · {name}</title>"
             f"<link rel='preconnect' href='https://fonts.googleapis.com'><link href='https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap' rel='stylesheet'>"
             f"<link rel='manifest' href='/manifest.webmanifest'><meta name='theme-color' content='#2563eb'><link rel='apple-touch-icon' href='/icon-192.png'><style>{CSS}</style></head><body><div class='nav'><a class='logo' href='/'><span class='mark'>{LOGO_SVG}</span>{name}</a><div class='links'>{links}<a href='#' id='inst' style='display:none'>⬇ INSTALL APP</a></div></div>{body}"
             f"<div class='foot'>© {datetime.datetime.utcnow().year} {name} · Trading involves risk. Past results do not guarantee future results. Not financial advice.</div>{PWA_JS}</body></html>")
 
+@app.after_request
+def secure_headers(r):
+    r.headers.update({"X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer",
+        "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
+        "Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; object-src 'none'"})
+    if os.environ.get("RENDER"): r.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    if request.path.startswith(("/admin", "/status", "/ea/download", "/save_account")): r.headers["Cache-Control"] = "no-store"
+    return r
+
+@app.before_request
+def csrf_guard():
+    """Browsers always send Origin on form posts: refuse posts that come from another website."""
+    if request.method == "POST" and request.path != "/ea/sync":
+        o = request.headers.get("Origin")
+        if o and urllib.parse.urlparse(o).netloc != request.host: abort(403)
+
 FAILS = {}
+def throttled(name, limit=10, window=600, add=False):
+    now = time.time(); k = f"{name}:{_ip()}"
+    if len(FAILS) > 5000: FAILS.clear()
+    FAILS[k] = [t for t in FAILS.get(k, []) if now - t < window]
+    if add: FAILS[k].append(now)
+    return len(FAILS[k]) >= limit
 def _ip(): return (request.headers.get("X-Forwarded-For", request.remote_addr or "").split(",")[0]).strip()
 def _pw_hash(pw, salt): return hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), 200000).hex()
 def check_admin(pw):
@@ -480,6 +560,13 @@ def check_admin(pw):
     h = load().get("admin_hash")
     if h: return hmac.compare_digest(_pw_hash(pw, h["salt"]).encode(), h["hash"].encode())
     return hmac.compare_digest(pw.encode(), ADMIN_PASSWORD.encode())
+
+def _warnings(d):
+    w = []
+    if not d.get("admin_hash"): w.append("You are still using the built-in admin password. Change it under Security below.")
+    if not CRYPTO: w.append("Encryption library missing: add 'cryptography' to requirements.txt and redeploy. New exchange keys are refused until then.")
+    if not os.environ.get("DATA_KEY"): w.append("Set a DATA_KEY environment variable on Render (any long random text) so stored keys are encrypted with a key that is not on the disk.")
+    return "".join(f"<div class='card' style='background:#fef2f2;border-color:#fecaca;font-weight:600;color:#991b1b'>⚠️ {escape(x)}</div>" for x in w)
 
 def admin_only(f):
     def w(*a, **k):
@@ -647,31 +734,47 @@ def home():
 def setup():
     d = load(); s = d["settings"]
     if session.get("admin") is True:
-        saved = "".join(f"<div style='border:1px solid #e2e8f0;padding:10px;border-radius:10px;margin:6px 0'><b>#{escape(a['id'])} {escape(a['platform'])}</b> · key {escape(str(a['login'])[:4])}**** · balance {escape(str(a.get('balance','0')))} · {escape(a.get('server',''))} <form action='/test_account/{escape(a['id'])}' method='post' style='display:inline'><button class='btn' style='padding:4px 10px;font-size:12px;margin-left:8px'>Test connection</button></form></div>" for a in d["accounts"]) or "<p class='muted'>No account yet.</p>"
+        saved = "".join(f"<div style='border:1px solid #e2e8f0;padding:10px;border-radius:10px;margin:6px 0'><b>#{escape(a['id'])} {escape(a['platform'])}</b> · key {escape('hidden' if a['platform'] == 'EA' else str(a['login'])[:4] + '****')}{' · EA last heard ' + escape(a.get('last_seen', 'never')) if a['platform'] == 'EA' else ''} · balance {escape(str(a.get('balance','0')))} · {escape(a.get('server',''))} <form action='/test_account/{escape(a['id'])}' method='post' style='display:inline'><button class='btn' style='padding:4px 10px;font-size:12px;margin-left:8px'>Test connection</button></form></div>" for a in d["accounts"]) or "<p class='muted'>No account yet.</p>"
     else: saved = "<p class='muted'>Fill the form to connect your account. Saved accounts are visible to the admin only.</p>"
     plats = "".join(f"<option>{escape(p)}</option>" for p in s["platforms"])
     return layout("Setup", f"""<div class='card'><h2>Accounts</h2>{saved}<hr style='margin:14px 0;border:none;border-top:1px solid #e2e8f0'>
 <form action='/save_account' method='post' class='grid'><div><label>Account #</label><input class='input' name='id' type='number' min='1' max='{s['max_accounts']}' required></div>
 <div><label>Platform</label><select class='input' name='platform'>{plats}</select></div>
-<div><label>API key / login</label><input class='input' name='login' required></div><div><label>API secret (MT4/MT5: type any text)</label><input class='input' name='password' type='password'></div>
+<div><label>API key / login (platform EA: leave blank, a key is created for you)</label><input class='input' name='login'></div><div><label>API secret (MT4/MT5: type any text)</label><input class='input' name='password' type='password'></div>
 <div><label>Extra: passphrase (OKX, Bitget) · MetaApi account ID (MT4/MT5)</label><input class='input' name='extra'></div>
 <div><label>Server (Binance: type testnet for test money, blank for real)</label><input class='input' name='server'></div>
-<div><label>Account balance (USDT) used for sizing</label><input class='input' name='balance' type='number' step='any' required></div><div><button class='btn'>Save</button></div></form>
+<div><label>Account balance (USDT) used for sizing</label><input class='input' name='balance' type='number' step='any'></div><div><button class='btn'>Save</button></div></form>
 <div class='muted' style='margin-top:12px;line-height:1.7'><b>What to enter</b><br>
 <b>BINANCE / BYBIT:</b> API key + secret. Server: blank = real, <code>testnet</code> = test money.<br>
 <b>OKX / BITGET:</b> API key + secret + passphrase (in Extra). OKX Server <code>testnet</code> = demo keys.<br>
 <b>MT5 / MT4</b> (Exness, FBS, FTMO, IC Markets, any broker): create a free account at metaapi.cloud, add your MT login there, then paste its <b>API token</b> into "API key", its <b>account ID</b> into Extra, and your region (e.g. <code>new-york</code>, <code>london</code>) into Server.<br>
-Use trade-only keys with withdrawals disabled.</div></div>""")
+<b>EA</b> (free, runs inside MT5 on your laptop, any MT5 broker): choose Platform EA, leave the key blank and press Save. The next page gives you the EA file with your key already inside, and a link to check your connection.<br>Use trade-only keys with withdrawals disabled.</div></div>""")
+
+def _hidden(aid, key): return f"<input type='hidden' name='id' value='{escape(aid)}'><input type='hidden' name='key' value='{escape(key)}'>"
 
 @app.route("/save_account", methods=["POST"])
 def save_account():
+    is_admin = session.get("admin") is True
+    if not is_admin and throttled("mk", 8, 3600, add=True): return "Too many accounts created from your network. Try again later.", 429
     with LOCK:
         d = load(); f = request.form
         acc = {k: f.get(k, "").strip() for k in ("id", "platform", "login", "password", "server", "balance", "extra")}
-        if not acc["id"].isdigit() or acc["platform"] not in d["settings"]["platforms"]: return "Invalid account", 400
-        if any(a["id"] == acc["id"] for a in d["accounts"]) and session.get("admin") is not True: return "Account number already used", 403
+        if not acc["id"].isdigit() or len(acc["id"]) > 6 or acc["platform"] not in d["settings"]["platforms"]: return "Invalid account", 400
+        if acc["platform"] == "EA":
+            acc["login"] = secrets.token_urlsafe(24); acc["key_hash"] = _h(acc["login"]); acc["password"] = acc["extra"] = ""
+        elif not acc["login"]: return "API key / login is required", 400
+        elif not CRYPTO: return "Secure storage is not ready on this server yet. Please try again later.", 503
+        exists = any(a["id"] == acc["id"] for a in d["accounts"])
+        if exists and not is_admin: return "Account number already used", 403
+        if not exists and len(d["accounts"]) >= int(d["settings"]["max_accounts"]): return "This app has reached its account limit", 403
         d["accounts"] = [a for a in d["accounts"] if a["id"] != acc["id"]] + [acc]; save(d)
-    return redirect("/setup")
+    if acc["platform"] == "EA":
+        return layout("EA key", f"<div class='card' style='max-width:640px'><h2>Account saved</h2><p class='muted'>Your EA key. Write it down: with your account number it lets you check your connection later.</p><pre style='font-size:14px;word-break:break-all'>Account #{escape(acc['id'])}\nKey: {escape(acc['login'])}</pre>"
+                f"<form method='post' action='/ea/download' style='margin-top:12px'>{_hidden(acc['id'], acc['login'])}<button class='btn'>1. Download the EA (your key is already inside)</button></form>"
+                f"<form method='post' action='/status' style='margin-top:10px'>{_hidden(acc['id'], acc['login'])}<button class='btn' style='background:#0f172a'>2. Open my account page</button></form></div>")
+    if is_admin: return redirect("/setup")
+    return layout("Saved", f"<div class='card' style='max-width:640px'><h2>Account saved</h2><p class='muted'>Your details are stored encrypted. Check that the connection works:</p>"
+                  f"<form method='post' action='/status' style='margin-top:12px'>{_hidden(acc['id'], acc['login'])}<input type='hidden' name='action' value='test'><button class='btn'>Test my connection</button></form></div>")
 
 @app.route("/test_account/<aid>", methods=["POST"])
 @admin_only
@@ -679,9 +782,160 @@ def test_account(aid):
     with LOCK:
         d = load(); a = next((x for x in d["accounts"] if x["id"] == aid), None)
         if not a: abort(404)
-        try: b = balance(a); a["balance"] = str(round(b, 2)); save(d); msg = f"✅ Connected. Balance synced: {b:,.2f}"
-        except Exception as e: msg = f"❌ Could not connect: {escape(str(e))}"
+        if a["platform"] == "EA":
+            msg = (f"✅ EA connected. Last heard from it: {escape(a['last_seen'])} UTC. Balance: {escape(str(a.get('balance', '0')))}" if a.get("last_seen")
+                   else "⚠️ The EA has not contacted the app yet. Attach it to a chart in MT5 and read the Experts tab.")
+        else:
+            try: b = balance(a); a["balance"] = str(round(b, 2)); save(d); msg = f"✅ Connected. Balance synced: {b:,.2f}"
+            except Exception as e: msg = f"❌ Could not connect: {escape(str(e))}"
     return layout("Test", f"<div class='card'><h2>Connection test</h2><p style='margin:10px 0'>{msg}</p><a class='btn' href='/setup'>Back</a></div>")
+
+# ---------------- EA bridge: MT5 on the user's own laptop talks to the app (no MetaApi needed) ----------------
+def ea_account(d, key):
+    h = _h(key)
+    for a in d["accounts"]:
+        if a["platform"] == "EA" and a.get("key_hash") and hmac.compare_digest(a["key_hash"], h): return a
+
+@app.route("/ea/sync", methods=["POST"])
+def ea_sync():
+    """Plain-text protocol. The EA sends: KEY= SYMBOL= TF= BAL= [PLACED=id] [FAILED=id~reason] then '---' and candle lines t,o,h,l,c (closed bars, oldest first).
+    The app answers: 'OK <mode>' then ORDER|id|side|entry|sl|tp|risk and CANCEL|id lines."""
+    head, rows, placed, failed = {}, [], [], []
+    for ln in request.get_data(as_text=True).splitlines():
+        ln = ln.strip()
+        if not ln or ln == "---": continue
+        k, _, v = ln.partition("=")
+        if _ and k in ("KEY", "SYMBOL", "TF", "BAL", "PLACED", "FAILED"):
+            if k == "PLACED": placed.append(v)
+            elif k == "FAILED": failed.append(v)
+            else: head[k] = v
+        elif ln.count(",") == 4:
+            try: t, o_, h, l, c = ln.split(","); rows.append({"t": int(t) * 1000, "o": float(o_), "h": float(h), "l": float(l), "c": float(c)})
+            except ValueError: return "ERR bad candle data", 400
+    sym = re.sub(r"[^A-Za-z0-9._#]", "", head.get("SYMBOL", ""))[:20]
+    if not sym or len(rows) > 1000: return "ERR bad request", 400
+    if throttled("ea", 30): return "ERR too many wrong keys. Wait a few minutes.", 429
+    with LOCK:
+        d = load(); s = d["settings"]; a = ea_account(d, head.get("KEY", ""))
+        if not a:
+            throttled("ea", 30, add=True)
+            return "ERR unknown EA key. Check the key in the EA inputs.", 401
+        if rows and head.get("TF") != s["timeframe"]: return f"ERR the chart is {head.get('TF')} but the app trades {s['timeframe']}. Change the chart timeframe.", 400
+        if rows and len(rows) < 30: return "ERR not enough candles on the chart yet", 400
+        try: bal = float(head.get("BAL", 0))
+        except ValueError: bal = 0
+        if bal > 0: a["balance"] = str(round(bal, 2))
+        a["last_seen"] = str(datetime.datetime.utcnow())[:19]
+        mine = [o for o in d["orders"] if o.get("account") == a["id"] and o.get("symbol") == sym]
+        for o in mine:
+            if o["id"] in placed: o["ea_ack"] = True
+        for f in failed:
+            oid, _, err = f.partition("~")
+            for o in mine:
+                if o["id"] == oid and o.get("outcome") == "PENDING" and not o.get("ea_ack"): o["status"], o["outcome"] = f"LIVE FAILED: {err[:150]}", "REJECTED"
+        if rows:
+            for o in mine: resolve(o, rows)
+            sig = find_setup(rows, s)
+            seen_key = f"ea:{a['id']}:{sym}-{sig['key']}" if sig else None
+            if sig and seen_key not in d["seen"]:
+                d["seen"] = (d["seen"] + [seen_key])[-500:]
+                skip = any(str(sig[f]) in s["filters"].get(f, []) for f in s["filters"] if f in sig)
+                busy = any(o.get("outcome") in ("PENDING", "OPEN") for o in mine)
+                if not skip and not busy:
+                    new = place_order(a, sig, sym, s); d["orders"].append(new); mine.append(new)
+        out = [f"OK {s['mode']}"]
+        if s["mode"] == "live":
+            for o in mine:
+                if str(o.get("status", "")).startswith("LIVE: queued") and not o.get("ea_ack") and o.get("outcome") == "PENDING":
+                    out.append(f"ORDER|{o['id']}|{o['side']}|{o['entry']!r}|{o['sl']!r}|{o['tp']!r}|{o['risk_amount']}")
+        cutoff = str(datetime.datetime.utcnow() - datetime.timedelta(days=3))
+        for o in mine:
+            if o.get("outcome") == "EXPIRED" and str(o.get("status", "")).startswith("LIVE") and o.get("time", "") > cutoff: out.append(f"CANCEL|{o['id']}")
+        d["orders"] = d["orders"][-5000:]; save(d)
+    return "\n".join(out), 200, {"Content-Type": "text/plain"}
+
+def find_account(d, aid, key):
+    if not key: return None
+    for a in d["accounts"]:
+        if a["id"] != str(aid).strip(): continue
+        if a["platform"] == "EA": ok = bool(a.get("key_hash")) and hmac.compare_digest(a["key_hash"], _h(key))
+        else: ok = bool(a.get("login")) and hmac.compare_digest(str(a["login"]).encode(), key.encode())
+        if ok: return a
+
+@app.route("/status", methods=["GET", "POST"])
+def my_status():
+    form = ("<div class='card' style='max-width:520px'><h2>My account</h2><p class='muted' style='margin-bottom:10px'>Check that your connection works and see your own results. "
+            "Enter your account number and your key: the EA key you were given, or your exchange API key.</p>"
+            "<form method='post'><label>Account #</label><input class='input' name='id' required><br><br><label>Key</label><input class='input' name='key' type='password' required><br><br><button class='btn'>Open my account</button></form></div>")
+    if request.method == "GET": return layout("My account", form)
+    aid, key, act = request.form.get("id", "").strip(), request.form.get("key", "").strip(), request.form.get("action", "")
+    if throttled("st", 10): return layout("My account", "<div class='card' style='max-width:520px'>Too many attempts. Try again in 10 minutes.</div>"), 429
+    d = load(); a = find_account(d, aid, key)
+    if not a:
+        throttled("st", 10, add=True)
+        return layout("My account", "<div class='card' style='max-width:520px;color:#dc2626;font-weight:600'>Account number or key not recognised.</div>" + form), 403
+    s, ee, note, tested = d["settings"], a["platform"] == "EA", "", None
+    if act == "test" and not ee:
+        try:
+            b = balance(a); tested = True; note = f"Connected. Your balance: {b:,.2f}"; a["balance"] = str(round(b, 2))
+            with LOCK:
+                dd = load(); x = next((z for z in dd["accounts"] if z["id"] == a["id"]), None)
+                if x: x["balance"] = a["balance"]; save(dd)
+        except Exception as e: tested = False; note = "Could not connect: " + str(e)[:200]
+    if ee:
+        ls = a.get("last_seen", "")
+        try: on = bool(ls) and (datetime.datetime.utcnow() - datetime.datetime.strptime(ls, "%Y-%m-%d %H:%M:%S")).total_seconds() < 180
+        except ValueError: on = False
+        badge = (f"<b style='color:#16a34a'>● Connected</b> <span class='muted'>(EA last heard {escape(ls)} UTC)</span>" if on else
+                 f"<b style='color:#dc2626'>● Not connected</b> <span class='muted'>({'last heard ' + escape(ls) + ' UTC' if ls else 'the EA has not contacted the app yet'})</span>")
+    elif tested is True: badge = f"<b style='color:#16a34a'>● {escape(note)}</b>"
+    elif tested is False: badge = f"<b style='color:#dc2626'>● {escape(note)}</b>"
+    else: badge = "<b style='color:#64748b'>● Saved. Press Test connection to check your keys.</b>"
+    mode = ("LIVE: orders are sent to your account." if s["mode"] == "live" else "PAPER: practice mode. Trades are recorded here but not sent to your account.")
+    mine = [o for o in d["orders"] if o.get("account") == a["id"]]; p = perf(mine)
+    box = lambda l, v: f"<div style='border:1px solid #e2e8f0;border-radius:12px;padding:12px'><div class='muted'>{l}</div><div style='font-size:22px;font-weight:800'>{v}</div></div>"
+    rows = "".join(f"<div style='padding:8px;border-bottom:1px solid #f1f5f9;font-size:12px'>{escape(o.get('time', '')[:16])} · {escape(o.get('symbol', ''))} {escape(o.get('side', ''))} · E {o['entry']:.6g} SL {o['sl']:.6g} TP {o['tp']:.6g} · <b>{escape(o.get('outcome', ''))}</b> {escape(str(o.get('status', '')))}</div>"
+                   for o in mine[::-1][:10] if "entry" in o) or "<p class='muted'>No trades yet. The robot only trades when its pattern appears.</p>"
+    tr = f"{p['total_r']:+}R"
+    hid = _hidden(a["id"], key)
+    acts = f"<form method='post' style='display:inline'>{hid}<button class='btn'>Refresh</button></form> "
+    if ee: acts += f"<form method='post' action='/ea/download' style='display:inline'>{hid}<button class='btn' style='background:#0f172a'>Download EA with my key</button></form>"
+    else: acts += f"<form method='post' style='display:inline'>{hid}<input type='hidden' name='action' value='test'><button class='btn' style='background:#0f172a'>Test connection</button></form>"
+    guide = ("<details style='margin-top:14px'><summary style='cursor:pointer;font-weight:700'>How to connect the EA (about 5 minutes)</summary><ol class='muted' style='line-height:1.9;margin:8px 0 0 18px'>"
+             "<li>Install MetaTrader 5 and log in to your broker account (demo or real).</li>"
+             "<li>Press Copy EA code below. In MT5 press F4 to open MetaEditor, choose File, New, Expert Advisor (template), name it ISIG_EA and press Finish. Select all (Ctrl+A), paste (Ctrl+V), then press F7. It should say 0 errors.</li>"
+             f"<li>In MT5: Tools, Options, Expert Advisors. Tick Allow WebRequest and add <b>{escape(request.host_url.rstrip('/'))}</b></li>"
+             "<li>Open a 30-minute chart of your pair. In Navigator, right-click Expert Advisors, Refresh, drag ISIG_EA onto the chart, tick Allow Algo Trading, press OK.</li>"
+             "<li>Turn on the Algo Trading button in MT5. This page will show Connected within a minute.</li></ol></details>") if ee else ""
+    src = _ea_source(key) if ee else None
+    code = ("<div class='card' style='max-width:760px'><h3>Copy the EA code</h3><p class='muted' style='margin:4px 0 10px'>Press the button, then paste (Ctrl+V) into a new file in MetaEditor. Your key is already inside. Keep it private.</p>"
+            "<button class='btn' type='button' id='cpbtn'>Copy EA code</button> <span id='cpmsg' class='muted'></span>"
+            f"<textarea id='eacode' readonly rows='6' style='width:100%;margin-top:10px;font-family:monospace;font-size:11px;border:1px solid #e2e8f0;border-radius:10px;padding:8px'>{escape(src or '')}</textarea>"
+            "<script>document.getElementById('cpbtn').onclick=function(){var t=document.getElementById('eacode'),m=document.getElementById('cpmsg');function ok(){m.textContent='Copied. Now paste it in MetaEditor.'}"
+            "if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(t.value).then(ok,function(){t.select();document.execCommand('copy');ok()})}else{t.select();document.execCommand('copy');ok()}}</script></div>") if src else ""
+    body = (f"<div class='card' style='max-width:760px'><h2>Account #{escape(a['id'])} · {escape(a['platform'])}</h2><p style='margin:8px 0'>{badge}</p>"
+            f"<p class='muted'>Balance: {escape(str(a.get('balance', '0')))} · risk per trade {s['risk_pct']}% · target 1:{s['rr']}</p><p class='muted' style='margin:6px 0 12px'>Mode: {escape(mode)}</p>{acts}{guide}</div>{code}"
+            f"<div class='card' style='max-width:760px'><h3>My results</h3><div class='grid'>{box('Closed trades', p['trades'])}{box('Win rate', str(p['win_rate']) + '%')}{box('Total result', tr)}</div>"
+            f"<h3 style='margin-top:14px'>My latest trades</h3>{rows}</div>")
+    return layout("My account", body)
+
+def _ea_source(key):
+    try:
+        with open(EA_FILE, encoding="utf-8") as fh: src = fh.read()
+    except OSError: return None
+    server = request.host_url.rstrip("/")
+    src = re.sub(r'(input\s+string\s+InpServer\s*=\s*)"[^"]*"', lambda m: m.group(1) + '"' + server + '"', src)
+    return re.sub(r'(input\s+string\s+InpKey\s*=\s*)"[^"]*"', lambda m: m.group(1) + '"' + key + '"', src)
+
+@app.route("/ea/download", methods=["POST"])
+def ea_download():
+    if throttled("st", 10): return "Too many attempts. Try again later.", 429
+    key = request.form.get("key", "").strip()
+    a = find_account(load(), request.form.get("id", ""), key)
+    if not a or a["platform"] != "EA": throttled("st", 10, add=True); return "Account number or key not recognised.", 403
+    src = _ea_source(key)
+    if src is None: return "The EA file (ISIG_EA.mq5) is not on the server yet. Ask the owner to upload it next to app.py.", 404
+    return Response(src, mimetype="text/plain", headers={"Content-Disposition": "attachment; filename=ISIG_EA.mq5"})
 
 @app.route("/webhook", methods=["POST", "GET"])
 def webhook():
@@ -760,9 +1014,10 @@ def admin():
     if request.method == "POST":
         ip, now = _ip(), time.time()
         FAILS[ip] = [t for t in FAILS.get(ip, []) if now - t < 600]
-        if len(FAILS[ip]) >= 5: session["msg"] = "Too many wrong attempts. Try again in 10 minutes."
+        FAILS["admin*"] = [t for t in FAILS.get("admin*", []) if now - t < 600]          # global cap, even if someone fakes their address
+        if len(FAILS[ip]) >= 5 or len(FAILS["admin*"]) >= 20: session["msg"] = "Too many wrong attempts. Try again in 10 minutes."
         elif check_admin(request.form.get("pw", "")): session["admin"] = True; session.permanent = True; FAILS.pop(ip, None)
-        else: FAILS[ip].append(now); session["msg"] = "Wrong password."
+        else: FAILS[ip].append(now); FAILS["admin*"].append(now); session["msg"] = "Wrong password."
         return redirect("/admin")
     if session.get("admin") is not True:
         m = session.pop("msg", None)
@@ -793,7 +1048,7 @@ def admin():
             tbl += f"<div class='muted'>{f}={escape(k)}: {m['n']} trades · win {m['win']}% · avg {m['exp']}R</div>"
             if m["n"] >= 10 and m["exp"] < 0: tips.append(f"Consider filtering {f}={k} ({m['n']} trades, {m['exp']}R avg)")
     jr = "".join(f"<div style='border-top:1px solid #e2e8f0;padding:10px 0'><img src='/uploads/{escape(j['file'])}' style='max-width:100%;max-height:260px;border-radius:8px'><div class='muted'>{escape(j['symbol'])} · {escape(j['result'])} · {escape(j['note'])}</div><pre>{escape(j.get('analysis','(not analysed)'))}</pre><form action='/admin/analyze/{j['id']}' method='post'><button class='btn' style='padding:6px 12px'>Analyse with Claude</button></form></div>" for j in d["journal"][::-1][:15])
-    return layout("Admin", f"""{msg}{brand}<div class='card'><h2>1. Settings</h2><form action='/admin/save' method='post' class='grid'>{fields}
+    return layout("Admin", f"""{msg}{_warnings(d)}{brand}<div class='card'><h2>1. Settings</h2><form action='/admin/save' method='post' class='grid'>{fields}
 <div><label>Type LIVE here to allow mode=live</label><input class='input' name='confirm'></div><div><button class='btn'>Save settings</button></div></form>
 <p class='muted' style='margin-top:8px'>Lists/filters are JSON. Example filter: {{"session": ["Asia"]}}</p>
 <form action='/admin/scan' method='post' style='margin-top:10px'><button class='btn' style='background:#0f172a'>Run scan now</button></form></div>
