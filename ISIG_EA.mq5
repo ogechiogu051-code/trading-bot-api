@@ -4,23 +4,31 @@
 //| 2) the app finds the setup and answers with an order               |
 //| 3) this EA places the limit order with SL and TP attached          |
 //| Lot size is calculated here from the risk amount the app sends.    |
+//| v2: also reports the account type (demo/real), server and login so |
+//|     the app can classify the account; obeys the app's poll timing. |
 //+------------------------------------------------------------------+
 #property copyright "Nnanna Michael"
-#property version   "1.00"
+#property version   "2.00"
 #property description "Sends candles to the bot app and places the orders it returns."
 
 #include <Trade\Trade.mqh>
 
 input string InpServer      = "https://trading-bot-api-isig.onrender.com"; // Your app address (no slash at the end)
 input string InpKey         = "";                                           // EA key shown when you saved the EA account
-input int    InpSyncSeconds = 20;                                           // How often to talk to the app (seconds)
+input int    InpSyncSeconds = 30;                                           // Start-up poll time; the app then tells the EA how often to call
 input int    InpCandles     = 300;                                          // Closed candles sent to the app
+input int    InpJitter      = 20;                                           // Random delay (seconds) after a bar closes, spreads the load on the app
 input long   InpMagic       = 20260101;                                     // Magic number for orders placed by this EA
 
 CTrade   trade;
 string   g_placed[];        // order ids placed, waiting to be confirmed to the app
 string   g_failed[];        // "id~reason" for orders the broker refused
 datetime g_lastSent = 0;    // last closed bar already sent to the app
+datetime g_jitterBar = 0;   // bar for which the random delay was drawn
+datetime g_sendAfter = 0;   // do not send candles before this time
+int      g_period = 0;      // current timer period in seconds
+string   g_tier = "";       // what the app says about this account (demo / real)
+string   g_msg  = "";       // message from the app (for example plan expired)
 
 //+------------------------------------------------------------------+
 string TfName()
@@ -43,9 +51,31 @@ string Clean(string s)
    StringReplace(s, "|", " ");
    StringReplace(s, "~", " ");
    StringReplace(s, ",", " ");
+   StringReplace(s, "=", " ");
    StringReplace(s, "\n", " ");
    StringReplace(s, "\r", " ");
    return s;
+  }
+
+// account type exactly as MetaTrader reports it
+string AccountMode()
+  {
+   switch((ENUM_ACCOUNT_TRADE_MODE)AccountInfoInteger(ACCOUNT_TRADE_MODE))
+     {
+      case ACCOUNT_TRADE_MODE_DEMO:    return "DEMO";
+      case ACCOUNT_TRADE_MODE_CONTEST: return "CONTEST";
+      case ACCOUNT_TRADE_MODE_REAL:    return "REAL";
+     }
+   return "REAL";            // unknown is treated as real
+  }
+
+void SetPeriod(int sec)
+  {
+   sec = MathMax(5, MathMin(600, sec));
+   if(sec == g_period) return;
+   EventKillTimer();
+   EventSetTimer(sec);
+   g_period = sec;
   }
 
 void AddUnique(string &arr[], string v)
@@ -136,11 +166,20 @@ void CancelOrder(string id)
   }
 
 //+------------------------------------------------------------------+
+void ShowStatus(string status)
+  {
+   Comment("ISIG EA: ", status, "\n", _Symbol, " ", TfName(),
+           (g_tier != "" ? "\nAccount: " + g_tier : ""),
+           (g_msg  != "" ? "\n" + g_msg : ""),
+           "\nlast check ", TimeToString(TimeLocal(), TIME_SECONDS));
+  }
+
 void ProcessResponse(string resp)
   {
    string lines[];
    int n = StringSplit(resp, '\n', lines);
    string status = "";
+   g_msg = "";
    for(int i = 0; i < n; i++)
      {
       string ln = lines[i];
@@ -149,13 +188,17 @@ void ProcessResponse(string resp)
       if(StringLen(ln) == 0) continue;
       string p[];
       int k = StringSplit(ln, '|', p);
+      if(k < 1) continue;
       if(StringFind(ln, "OK ") == 0) status = "connected (" + StringSubstr(ln, 3) + " mode)";
+      else if(p[0] == "NEXT" && k >= 2) SetPeriod((int)StringToInteger(p[1]));
+      else if(p[0] == "TIER" && k >= 2) g_tier = StringToUpper(p[1]) + (k >= 3 ? " - " + p[2] : "");
+      else if(p[0] == "MSG" && k >= 2) g_msg = p[1];
       else if(p[0] == "ORDER" && k >= 7)
          PlaceOrder(p[1], p[2], StringToDouble(p[3]), StringToDouble(p[4]), StringToDouble(p[5]), StringToDouble(p[6]));
       else if(p[0] == "CANCEL" && k >= 2)
          CancelOrder(p[1]);
      }
-   Comment("ISIG EA: ", status, "\n", _Symbol, " ", TfName(), "\nlast check ", TimeToString(TimeLocal(), TIME_SECONDS));
+   ShowStatus(status);
   }
 
 string BuildBody(bool withCandles)
@@ -164,6 +207,13 @@ string BuildBody(bool withCandles)
    b += "SYMBOL=" + _Symbol + "\n";
    b += "TF=" + TfName() + "\n";
    b += "BAL=" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2) + "\n";
+   // account facts straight from MetaTrader: the app uses them to decide demo or real
+   b += "TRADEMODE=" + AccountMode() + "\n";
+   b += "ACCSERVER=" + Clean(AccountInfoString(ACCOUNT_SERVER)) + "\n";
+   b += "ACCCOMPANY=" + Clean(AccountInfoString(ACCOUNT_COMPANY)) + "\n";
+   b += "ACCLOGIN=" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + "\n";
+   b += "ACCCCY=" + Clean(AccountInfoString(ACCOUNT_CURRENCY)) + "\n";
+   b += "EAVER=2\n";
    for(int i = 0; i < ArraySize(g_placed); i++) b += "PLACED=" + g_placed[i] + "\n";
    for(int i = 0; i < ArraySize(g_failed); i++) b += "FAILED=" + g_failed[i] + "\n";
    if(withCandles)
@@ -188,7 +238,16 @@ void Sync()
       return;
      }
    datetime lastBar = iTime(_Symbol, _Period, 1);
-   bool withC = (lastBar != g_lastSent);                            // send candles once per new closed bar
+   bool withC = false;
+   if(lastBar != g_lastSent)                                        // a new closed bar: send candles, after a small random delay
+     {
+      if(g_jitterBar != lastBar)
+        {
+         g_jitterBar = lastBar;
+         g_sendAfter = TimeLocal() + (MathRand() % (MathMax(0, InpJitter) + 1));
+        }
+      withC = (TimeLocal() >= g_sendAfter);
+     }
    string body = BuildBody(withC);
    if(withC && body == "") { withC = false; body = BuildBody(false); }
 
@@ -205,6 +264,7 @@ void Sync()
    string resp = CharArrayToString(result, 0, WHOLE_STRING, CP_UTF8);
    if(code != 200)
      {
+      if(code == 429 || code == 503) SetPeriod(MathMax(g_period, 60));       // the app is busy: wait longer
       Comment("ISIG EA: ", resp);
       return;
      }
@@ -218,7 +278,8 @@ void Sync()
 int OnInit()
   {
    trade.SetExpertMagicNumber(InpMagic);
-   EventSetTimer(MathMax(5, InpSyncSeconds));
+   MathSrand((int)(GetTickCount() ^ (uint)AccountInfoInteger(ACCOUNT_LOGIN)));
+   SetPeriod(InpSyncSeconds);
    Comment("ISIG EA: starting...");
    return INIT_SUCCEEDED;
   }
