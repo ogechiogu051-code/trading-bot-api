@@ -893,7 +893,6 @@ a{color:var(--brand)}
 .mark{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,var(--brand),var(--brand2));display:grid;place-items:center;box-shadow:0 6px 16px rgba(37,99,235,.35)}
 .links a{margin-left:4px;text-decoration:none;color:#475569;font-weight:700;font-size:12px;letter-spacing:.04em;padding:8px 12px;border-radius:999px;transition:.2s}
 .links a:hover{background:#eef2ff;color:var(--brand)}
-.links a#inst{background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff}.links a#inst:hover{filter:brightness(1.1);color:#fff}
 .card{background:#fff;border:1px solid var(--line);border-radius:18px;padding:22px;margin:16px auto;max-width:1100px;box-shadow:0 8px 30px rgba(15,23,42,.05);animation:fade .5s ease both}
 @keyframes fade{from{opacity:0;translate:0 10px}to{opacity:1;translate:0 0}}
 .btn{background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;padding:11px 18px;border-radius:12px;border:none;font-weight:700;cursor:pointer;text-decoration:none;display:inline-block;transition:.2s;box-shadow:0 8px 20px rgba(37,99,235,.25)}
@@ -946,18 +945,17 @@ def service_worker():
          "self.addEventListener('fetch',function(e){e.respondWith(fetch(e.request).catch(function(){return new Response('You are offline. Reconnect to open the app.',{headers:{'Content-Type':'text/plain'}})}))});"
     return js, 200, {"Content-Type": "application/javascript", "Service-Worker-Allowed": "/", "Cache-Control": "no-cache"}
 
-# Install prompts: a banner at the bottom of every page, the button in the top bar, and one in the home page hero. All of them
-# share the class .instbtn (or id #inst) and are hidden automatically once the app is installed / opened as an app.
+# Install prompt: ONE banner at the bottom of every page (the only install button). It hides itself once the app is installed / opened as an app.
 PWA_JS = ("<div class='instbar' id='instbar'><b>📲 Install the app on your phone</b><button class='btn instbtn' type='button'>INSTALL</button><button class='x' id='instx' type='button' aria-label='Close'>×</button></div>"
           "<script>if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js');var dp=null,bar=document.getElementById('instbar');"
           "function inApp(){return (window.matchMedia&&matchMedia('(display-mode: standalone)').matches)||navigator.standalone===true}"
-          "function hideAll(){document.querySelectorAll('.instbtn,#inst').forEach(function(e){e.style.display='none'});if(bar)bar.style.display='none'}"
+          "function hideAll(){document.querySelectorAll('.instbtn').forEach(function(e){e.style.display='none'});if(bar)bar.style.display='none'}"
           "var closed=false;try{closed=sessionStorage.getItem('instx')==='1'}catch(e){}"
           "if(inApp())hideAll();else if(bar&&!closed)bar.style.display='flex';"
           "addEventListener('beforeinstallprompt',function(e){e.preventDefault();dp=e});"
           "addEventListener('appinstalled',hideAll);"
           "document.getElementById('instx').onclick=function(){bar.style.display='none';try{sessionStorage.setItem('instx','1')}catch(e){}};"
-          "document.querySelectorAll('.instbtn,#inst').forEach(function(b){b.onclick=function(x){x.preventDefault();"
+          "document.querySelectorAll('.instbtn').forEach(function(b){b.onclick=function(x){x.preventDefault();"
           "if(dp){dp.prompt();dp=null}else{alert('To install: open your browser menu (the three dots) and tap Install app or Add to Home screen. On iPhone use Safari: tap Share, then Add to Home Screen.')}}});</script>")
 
 LOGO_SVG = "<svg width='18' height='18' viewBox='0 0 18 18'><rect x='2' y='8' width='3' height='8' rx='1' fill='#fff'/><rect x='7.5' y='3' width='3' height='13' rx='1' fill='#fff'/><rect x='13' y='6' width='3' height='10' rx='1' fill='#fff' opacity='.85'/></svg>"
@@ -971,7 +969,7 @@ def layout(title, body):
     links = "".join(f"<a href='{h}'>{t}</a>" for h, t in nav)
     return (f"<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>{escape(title)} · {name}</title>"
             f"<link rel='preconnect' href='https://fonts.googleapis.com'><link href='https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap' rel='stylesheet'>"
-            f"<link rel='manifest' href='/manifest.webmanifest'><meta name='theme-color' content='#2563eb'><link rel='apple-touch-icon' href='/icon-192.png'><style>{CSS}</style></head><body><div class='nav'><a class='logo' href='/'><span class='mark'>{LOGO_SVG}</span>{name}</a><div class='links'>{links}<a href='#' id='inst'>⬇ INSTALL APP</a></div></div>{body}"
+            f"<link rel='manifest' href='/manifest.webmanifest'><meta name='theme-color' content='#2563eb'><link rel='apple-touch-icon' href='/icon-192.png'><style>{CSS}</style></head><body><div class='nav'><a class='logo' href='/'><span class='mark'>{LOGO_SVG}</span>{name}</a><div class='links'>{links}</div></div>{body}"
             f"<div class='foot'>© {datetime.datetime.utcnow().year} {name} · Trading involves risk. Past results do not guarantee future results. Not financial advice.</div>{PWA_JS}</body></html>")
 
 @app.after_request
@@ -1137,6 +1135,10 @@ def init_app():
             if attempt == 3: raise
             time.sleep(1 + random.random())                           # two processes creating the tables at the same instant
     migrate_legacy()
+    if ADMIN_PASSWORD:                      # a NEW value in Render's ADMIN_PASSWORD replaces the saved admin password (once per change)
+        fp = hashlib.sha256((kdf_salt() + ADMIN_PASSWORD).encode()).hexdigest()
+        if kv_get("admin_env_fp") != fp:
+            set_admin_password(ADMIN_PASSWORD); kv_set("admin_env_fp", fp)
     sk = os.environ.get("SECRET_KEY") or kv_get("session_secret")
     if not sk:
         db.x("INSERT INTO kv (k, v) VALUES ('session_secret', :v) ON CONFLICT (k) DO NOTHING", v=secrets.token_hex(32)); sk = kv_get("session_secret")
@@ -1258,7 +1260,7 @@ HOME_TPL = """
   <span class='badge'><span class='dot'></span>@@MODE@@ MODE · SCANNING THE MARKET</span>
   <h1><span class='grad'>@@NAME@@</span><br>@@TAGLINE@@</h1>
   <p class='lead'>@@LEAD@@</p>
-  <div class='cta'><a class='btn' href='/setup'>CONNECT ACCOUNT →</a><a class='btn ghost' href='/performance'>VIEW PERFORMANCE</a><a class='btn ghost instbtn' href='#'>📲 INSTALL APP</a></div>
+  <div class='cta'><a class='btn' href='/setup'>CONNECT ACCOUNT →</a><a class='btn ghost' href='/performance'>VIEW PERFORMANCE</a></div>
   <div class='kpis'>
    <div class='kpi'><b data-to='@@TRADES@@'>0</b><span>Closed trades · @@TFK@@</span></div>
    <div class='kpi'><b data-to='@@WIN@@' data-dec='1' data-suf='%'>0</b><span>Win rate · @@TFK@@</span></div>
