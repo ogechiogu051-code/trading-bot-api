@@ -1401,4 +1401,674 @@ def _make_acc(f, user, s):
                 a["attest"] = {"server": str(info.get("server") or "")[:60], "login": str(info.get("login") or "")[:20], "broker": str(info.get("broker") or "")[:60]}
                 a["balance"] = float(info.get("balance") or 0)
             except Exception: return None, "MetaApi could not connect to that account. Check the token, the account ID and the region."
-            if a["attest"]["server"] and a["attest"]["login"]: a["fp"] = hashlib.sha256(f"{a['attest']['broker']}|{a['attest']['server']}|{a['attest']['login']}".lower().encode()).hexdiges
+            if a["attest"]["server"] and a["attest"]["login"]: a["fp"] = hashlib.sha256(f"{a['attest']['broker']}|{a['attest']['server']}|{a['attest']['login']}".lower().encode()).hexdigest()[:40]
+    return a, ""
+
+def _insert_account(a, user, s):
+    ref = secrets.token_hex(8); a.update(ref=ref, user_id=user["id"] if user else None, created=str(today()), trial_end=None)
+    a.update(tier_cols(a, s))
+    row = dict(ref=ref, user_id=a["user_id"], platform=a["platform"], tf=a["tf"], env=a["env"], server=a["server"], secrets=seal(ref, a["secrets"]) if a["secrets"] else "{}",
+               key_hash=a.get("key_hash"), balance=a["balance"], created=a["created"], tier=a["tier"], tier_src=a["tier_src"], tier_note=a["tier_note"], attest=json.dumps(a["attest"]), fp=a.get("fp"))
+    if not user and int(s.get("trial_days") or 0): row["trial_end"] = None
+    r = db.q("INSERT INTO accounts (ref, user_id, platform, tf, env, server, secrets, key_hash, balance, created, tier, tier_src, tier_note, attest, fp) VALUES "
+             "(:ref, :user_id, :platform, :tf, :env, :server, :secrets, :key_hash, :balance, :created, :tier, :tier_src, :tier_note, :attest, :fp) RETURNING id", **row)
+    if a["tier"] == "real" and user: start_trial(user["id"])
+    return r[0]["id"]
+
+@app.route("/save_account", methods=["POST"])
+def save_account():
+    s, user = S(), cur_user()
+    if s["require_signup"] and not user: return redirect("/login?next=/setup")
+    if throttled("mk", 20, 3600): return layout("Slow down", "<div class='card' style='max-width:520px'>Too many accounts created from your network. Try again later.</div>"), 429
+    if user and db.one("SELECT COUNT(*) AS n FROM accounts WHERE user_id=:u", u=user["id"])["n"] >= int(s["max_accounts_per_user"] or 0) > 0:
+        return layout("Limit", f"<div class='card' style='max-width:520px'>You can connect up to {int(s['max_accounts_per_user'])} accounts. Delete one on <a href='/status'>My account</a> first.</div>"), 403
+    a, err = _make_acc(request.form, user, s)
+    if err: return layout("Could not save", f"<div class='card' style='max-width:520px'><h2>Not saved</h2><p style='color:#dc2626;font-weight:600;margin:8px 0'>{escape(err)}</p><a class='btn' href='/setup'>Back</a></div>"), 400
+    try: aid = _insert_account(a, user, s)
+    except Exception as e:
+        return layout("Could not save", "<div class='card' style='max-width:520px'><h2>Not saved</h2><p class='muted'>This broker login is already linked to another account.</p><a class='btn' href='/setup'>Back</a></div>"), 409
+    throttled("mk", 20, 3600, add=True)
+    if a["platform"] == "EA": return _ea_created(aid, a["key"], new=True)
+    if user: return redirect(f"/account/{aid}")
+    return layout("Saved", f"<div class='card' style='max-width:640px'><h2>Account saved</h2><p class='muted'>Write down your account number and the API key you entered: without a login you need them to open your account page.</p><pre>Account #{aid}</pre>"
+                           f"<form method='post' action='/status' style='margin-top:12px'><input type='hidden' name='id' value='{aid}'><input type='hidden' name='key' value='{escape(a['secrets']['login'])}'><button class='btn'>Open my account page</button></form></div>")
+
+EX5_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ISIG_EA.ex5")
+def ex5_ready(): return os.path.exists(EX5_FILE)
+COMPILED_ONLY = os.environ.get("EA_COMPILED_ONLY") == "1" and os.path.exists(EX5_FILE)      # hand out only the compiled EA, never the source
+
+def _ea_created(aid, key, new=False):
+    src = None if COMPILED_ONLY else _ea_source(key)
+    code = (f"<textarea id='eacode' readonly rows='6' style='width:100%;margin-top:10px;font-family:monospace;font-size:11px;border:1px solid #e2e8f0;border-radius:10px;padding:8px'>{escape(src)}</textarea>"
+            "<button class='btn' type='button' id='cpbtn' style='margin-top:8px'>Copy EA code</button> <span id='cpmsg' class='muted'></span>"
+            "<script>document.getElementById('cpbtn').onclick=function(){var t=document.getElementById('eacode'),m=document.getElementById('cpmsg');function ok(){m.textContent='Copied. Paste it in MetaEditor.'}"
+            "if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(t.value).then(ok,function(){t.select();document.execCommand('copy');ok()})}else{t.select();document.execCommand('copy');ok()}}</script>") if src else ""
+    hid = f"<input type='hidden' name='id' value='{aid}'><input type='hidden' name='key' value='{escape(key)}'>"
+    srcpart = (f"<form method='post' action='/ea/download' style='margin-top:12px'>{hid}<button class='btn'>Download ISIG_EA.mq5</button></form><h3 style='margin-top:16px'>Or copy the code</h3>{code}") if src else ""
+    if not src and not COMPILED_ONLY: srcpart = "<p class='muted'>The EA file is not on the server yet (ISIG_EA.mq5 next to app.py).</p>"
+    ex5 = (f"<form method='post' action='/ea/download' style='margin-top:12px'>{hid}<input type='hidden' name='fmt' value='ex5'><button class='btn' style='background:#0f172a'>Download compiled EA (ISIG_EA.ex5)</button></form>"
+           "<p class='muted'>Put it in MT5 > File > Open Data Folder > MQL5 > Experts, restart MT5, drag it on a chart and paste your key and the app address into the EA inputs (F7).</p>") if ex5_ready() else ""
+    note = "Your key is already inside the code below." if src else "Paste this key into the EA inputs."
+    return layout("EA key", f"<div class='card' style='max-width:760px'><h2>{'Account saved' if new else 'New EA key'}</h2><p class='muted'>Your EA key. It is shown only now (the server keeps just a fingerprint). {note} Keep it private.</p>"
+                            f"<pre style='font-size:14px;word-break:break-all'>Account #{aid}\nKey: {escape(key)}\nApp address: {escape(request.host_url.rstrip('/'))}</pre>{srcpart}{ex5}"
+                            f"<p style='margin-top:14px'><a class='btn' style='background:#0f172a' href='/account/{aid}'>Open my account page</a></p></div>")
+
+def _ea_source(key):
+    try:
+        with open(EA_FILE, encoding="utf-8") as fh: src = fh.read()
+    except OSError: return None
+    server = request.host_url.rstrip("/")
+    src = re.sub(r'(input\s+string\s+InpServer\s*=\s*)"[^"]*"', lambda m: m.group(1) + '"' + server + '"', src)
+    return re.sub(r'(input\s+string\s+InpKey\s*=\s*)"[^"]*"', lambda m: m.group(1) + '"' + key + '"', src)
+
+# ======================================================================================================================
+# my accounts
+# ======================================================================================================================
+def _owner_or_key(aid, key=""):
+    """Account the caller may act on: its owner (logged in), or someone holding the account's key (accounts created without sign-up)."""
+    try: aid = int(aid)
+    except (TypeError, ValueError): return None
+    a = db.one("SELECT * FROM accounts WHERE id=:i", i=aid)
+    if not a: return None
+    u = cur_user()
+    if u and a["user_id"] == u["id"]: return a
+    return a if key and _key_ok(a, key) else None
+
+def _key_ok(a, key):
+    if a["platform"] == "EA": return bool(a["key_hash"]) and hmac.compare_digest(a["key_hash"], _h(key))
+    lg = unseal(a["ref"], a["secrets"]).get("login", "")
+    return bool(lg) and hmac.compare_digest(lg.encode(), key.encode())
+
+def tier_badge(a):
+    t = a["tier"]; col = "#16a34a" if t == "demo" else "#b45309"
+    src = {"endpoint": "proven by the exchange", "metaapi": "verified through MetaApi", "ea": "reported by the EA", "admin": "set by the owner", "unverified": "not verified yet"}.get(a["tier_src"], "")
+    return f"<span style='background:{col};color:#fff;border-radius:999px;padding:2px 10px;font-size:11px;font-weight:800'>{t.upper()}</span> <span class='muted'>{escape(src)}{' 路 ' + escape(a['tier_note']) if a['tier_note'] else ''}</span>"
+
+def _online(a):
+    try: return bool(a["last_seen"]) and (datetime.datetime.utcnow() - datetime.datetime.strptime(a["last_seen"][:19], "%Y-%m-%d %H:%M:%S")).total_seconds() < max(180, 4 * int(S()["ea_poll_seconds"]))
+    except ValueError: return False
+
+@app.route("/status", methods=["GET", "POST"])
+def my_status():
+    s, u = S(), cur_user()
+    if request.method == "POST":                                       # account page without sign-up: account number + key
+        if throttled("st", 10): return layout("My account", "<div class='card' style='max-width:520px'>Too many attempts. Try again in 10 minutes.</div>"), 429
+        key = request.form.get("key", "").strip(); ident = request.form.get("id", "").strip()
+        cands = db.q("SELECT * FROM accounts WHERE legacy_id=:l", l=ident) + (db.q("SELECT * FROM accounts WHERE id=:i", i=int(ident)) if ident.isdigit() else [])
+        a = next((c for c in cands if key and _key_ok(c, key)), None)
+        if not a: throttled("st", 10, add=True); return layout("My account", _status_form("Account number or key not recognised.")), 403
+        if u and not a["user_id"]:                                     # logged in + valid key = claim this account for the profile
+            db.x("UPDATE accounts SET user_id=:u WHERE id=:a AND user_id IS NULL", u=u["id"], a=a["id"]); return redirect(f"/account/{a['id']}")
+        return render_account(a, key=key)
+    if u:
+        rows = db.q("SELECT * FROM accounts WHERE user_id=:u ORDER BY id", u=u["id"])
+        cards = "".join(f"<div style='border:1px solid #e2e8f0;border-radius:12px;padding:12px;margin:8px 0'><b>Account #{a['id']} 路 {escape(a['platform'])} 路 {escape(a['tf'])} chart</b><br>{tier_badge(a)}<br>"
+                        f"<span style='color:{'#16a34a' if sub_state(a, s, u)[0] else '#dc2626'};font-weight:600'>{escape(sub_state(a, s, u)[1])}</span> 路 <a href='/account/{a['id']}'>Open</a></div>" for a in rows) or "<p class='muted'>No accounts yet. <a href='/setup'>Connect one</a>.</p>"
+        return layout("My account", f"<div class='card' style='max-width:760px'><h2>My accounts</h2><p class='muted'>Signed in as {escape(u['email'])}</p>{cards}<p><a class='btn' href='/setup'>+ Connect another account</a></p></div>"
+                                    f"<div class='card' style='max-width:760px'><h3>Have an older account without sign-up?</h3><p class='muted'>Enter its number and key to link it to your profile.</p>{_status_form('', bare=True)}</div>")
+    if s["require_signup"]: return redirect("/login?next=/status")
+    return layout("My account", _status_form(""))
+
+def _status_form(err, bare=False):
+    e = f"<p style='color:#dc2626;font-weight:600;margin-bottom:8px'>{escape(err)}</p>" if err else ""
+    f = (f"{e}<form method='post' action='/status'><label>Account #</label><input class='input' name='id' required><br><br><label>Key (EA key, or the exchange API key)</label>"
+         "<input class='input' name='key' type='password' required><br><br><button class='btn'>Open my account</button></form>")
+    return f if bare else f"<div class='card' style='max-width:520px'><h2>My account</h2><p class='muted' style='margin-bottom:10px'>Log in to see your accounts, or enter an account number and key.</p>{f}<p class='muted' style='margin-top:12px'><a href='/login?next=/status'>Log in</a> 路 <a href='/signup'>Sign up</a></p></div>"
+
+@app.route("/account/<aid>")
+def account_page(aid):
+    a = _owner_or_key(aid)
+    if not a: return redirect("/login?next=" + request.path)
+    return render_account(a)
+
+def render_account(a, key="", note=""):
+    s, u = S(), cur_user(); ee = a["platform"] == "EA"; owner = user_of(a)
+    hid = f"<input type='hidden' name='key' value='{escape(key)}'>" if key else ""
+    ok, txt = sub_state(a, s, owner)
+    if ee:
+        ls = a["last_seen"] or ""; on = _online(a)
+        badge = (f"<b style='color:#16a34a'>鈼� Connected</b> <span class='muted'>(EA last heard {escape(ls)} UTC)</span>" if on else
+                 f"<b style='color:#dc2626'>鈼� Not connected</b> <span class='muted'>({'last heard ' + escape(ls) + ' UTC' if ls else 'the EA has not contacted the app yet'})</span>")
+    else: badge = f"<b style='color:#64748b'>鈼� {escape(note) if note else 'Saved. Press Test connection to check your keys.'}</b>"
+    mode = "LIVE: orders are sent to your account." if s["mode"] == "live" else "PAPER: practice mode. Trades are recorded here but not sent to your account."
+    mine = [row_to_order(r) for r in db.q("SELECT * FROM orders WHERE account_id=:a ORDER BY created DESC LIMIT 200", a=a["id"])]
+    p = perf(mine); tr = f"{p['total_r']:+}R"
+    box = lambda l, v: f"<div style='border:1px solid #e2e8f0;border-radius:12px;padding:12px'><div class='muted'>{l}</div><div style='font-size:22px;font-weight:800'>{v}</div></div>"
+    rows = "".join(f"<div style='padding:8px;border-bottom:1px solid #f1f5f9;font-size:12px'>{escape(o.get('time', '')[:16])} 路 {escape(o.get('symbol', ''))} {escape(o.get('side', ''))} 路 E {o['entry']:.6g} SL {o['sl']:.6g} TP {o['tp']:.6g} 路 <b>{escape(o.get('outcome', ''))}</b> {escape(str(o.get('status', '')))}</div>"
+                   for o in mine[:10] if "entry" in o) or "<p class='muted'>No trades yet. The robot only trades when its pattern appears.</p>"
+    pay = f"<p style='margin:8px 0'>{tier_badge(a)}</p><p style='margin:8px 0'><b style='color:{'#16a34a' if ok else '#dc2626'}'>Plan: {escape(txt)}</b></p>"
+    if a["tier"] == "real" and s["paid_mode"] and not (ok and txt.startswith("Free access")):
+        pay += ((f"<p class='muted'>{escape(s['price_text'])}</p>" if s["price_text"] else "") + (f"<p><a class='btn' href='{escape(s['payment_link'])}' target='_blank' rel='noopener'>Pay now</a></p>" if s["payment_link"] else "")
+                + (f"<p class='muted'>{escape(s['pay_note'])}</p>" if s["pay_note"] else "") + f"<p class='muted'>Quote your account number: <b>#{a['id']}</b></p>")
+    tfopts = "".join(f"<option value='{escape(t)}'{' selected' if t == a['tf'] else ''}>{escape({'30m': '30 minutes', '1h': '1 hour'}.get(t, t))}</option>" for t in s["timeframes"])
+    act = f"/account/{a['id']}"
+    tfform = (f"<form method='post' action='{act}/tf' style='margin:10px 0'>{hid}<label>Chart the robot trades for you (one at a time)</label><div style='display:flex;gap:8px;margin-top:4px'>"
+              f"<select class='input' name='tf' style='max-width:200px'>{tfopts}</select><button class='btn'>Save</button></div></form>")
+    btns = f"<form method='post' action='{act}' style='display:inline'>{hid}<button class='btn'>Refresh</button></form> "
+    btns += (f"<form method='post' action='{act}/rekey' style='display:inline'>{hid}<button class='btn' style='background:#0f172a'>New EA key + code</button></form> " if ee else
+             f"<form method='post' action='{act}/test' style='display:inline'>{hid}<button class='btn' style='background:#0f172a'>Test connection</button></form> ")
+    btns += f"<form method='post' action='{act}/delete' style='display:inline' onsubmit='return confirm(\"Delete this account?\")'>{hid}<button class='btn' style='background:#dc2626'>Delete</button></form>"
+    guide = ("<details style='margin-top:14px'><summary style='cursor:pointer;font-weight:700'>How to connect the EA (about 5 minutes)</summary><ol class='muted' style='line-height:1.9;margin:8px 0 0 18px'>"
+             "<li>Install MetaTrader 5 and log in to your broker account (demo or real).</li><li>Use <b>New EA key + code</b> above to get the code. In MT5 press F4 (MetaEditor), File, New, Expert Advisor (template), name it ISIG_EA, select all, paste, press F7: 0 errors.</li>"
+             f"<li>In MT5: Tools, Options, Expert Advisors. Tick Allow WebRequest and add <b>{escape(request.host_url.rstrip('/'))}</b></li>"
+             "<li>Open a chart of your pair on the timeframe you chose, drag ISIG_EA onto it, tick Allow Algo Trading, press OK, and turn on the Algo Trading button.</li></ol></details>") if ee else ""
+    body = (f"<div class='card' style='max-width:760px'><h2>Account #{a['id']} 路 {escape(a['platform'])}</h2><p style='margin:8px 0'>{badge}</p>"
+            f"<p class='muted'>Balance: {a['balance']:,.2f} 路 risk per trade {s['risk_pct']}% 路 target 1:{s['rr']} 路 chart {escape(a['tf'])}</p><p class='muted' style='margin:6px 0 12px'>Mode: {escape(mode)}</p>{pay}{tfform}{btns}{guide}</div>"
+            f"<div class='card' style='max-width:760px'><h3>My results</h3><div class='grid'>{box('Closed trades', p['trades'])}{box('Win rate', str(p['win_rate']) + '%')}{box('Total result', tr)}</div>"
+            f"<h3 style='margin-top:14px'>My latest trades</h3>{rows}</div>")
+    return layout("My account", body)
+
+@app.route("/account/<aid>/<op>", methods=["POST"])
+def account_op(aid, op):
+    key = request.form.get("key", "").strip()
+    if throttled("st", 30): return "Too many attempts. Try again later.", 429
+    a = _owner_or_key(aid, key)
+    if not a: throttled("st", 30, add=True); abort(403)
+    s = S()
+    if op == "tf" and request.form.get("tf") in s["timeframes"]:
+        db.x("UPDATE accounts SET tf=:t WHERE id=:i", t=request.form["tf"], i=a["id"]); a = db.one("SELECT * FROM accounts WHERE id=:i", i=a["id"]); return render_account(a, key, "Saved. The robot now trades only the " + a["tf"] + " chart for you.")
+    if op == "test" and a["platform"] != "EA":
+        try:
+            full = acc_full(a)
+            if a["platform"] in FX_PLATS:
+                info = meta(full, "GET", "/account-information"); b = float(info.get("balance") or 0)
+                att = {"server": str(info.get("server") or "")[:60], "login": str(info.get("login") or "")[:20], "broker": str(info.get("broker") or "")[:60]}
+                a2 = {**a, "attest": att}; db.x("UPDATE accounts SET attest=:t, balance=:b, tier=:tier, tier_src=:src, tier_note=:note WHERE id=:i", t=json.dumps(att), b=b, i=a["id"], **{"tier": tier_cols(a2, s)["tier"], "src": tier_cols(a2, s)["tier_src"], "note": tier_cols(a2, s)["tier_note"]})
+            else: b = float(balance(full)); db.x("UPDATE accounts SET balance=:b WHERE id=:i", b=b, i=a["id"])
+            note = f"Connected. Your balance: {b:,.2f}"
+        except Exception as e: note = "Could not connect: " + str(e)[:200]
+        return render_account(db.one("SELECT * FROM accounts WHERE id=:i", i=a["id"]), key, note)
+    if op == "rekey" and a["platform"] == "EA":
+        k = secrets.token_urlsafe(24); db.x("UPDATE accounts SET key_hash=:h WHERE id=:i", h=_h(k), i=a["id"]); return _ea_created(a["id"], k)
+    if op == "delete":
+        db.x("DELETE FROM orders WHERE account_id=:i", i=a["id"]); db.x("DELETE FROM accounts WHERE id=:i", i=a["id"]); return redirect("/status")
+    return render_account(a, key)
+
+@app.route("/ea/download", methods=["POST"])
+def ea_download():
+    if throttled("st", 30): return "Too many attempts. Try again later.", 429
+    key = request.form.get("key", "").strip(); a = _owner_or_key(request.form.get("id", ""), key)
+    if not a or a["platform"] != "EA" or not _key_ok(a, key): throttled("st", 30, add=True); return "Account number or key not recognised.", 403
+    if request.form.get("fmt") == "ex5":
+        if not ex5_ready(): return "The compiled EA is not on the server.", 404
+        return Response(open(EX5_FILE, "rb").read(), mimetype="application/octet-stream", headers={"Content-Disposition": "attachment; filename=ISIG_EA.ex5"})
+    if COMPILED_ONLY: return "Only the compiled EA is available.", 403
+    src = _ea_source(key)
+    if src is None: return "The EA file (ISIG_EA.mq5) is not on the server yet. Ask the owner to upload it next to app.py.", 404
+    return Response(src, mimetype="text/plain", headers={"Content-Disposition": "attachment; filename=ISIG_EA.mq5"})
+def _curve_svg(c):
+    if len(c) < 2: return "<p class='muted'>Chart appears after 2+ closed trades.</p>"
+    w, h, lo, hi = 640, 180, min(c + [0]), max(c + [0]); span = (hi - lo) or 1
+    pts = " ".join(f"{i * w / (len(c) - 1):.1f},{h - 10 - (v - lo) / span * (h - 20):.1f}" for i, v in enumerate(c))
+    zero = h - 10 - (0 - lo) / span * (h - 20)
+    col = "#16a34a" if c[-1] >= 0 else "#dc2626"
+    return f"<svg viewBox='0 0 {w} {h}' style='width:100%;height:auto'><line x1='0' x2='{w}' y1='{zero:.1f}' y2='{zero:.1f}' stroke='#cbd5e1' stroke-dasharray='4'/><polyline fill='none' stroke='{col}' stroke-width='2.5' points='{pts}'/></svg>"
+
+
+# ======================================================================================================================
+# EA bridge: MT5 on the user's own computer talks to the app. Cheap by design: one indexed lookup per poll,
+# candles only when a new bar closed, setup detection cached, and the app tells every EA how long to wait (NEXT|seconds).
+# ======================================================================================================================
+EA_KEYS = ("KEY", "SYMBOL", "TF", "BAL", "TRADEMODE", "ACCSERVER", "ACCCOMPANY", "ACCLOGIN", "ACCCCY", "EAVER", "PLACED", "FAILED")
+_INFL, _INFL_LOCK = {"n": 0}, threading.Lock()
+UPD_OK = ("balance", "last_seen", "attest", "fp", "fp_changes", "flags", "ever_real", "blocked", "tier", "tier_src", "tier_note")
+
+@app.route("/ea/sync", methods=["POST"])
+def ea_sync():
+    """Plain-text protocol. The EA sends KEY= SYMBOL= TF= BAL= TRADEMODE= ACCSERVER= ACCCOMPANY= ACCLOGIN= [PLACED=id] [FAILED=id~reason], then '---' and candle lines t,o,h,l,c.
+    The app answers: 'OK <mode>', NEXT|seconds, TIER|demo/real|text, optional MSG|text, then ORDER|id|side|entry|sl|tp|risk and CANCEL|id lines."""
+    s = S(); raw = request.get_data(as_text=True)
+    if len(raw) > 400000: return "ERR too large", 413
+    head, rows, placed, failed = {}, [], [], []
+    for ln in raw.splitlines():
+        ln = ln.strip()
+        if not ln or ln == "---": continue
+        k, sep, v = ln.partition("=")
+        if sep and k in EA_KEYS:
+            if k == "PLACED": placed.append(v[:40])
+            elif k == "FAILED": failed.append(v[:300])
+            else: head[k] = v[:120]
+        elif ln.count(",") == 4:
+            try: t, o_, h, l, c = ln.split(","); rows.append({"t": int(t) * 1000, "o": float(o_), "h": float(h), "l": float(l), "c": float(c)})
+            except ValueError: return "ERR bad candle data", 400
+    sym = re.sub(r"[^A-Za-z0-9._#]", "", head.get("SYMBOL", ""))[:20]
+    if not sym or len(rows) > 1000: return "ERR bad request", 400
+    if throttled("ea", 30): return "ERR too many wrong keys. Wait a few minutes.", 429
+    if throttled("eak", 12, 60, add=True, ident=_h(head.get("KEY", ""))[:16]): return "ERR slow down", 429, {"Retry-After": "30"}
+    with _INFL_LOCK:
+        if _INFL["n"] >= int(s["max_inflight"]): return "ERR busy, retry shortly", 503, {"Retry-After": "30"}
+        _INFL["n"] += 1
+    try: return _ea_sync(s, head, rows, placed, failed, sym)
+    finally:
+        with _INFL_LOCK: _INFL["n"] -= 1
+
+def _ea_sync(s, head, rows, placed, failed, sym):
+    kh = _h(head.get("KEY", "")); a = db.one("SELECT * FROM accounts WHERE key_hash=:h", h=kh)
+    if not a:
+        throttled("ea", 30, add=True); return "ERR unknown EA key. Check the key in the EA inputs.", 401
+    tf = head.get("TF", ""); want = a["tf"] or s["timeframe"]
+    if rows and tf != want: return f"ERR you chose the {want} chart for the robot, but this MT5 chart is {tf}. Switch this chart to {want}, or change your timeframe on the My Account page.", 400
+    if rows and want not in s["timeframes"]: return f"ERR the {want} chart is not available right now.", 400
+    if rows and len(rows) < 30: return "ERR not enough candles on the chart yet", 400
+    now = now_s(); upd = {}
+    # ---- what MetaTrader says about the account (self-reported: used only through the strict checks in eval_ea) ----
+    att = _att(a); old_att = dict(att)
+    mode = head.get("TRADEMODE", "").upper()
+    if mode in ("DEMO", "CONTEST", "REAL"): att["mode"] = mode
+    for k, hk, n in (("server", "ACCSERVER", 60), ("company", "ACCCOMPANY", 60), ("ccy", "ACCCCY", 8)):
+        if head.get(hk): att[k] = re.sub(r"[^\w .:#()\-]", "", head[hk])[:n]
+    if head.get("ACCLOGIN"): att["login"] = re.sub(r"\D", "", head["ACCLOGIN"])[:20]
+    if att != old_att: upd["attest"] = json.dumps(att)
+    if att.get("mode") == "REAL" and not a["ever_real"]: upd["ever_real"] = 1; a["ever_real"] = 1       # once real, never demo again on this key
+    if att.get("login") and att.get("server"):
+        fp = hashlib.sha256(f"{att.get('company', '')}|{att['server']}|{att['login']}".lower().encode()).hexdigest()[:40]
+        if fp != a["fp"]:
+            if db.one("SELECT id FROM accounts WHERE fp=:f AND id != :i", f=fp, i=a["id"]): return "ERR this MetaTrader login is already linked to another account.", 409
+            upd["fp"] = fp
+            if a["fp"]:                                                                                    # the key moved to a different login/server
+                upd["fp_changes"] = a["fp_changes"] + 1; fl = set(filter(None, a["flags"].split(",")))
+                fl.add("login_changed"); upd["flags"] = ",".join(sorted(fl))
+                if upd["fp_changes"] >= 6: upd["blocked"] = 1
+    try: bal = float(head.get("BAL", 0))
+    except ValueError: bal = 0
+    if bal > 0 and abs(bal - float(a["balance"] or 0)) > 0.004: upd["balance"] = round(bal, 2)
+    a.update({k: v for k, v in upd.items() if k in a}); a["attest"] = json.dumps(att)
+    tc = tier_cols(a, s)
+    if any(a[k] != v for k, v in tc.items()): upd.update(tc); a.update(tc)
+    try: stale = not a["last_seen"] or (datetime.datetime.utcnow() - datetime.datetime.strptime(a["last_seen"][:19], "%Y-%m-%d %H:%M:%S")).total_seconds() > 40
+    except ValueError: stale = True
+    if stale: upd["last_seen"] = now[:19]; a["last_seen"] = now[:19]
+    if upd:
+        db.x("UPDATE accounts SET " + ", ".join(f"{k}=:{k}" for k in upd if k in UPD_OK) + " WHERE id=:id", id=a["id"], **{k: v for k, v in upd.items() if k in UPD_OK})
+        if "tier" in upd and upd["tier"] == "real": start_trial(a["user_id"])
+    u = user_of(a); okk, why = sub_state(a, s, u)
+    for pid in placed: db.x("UPDATE orders SET ack=1 WHERE id=:i AND account_id=:a", i=pid, a=a["id"])
+    for f in failed:
+        oid, _, err = f.partition("~")
+        db.x("UPDATE orders SET status=:st, outcome='REJECTED' WHERE id=:i AND account_id=:a AND outcome='PENDING' AND ack=0", st=f"LIVE FAILED: {err[:150]}", i=oid, a=a["id"])
+    if rows:
+        for r in db.q("SELECT * FROM orders WHERE account_id=:a AND symbol=:s AND tf=:t AND outcome IN ('PENDING','OPEN')", a=a["id"], s=sym, t=tf):
+            o = row_to_order(r)
+            if resolve(o, rows):
+                save_order_state(o); record_track(o) if o["outcome"] in ("WIN", "LOSS") else None
+        sig = cached_setup(rows, s, tf)
+        if sig and okk and seen_new(f"ea:{a['id']}:{sym}-{sig['key']}"):                                  # a setup missed while the plan was inactive is not marked as seen
+            skip = any(str(sig[f]) in s["filters"].get(f, []) for f in s["filters"] if f in sig)
+            busy = db.one("SELECT 1 AS x FROM orders WHERE account_id=:a AND symbol=:s AND tf=:t AND outcome IN ('PENDING','OPEN')", a=a["id"], s=sym, t=tf)
+            if not skip and not busy: insert_order(place_order(a, sig, sym, s))
+    poll = max(10, int(s["ea_poll_seconds"])); poll += int(kh[:4], 16) % max(5, poll // 4)                 # spread the EAs out so they do not all call at once
+    out = [f"OK {s['mode']}", f"NEXT|{poll}", f"TIER|{a['tier']}|{a['tier_note']}"]
+    if not okk: out.append("MSG|" + why + ". Open the My Account page in the app.")
+    if s["mode"] == "live" and okk:
+        for r in db.q("SELECT * FROM orders WHERE account_id=:a AND symbol=:s AND tf=:t AND ack=0 AND outcome='PENDING' AND status LIKE 'LIVE: queued%'", a=a["id"], s=sym, t=tf):
+            o = row_to_order(r); out.append(f"ORDER|{o['id']}|{o['side']}|{o['entry']!r}|{o['sl']!r}|{o['tp']!r}|{o['risk_amount']}")
+    for r in db.q("SELECT id FROM orders WHERE account_id=:a AND symbol=:s AND tf=:t AND outcome='EXPIRED' AND status LIKE 'LIVE%' AND created > :c", a=a["id"], s=sym, t=tf, c=str(datetime.datetime.utcnow() - datetime.timedelta(days=3))): out.append(f"CANCEL|{r['id']}")
+    return "\n".join(out), 200, {"Content-Type": "text/plain"}
+
+@app.route("/webhook", methods=["POST", "GET"])
+def webhook():
+    if not WEBHOOK_SECRET or not hmac.compare_digest(request.args.get("key", ""), WEBHOOK_SECRET): return jsonify({"error": "unauthorized"}), 401
+    return jsonify({"status": "scanned", "new": run_scan()})
+
+# ======================================================================================================================
+# public track record (built from the `track` table: one row per signal, no account data)
+# ======================================================================================================================
+def closed_trades(orders, view="all", tf=None):
+    paper = lambda o: str(o.get("status", "")).startswith("PAPER")
+    rows = [o for o in orders if o.get("outcome") in ("WIN", "LOSS") and (view == "all" or (view == "paper") == paper(o)) and (tf is None or (o.get("tf") or "30m") == tf)]
+    return sorted(rows, key=lambda o: o.get("time", ""), reverse=True)
+
+def trade_table(trs, tf=""):
+    if not trs: return "<div class='card'><h2>Trade log</h2><p class='muted'>No closed trades yet.</p></div>"
+    h = "<tr>" + "".join(f"<th style='text-align:left;padding:6px'>{x}</th>" for x in ("Time", "Symbol", "TF", "Side", "Entry", "SL", "TP", "Result", "Type")) + "</tr>"
+    rows = ""
+    for o in trs[:300]:
+        col = "#16a34a" if o["r"] > 0 else "#dc2626"
+        typ = "PAPER" if str(o.get("status", "")).startswith("PAPER") else "LIVE"
+        cells = [escape(o["time"][:16]), escape(o["symbol"]), escape(o.get("tf") or "30m"), o["side"], f"{o['entry']:.6g}", f"{o['sl']:.6g}", f"{o['tp']:.6g}", f"<b style='color:{col}'>{o['outcome']} {o['r']:+}R</b>", typ]
+        rows += "<tr style='border-top:1px solid #f1f5f9'>" + "".join(f"<td style='padding:6px'>{c}</td>" for c in cells) + "</tr>"
+    return f"<div class='card'><h2>Trade log ({len(trs)})</h2><p class='muted'><a href='/trades.csv?tf={escape(tf)}'>Download CSV</a> 路 latest 300 shown</p><div style='overflow-x:auto;font-size:12px'><table style='width:100%;border-collapse:collapse'>{h}{rows}</table></div></div>"
+
+@app.route("/trades.csv")
+def trades_csv():
+    import csv, io
+    buf = io.StringIO(); w = csv.writer(buf)
+    w.writerow(["time", "symbol", "tf", "side", "entry", "sl", "tp", "outcome", "r", "type"])
+    tf_ = request.args.get("tf")
+    for o in closed_trades(track_rows(tf_ if tf_ in ("30m", "1h") else None, 20000), "all", tf_ if tf_ in ("30m", "1h") else None):
+        w.writerow([o["time"], o["symbol"], o.get("tf") or "30m", o["side"], o["entry"], o["sl"], o["tp"], o["outcome"], o["r"], "PAPER" if str(o.get("status", "")).startswith("PAPER") else "LIVE"])
+    return buf.getvalue(), 200, {"Content-Type": "text/csv", "Content-Disposition": "attachment; filename=trades.csv"}
+
+@app.route("/performance")
+def performance():
+    s = S(); view = request.args.get("view", "all"); view = view if view in ("all", "paper", "live") else "all"
+    tfs_ok = s["timeframes"]; tf = request.args.get("tf", s["timeframe"]); tf = tf if tf in tfs_ok else tfs_ok[0]
+    rows = track_rows(tf); p = perf(rows, view, tf)
+    tftabs = "".join(f"<a class='btn' style='padding:6px 14px;margin-right:6px;{'' if t == tf else 'background:#e2e8f0;color:#0f172a'}' href='/performance?view={view}&tf={t}'>{t.upper()} chart</a>" for t in tfs_ok)
+    good = lambda v: "#16a34a" if v >= 0 else "#dc2626"
+    box = lambda label, val, col="#0f172a": f"<div style='border:1px solid #e2e8f0;border-radius:12px;padding:14px'><div class='muted'>{label}</div><div style='font-size:24px;font-weight:800;color:{col}'>{val}</div></div>"
+    tabs = "".join(f"<a class='btn' style='padding:6px 14px;margin-right:6px;{'' if v == view else 'background:#e2e8f0;color:#0f172a'}' href='/performance?view={v}&tf={tf}'>{v.upper()}</a>" for v in ("all", "paper", "live"))
+    pf = p["profit_factor"] if p["profit_factor"] is not None else "-"
+    body = f"""<div class='card'><h2>Bot performance 路 {escape(tf)} chart</h2><p class='muted'>Each timeframe has its own record. Nothing is combined. One row per signal; personal account results are private.</p><div style='margin:10px 0'>{tftabs}</div><div style='margin:10px 0'>{tabs}</div>
+<div class='grid'>{box('Closed trades', p['trades'])}{box('Win rate', str(p['win_rate']) + '%', good(p['win_rate'] - 33.4))}{box('Total result', f"{p['total_r']:+}R", good(p['total_r']))}
+{box('Avg win / avg loss', f"{p['avg_win_r']:+}R / {p['avg_loss_r']:+}R")}{box('Profit factor', pf)}{box('Max drawdown', f"-{p['max_drawdown_r']}R", '#dc2626')}{box('Avg per trade', f"{p['avg_r']:+}R", good(p['avg_r']))}</div>
+<h3 style='margin-top:16px'>Equity curve (cumulative R)</h3>{_curve_svg(p['curve'])}
+<p class='muted' style='margin-top:12px'>1R = the amount risked on one trade. Results are measured from market price data after each signal, not from broker statements. PAPER trades are simulated. Past results do not guarantee future results; this is not financial advice.</p></div>"""
+    tfstat = stats(track_rows(None))[0].get("tf", {})
+    if tfstat: body += "<div class='card'><h2>By timeframe</h2>" + "".join(f"<p style='margin:6px 0'><b>{escape(k)}</b>: {m['n']} trades 路 win {m['win']}% 路 average {m['exp']:+}R</p>" for k, m in sorted(tfstat.items())) + "<p class='muted'>Each signal counted once.</p></div>"
+    body += trade_table(closed_trades(rows, view, tf), tf)
+    return layout("Performance", body)
+
+@app.route("/api/performance")
+def api_performance():
+    v, tf = request.args.get("view", "all"), request.args.get("tf")
+    tf = tf if tf in ("30m", "1h") else None
+    return jsonify(perf(track_rows(tf), v if v in ("all", "paper", "live") else "all", tf))
+
+@app.route("/orders")
+def orders():
+    rows = [row_to_order(r) for r in db.q("SELECT * FROM orders WHERE platform='SIGNAL' ORDER BY created DESC LIMIT 40")]
+    n = db.one("SELECT COUNT(*) AS n FROM track")["n"]
+    def row(r): return f"<div style='padding:8px;border-bottom:1px solid #f1f5f9;font-size:12px'>{escape(r.get('time', '')[:16])} 路 {escape(r.get('symbol', ''))} {escape(r.get('side', ''))} {escape(r.get('tf', ''))} 路 E {r['entry']:.6g} SL {r['sl']:.6g} TP {r['tp']:.6g} 路 <b>{escape(r.get('outcome', ''))}</b></div>"
+    return layout("Signals", f"<div class='card'><h2>Latest signals</h2><p class='muted'>{n} resolved signals</p>{''.join(row(r) for r in rows) or '<p class=muted>No signals yet.</p>'}</div>")
+
+# ======================================================================================================================
+# admin
+# ======================================================================================================================
+def _flash(m): session["msg"] = m
+
+@app.route("/admin", methods=["GET", "POST"])
+def admin():
+    if request.method == "POST":
+        if throttled("adm", 5, 600) or throttled("adm*", 20, 600, ident="all"): _flash("Too many wrong attempts. Try again in 10 minutes.")
+        else:
+            pw = request.form.get("pw", ""); tot = _totp(); on = bool(tot.get("enabled")) and os.environ.get("DISABLE_ADMIN_2FA") != "1"
+            sec = _totp_secret() if on else ""
+            if check_admin(pw) and (not on or (sec and totp_ok(sec, request.form.get("code", "")))): session.clear(); session["admin"] = True; session.permanent = True
+            else: throttled("adm", 5, 600, add=True); throttled("adm*", 20, 600, add=True, ident="all"); _flash("Wrong password or code.")
+        return redirect("/admin")
+    if session.get("admin") is not True:
+        m = session.pop("msg", None)
+        note = f"<p style='color:#dc2626;margin:8px 0;font-weight:600'>{escape(m)}</p>" if m else ""
+        return layout("Admin", f"<div class='card' style='max-width:420px'><h2>Admin login</h2><p class='muted'>Only the owner can open this panel.</p>{note}<form method='post'><input class='input' name='pw' type='password' placeholder='Password' autofocus><br><br><input class='input' name='code' inputmode='numeric' autocomplete='one-time-code' placeholder='Authenticator code (only if 2-step login is on)'><br><br><button class='btn'>Unlock</button></form></div>")
+    s = load_settings(fresh=True); return _admin_page(s)
+
+def _onoff(s, name): return f"<select class='input' name='{name}'><option value='1'{' selected' if s[name] else ''}>On</option><option value='0'{'' if s[name] else ' selected'}>Off</option></select>"
+def _inp(s, name, typ="text", extra=""): return f"<input class='input' name='{name}' type='{typ}' value='{escape(str(s[name]))}' {extra}>"
+
+def _arow(a, s, ret):
+    u = {"blocked": a.get("ublocked"), "trial_end": a.get("utrial")} if a["user_id"] else None
+    ok, txt = sub_state(a, s, u)
+    def btn(op, label, style="", conf=""):
+        return (f"<form action='/admin/account' method='post' style='display:inline'{conf}><input type='hidden' name='id' value='{a['id']}'><input type='hidden' name='op' value='{op}'><input type='hidden' name='ret' value='{escape(ret)}'>"
+                f"<button class='btn' style='padding:4px 9px;font-size:11px;margin:2px;{style}'>{label}</button></form>")
+    flags = f" 路 <b style='color:#dc2626'>鈿� {escape(a['flags'])}</b>" if a["flags"] else ""
+    return (f"<div style='border-top:1px solid #e2e8f0;padding:10px 0;font-size:13px'><b>#{a['id']}</b> 路 {escape(a['platform'])} 路 {escape(a['tf'])} 路 {escape(a.get('email') or 'no sign-up')}{flags}<br>{tier_badge(a)}<br>"
+            f"<span style='color:{'#16a34a' if ok else '#dc2626'}'>{escape(txt)}</span> 路 balance {a['balance']:,.2f} 路 last seen {escape(a['last_seen'] or '-')}<br>"
+            + btn("activate", f"Activate +{int(s['plan_days'])} days") + btn("free", "Free access") + (btn("resume", "Resume") if a["blocked"] else btn("pause", "Pause"))
+            + btn("real", "Force REAL", "background:#b45309") + btn("demo", "Force DEMO", "background:#16a34a") + (btn("auto", "Back to automatic") if a["tier_override"] else "")
+            + (btn("reset", "Clear flags") if a["flags"] or a["ever_real"] else "") + btn("delete", "Delete", "background:#dc2626", " onsubmit='return confirm(&quot;Delete this account?&quot;)'") + "</div>")
+
+def _admin_page(s):
+    q, page = request.args.get("q", "").strip()[:80], max(0, int(request.args.get("page", 0) or 0)) if request.args.get("page", "0").isdigit() else 0
+    ret = request.full_path.rstrip("?") if request.full_path else "/admin"
+    st, n = stats(track_rows(None))
+    m = session.pop("msg", None)
+    msg = f"<div class='card' style='background:#ecfdf5;border-color:#a7f3d0;font-weight:600'>{escape(m)}</div>" if m else ""
+    fields = ""
+    for k in DEFAULTS:
+        if k in BRAND_KEYS or k in ACCESS_KEYS or k in TRUST_KEYS or k in SCALE_KEYS: continue
+        cur = s[k]; val = json.dumps(cur) if isinstance(cur, (list, dict)) else cur
+        fields += f"<div><label>{k}</label><input class='input' name='{k}' value='{escape(str(val))}'></div>"
+    # ---- numbers
+    c = lambda sql, **p: db.one(sql, **p)["n"]
+    cut = str(datetime.datetime.utcnow() - datetime.timedelta(minutes=4))[:19]
+    tiers = {r["tier"]: r["n"] for r in db.q("SELECT tier, COUNT(*) AS n FROM accounts GROUP BY tier")}
+    lease = db.one("SELECT expires FROM leases WHERE name='scan'"); wk = "running" if (lease and lease["expires"] > time.time()) else ("in-process" if os.environ.get("AUTOSCAN") == "1" else "NOT running")
+    kp = lambda l, v: f"<div style='border:1px solid #e2e8f0;border-radius:12px;padding:12px'><div class='muted'>{l}</div><div style='font-size:22px;font-weight:800'>{v}</div></div>"
+    n_users = c("SELECT COUNT(*) AS n FROM users"); n_online = c("SELECT COUNT(*) AS n FROM accounts WHERE platform='EA' AND last_seen >= :c", c=cut)
+    n_flag = c("SELECT COUNT(*) AS n FROM accounts WHERE flags != ''"); n_jobs = c("SELECT COUNT(*) AS n FROM jobs WHERE status='new'")
+    dash = ("<div class='card'><h2>Overview</h2><div class='grid'>" + kp("Users", f"{n_users:,}") + kp("Demo accounts (free)", f"{tiers.get('demo', 0):,}") + kp("Real accounts", f"{tiers.get('real', 0):,}")
+            + kp("EAs online", f"{n_online:,}") + kp("Flagged accounts", f"{n_flag:,}") + kp("Job queue", f"{n_jobs:,}") + kp("Worker", wk) + "</div></div>")
+    brand = f"""<div class='card'><h2>Branding</h2><form action='/admin/save' method='post' class='grid'>
+<div><label>App name</label><input class='input' name='site_name' maxlength='60' value='{escape(s['site_name'])}'></div>
+<div><label>Headline under the name</label><input class='input' name='tagline' maxlength='80' value='{escape(s['tagline'])}'></div>
+<div style='grid-column:1/-1'><label>Homepage description</label><textarea class='input' name='lead' rows='3' maxlength='400'>{escape(s['lead'])}</textarea></div>
+<div><button class='btn'>Save branding</button></div></form></div>"""
+    access = ("<div class='card'><h2>Sign-up &amp; monetization</h2><p class='muted' style='margin-bottom:10px'>Switch these on when you are ready. They apply to every account straight away. <b>Demo accounts are always free.</b> "
+              "Switching on \"Charge for real accounts\" gives everyone with a real account a fresh free trial first, so nobody is cut off without notice.</p><form action='/admin/save' method='post' class='grid'>"
+              f"<div><label>Require sign-up (no account can be added without logging in)</label>{_onoff(s, 'require_signup')}</div><div><label>Gmail addresses only</label>{_onoff(s, 'gmail_only')}</div>"
+              f"<div><label>Block old accounts that were never linked to a sign-up</label>{_onoff(s, 'block_unlinked')}</div><div><label>Max users (0 = no limit)</label>{_inp(s, 'max_users', 'number')}</div>"
+              f"<div><label>Max accounts per user (0 = no limit)</label>{_inp(s, 'max_accounts_per_user', 'number')}</div>"
+              f"<div><label>Charge for REAL accounts</label>{_onoff(s, 'paid_mode')}</div><div><label>Free trial for real accounts (days)</label>{_inp(s, 'trial_days', 'number')}</div>"
+              f"<div><label>Days added when you activate an account</label>{_inp(s, 'plan_days', 'number')}</div><div><label>Price shown to users (e.g. $5 per month)</label>{_inp(s, 'price_text')}</div>"
+              f"<div><label>Payment link (must start with https://)</label>{_inp(s, 'payment_link')}</div>"
+              f"<div style='grid-column:1/-1'><label>How to pay (shown to users)</label><textarea class='input' name='pay_note' rows='3' maxlength='300'>{escape(s['pay_note'])}</textarea></div>"
+              "<div><button class='btn'>Save</button></div></form></div>")
+    trust = ("<div class='card'><h2>Demo vs real: trust rules</h2><p class='muted' style='margin-bottom:10px'><b>Exchanges</b> and <b>MetaApi</b> accounts are proven by the exchange/broker and need no setup. "
+             "For the <b>EA</b>, the phone-in report from MetaTrader can in theory be faked by someone who edits their own EA, so the EA is only accepted as demo when it reports DEMO <i>and</i> its server name matches this list. "
+             "Anything else is real. Keep the list to broker demo servers you know.</p><form action='/admin/save' method='post' class='grid'>"
+             f"<div><label>EA demo accounts</label><select class='input' name='ea_demo_trust'><option value='strict'{' selected' if s['ea_demo_trust'] == 'strict' else ''}>Strict check (free if it passes)</option><option value='off'{' selected' if s['ea_demo_trust'] == 'off' else ''}>Off: every EA account counts as real</option></select></div>"
+             f"<div><label>Demo server names contain (comma separated)</label>{_inp(s, 'demo_servers')}</div><div><label>Never demo, even if it matches (comma separated)</label>{_inp(s, 'demo_blocklist')}</div>"
+             f"<div><label>Highest balance a demo EA may report (0 = no limit)</label>{_inp(s, 'demo_max_balance', 'number', 'step=any')}</div><div><button class='btn'>Save</button></div></form></div>")
+    scale = ("<div class='card'><h2>Load control</h2><form action='/admin/save' method='post' class='grid'>"
+             f"<div><label>Seconds between EA calls (the app tells every EA)</label>{_inp(s, 'ea_poll_seconds', 'number')}</div><div><label>Max EA requests handled at once per server</label>{_inp(s, 'max_inflight', 'number')}</div><div><button class='btn'>Save</button></div></form></div>")
+    security = """<div class='card'><h2>Security</h2><p class='muted' style='margin-bottom:10px'>Change the admin password (at least 8 characters).</p><form action='/admin/password' method='post' class='grid'>
+<div><label>Current password</label><input class='input' name='cur' type='password' required></div><div><label>New password</label><input class='input' name='new' type='password' minlength='8' required></div>
+<div><label>Repeat new password</label><input class='input' name='new2' type='password' minlength='8' required></div><div><button class='btn'>Change password</button></div></form>
+<form action='/admin/logout' method='post' style='margin-top:12px'><button class='btn' style='background:#0f172a'>Log out</button></form></div>"""
+    # ---- users (searchable, paginated: works with millions of rows)
+    per = 25
+    like = f"%{q.lower()}%"
+    ids = f"/admin?q={urllib.parse.quote(q)}"
+    urows = db.q("SELECT u.id, u.email, u.created, u.blocked, u.trial_end, (SELECT COUNT(*) FROM accounts a WHERE a.user_id = u.id) AS n FROM users u " + ("WHERE u.email LIKE :q " if q else "") + "ORDER BY u.id DESC LIMIT :l OFFSET :o",
+                 **({"q": like} if q else {}), l=per + 1, o=page * per)
+    def ubtn(uid, op, label, style="", conf=""):
+        return (f"<form action='/admin/user' method='post' style='display:inline'{conf}><input type='hidden' name='id' value='{uid}'><input type='hidden' name='op' value='{op}'><input type='hidden' name='ret' value='{escape(ret)}'>"
+                f"<button class='btn' style='padding:4px 9px;font-size:11px;margin:2px;{style}'>{label}</button></form>")
+    def urow(u):
+        return (f"<div style='border-top:1px solid #e2e8f0;padding:8px 0;font-size:13px'><b>#{u['id']}</b> {escape(u['email'])} 路 {u['n']} accounts 路 joined {escape(str(u['created'])[:10])}"
+                f"{' 路 <b style=color:#dc2626>BANNED</b>' if u['blocked'] else ''} 路 <a href='/admin?user={u['id']}'>accounts</a><br>"
+                + (ubtn(u["id"], "unban", "Unban") if u["blocked"] else ubtn(u["id"], "ban", "Ban", "background:#dc2626")) + ubtn(u["id"], "resetpw", "Reset password") + ubtn(u["id"], "free", "Free access (all)") + ubtn(u["id"], "trial", "Restart trial")
+                + ubtn(u["id"], "delete", "Delete user", "background:#dc2626", " onsubmit='return confirm(&quot;Delete this user and all their accounts?&quot;)'") + "</div>")
+    nav = (f"<p style='margin-top:10px'>" + (f"<a href='{ids}&page={page - 1}'>鈫� newer</a> " if page else "") + (f"<a href='{ids}&page={page + 1}'>older 鈫�</a>" if len(urows) > per else "") + "</p>")
+    users = (f"<div class='card'><h2>Users</h2><form method='get' action='/admin' style='display:flex;gap:8px;margin:8px 0'><input class='input' name='q' value='{escape(q)}' placeholder='Search by email'><button class='btn'>Search</button></form>"
+             + ("".join(urow(u) for u in urows[:per]) or "<p class='muted'>No users yet.</p>") + nav + "</div>")
+    # ---- accounts
+    uid, acct, tf_ = request.args.get("user", ""), request.args.get("acct", "").strip(), request.args.get("show", "")
+    base = "SELECT a.*, u.email AS email, u.blocked AS ublocked, u.trial_end AS utrial FROM accounts a LEFT JOIN users u ON u.id = a.user_id "
+    if uid.isdigit(): arows, title = db.q(base + "WHERE a.user_id=:u ORDER BY a.id", u=int(uid)), f"Accounts of user #{uid}"
+    elif acct: arows, title = db.q(base + "WHERE a.id=:i OR a.legacy_id=:l", i=int(acct) if acct.isdigit() else -1, l=acct), "Account search"
+    elif tf_ == "flagged": arows, title = db.q(base + "WHERE a.flags != '' ORDER BY a.id DESC LIMIT 50"), "Flagged accounts"
+    elif tf_ in ("demo", "real"): arows, title = db.q(base + "WHERE a.tier=:t ORDER BY a.id DESC LIMIT 50", t=tf_), f"Latest {tf_} accounts"
+    else: arows, title = db.q(base + "ORDER BY a.id DESC LIMIT 25"), "Latest accounts"
+    accts = (f"<div class='card'><h2>{escape(title)}</h2><form method='get' action='/admin' style='display:flex;gap:8px;margin:8px 0;flex-wrap:wrap'><input class='input' name='acct' placeholder='Account # (or old number)' style='max-width:240px'><button class='btn'>Find</button>"
+             "<a class='btn' style='background:#e2e8f0;color:#0f172a' href='/admin?show=flagged'>Flagged</a><a class='btn' style='background:#e2e8f0;color:#0f172a' href='/admin?show=demo'>Demo</a><a class='btn' style='background:#e2e8f0;color:#0f172a' href='/admin?show=real'>Real</a></form>"
+             + ("".join(_arow(a, s, ret) for a in arows) or "<p class='muted'>Nothing here.</p>") + "</div>")
+    # ---- 2-step login
+    tot = _totp()
+    if tot.get("enabled"):
+        twofa = ("<div class='card'><h2>2-step login is ON</h2><p class='muted' style='margin-bottom:10px'>To turn it off, enter your password and a current code.</p><form action='/admin/2fa' method='post' class='grid'><input type='hidden' name='op' value='disable'>"
+                 "<div><label>Password</label><input class='input' name='pw' type='password' required></div><div><label>Authenticator code</label><input class='input' name='code' inputmode='numeric' required></div>"
+                 "<div><button class='btn' style='background:#dc2626'>Turn off</button></div></form></div>")
+    elif TOTP_PENDING["secret"]:
+        sk = TOTP_PENDING["secret"]
+        twofa = (f"<div class='card'><h2>Set up 2-step login</h2><ol class='muted' style='line-height:1.9;margin:0 0 10px 18px'><li>Open Google Authenticator and tap +, then Enter a setup key.</li><li>Account: <b>Admin</b>. Key: <b style='word-break:break-all'>{' '.join(sk[i:i + 4] for i in range(0, len(sk), 4))}</b>. Time based.</li>"
+                 "<li>Type the 6-digit code below.</li></ol><form action='/admin/2fa' method='post' class='grid'><input type='hidden' name='op' value='confirm'><div><label>Code</label><input class='input' name='code' inputmode='numeric' required></div><div><button class='btn'>Turn on</button></div></form></div>")
+    else:
+        twofa = ("<div class='card'><h2>2-step login</h2><p class='muted' style='margin-bottom:10px'>Adds a code from your phone to the admin login.</p><form action='/admin/2fa' method='post'><input type='hidden' name='op' value='start'><button class='btn'>Set up 2-step login</button></form></div>")
+    tbl, tips = "", []
+    for f, gr in st.items():
+        for k, mm in gr.items():
+            tbl += f"<div class='muted'>{f}={escape(k)}: {mm['n']} trades 路 win {mm['win']}% 路 avg {mm['exp']}R</div>"
+            if mm["n"] >= 10 and mm["exp"] < 0: tips.append(f"Consider filtering {f}={k} ({mm['n']} trades, {mm['exp']}R avg)")
+    jr = "".join(f"<div style='border-top:1px solid #e2e8f0;padding:10px 0'><img src='/uploads/{escape(j['file'])}' style='max-width:100%;max-height:260px;border-radius:8px'><div class='muted'>{escape(j['symbol'])} 路 {escape(j['result'])} 路 {escape(j['note'])}</div><pre>{escape(j.get('analysis', '(not analysed)'))}</pre><form action='/admin/analyze/{j['id']}' method='post'><button class='btn' style='padding:6px 12px'>Analyse with Claude</button></form></div>"
+                 for j in (json.loads(r["data"]) for r in db.q("SELECT data FROM journal ORDER BY created DESC LIMIT 15")))
+    errs = "".join(f"<div class='muted'>{escape(r['created'][:16])} 路 {escape(r['symbol'])} 路 {escape(r['status'])}</div>" for r in db.q("SELECT created, symbol, status FROM orders WHERE platform='SYSTEM' ORDER BY created DESC LIMIT 5"))
+    return layout("Admin", f"""{msg}{_warnings(s)}{dash}{brand}{access}{trust}{scale}{users}{accts}<div class='card'><h2>1. Settings</h2><form action='/admin/save' method='post' class='grid'>{fields}
+<div><label>Type LIVE here to allow mode=live</label><input class='input' name='confirm'></div><div><button class='btn'>Save settings</button></div></form>
+<p class='muted' style='margin-top:8px'>Lists/filters are JSON. Example filter: {{"session": ["Asia"]}}</p>{errs}
+<form action='/admin/scan' method='post' style='margin-top:10px'><button class='btn' style='background:#0f172a'>Run scan now</button></form></div>
+<div class='card'><h2>2. Learning from results ({n} resolved signals)</h2>{tbl or '<p class=muted>Needs resolved trades.</p>'}<pre>{escape(chr(10).join(tips) or 'No suggestions yet (needs 10+ trades per group).')}</pre>
+<form action='/admin/synthesize' method='post' style='margin-top:8px'><button class='btn'>Ask Claude for improvements</button></form><pre>{escape(kv_get('lessons', ''))}</pre></div>
+<div class='card'><h2>3. Screenshot journal</h2><form action='/admin/upload' method='post' enctype='multipart/form-data' class='grid'>
+<div><label>Chart screenshot (entry, SL, TP drawn)</label><input class='input' type='file' name='img' accept='image/*' required></div>
+<div><label>Symbol</label><input class='input' name='symbol'></div><div><label>Result</label><select class='input' name='result'><option>WIN</option><option>LOSS</option><option>BREAKEVEN</option></select></div>
+<div><label>Notes (what happened)</label><input class='input' name='note'></div><div><button class='btn'>Upload</button></div></form>{jr}</div>{security}{twofa}""")
+
+@app.route("/admin/save", methods=["POST"])
+@admin_only
+def admin_save():
+    s = load_settings(fresh=True); was_paid = bool(s["paid_mode"])
+    for k, v in DEFAULTS.items():
+        raw = request.form.get(k)
+        if raw is None: continue
+        try:
+            new = json.loads(raw) if isinstance(v, (list, dict)) else (raw.strip().lower() in ("1", "true", "yes", "on") if isinstance(v, bool) else type(v)(raw))
+            if isinstance(v, (list, dict)) and not isinstance(new, type(v)): continue
+            if k == "mode" and (new not in ("paper", "live") or (new == "live" and request.form.get("confirm") != "LIVE")): continue
+            if k == "ob_entry" and new not in ("top", "mid"): continue
+            if k == "timeframe" and new not in ("30m", "1h"): continue
+            if k == "timeframes": new = [t for t in new if t in ("30m", "1h")] or ["30m"]
+            if k in BRAND_KEYS: new = new.strip()[:400 if k == "lead" else 80] or DEFAULTS[k]
+            if k == "max_mitigation_pct": new = min(100.0, max(0.0, new))
+            if k == "min_leg_atr": new = max(0.0, new)
+            if k in ("trial_days", "plan_days"): new = min(3650, max(0, new))
+            if k in ("max_users", "max_accounts_per_user"): new = min(10 ** 9, max(0, new))
+            if k == "ea_poll_seconds": new = min(600, max(10, new))
+            if k == "max_inflight": new = min(5000, max(10, new))
+            if k == "demo_max_balance": new = max(0.0, new)
+            if k == "ea_demo_trust" and new not in ("strict", "off"): continue
+            if k in ("demo_servers", "demo_blocklist"): new = ",".join(csv_list(new))[:400]
+            if k in ("price_text", "pay_note"): new = new.strip()[:300]
+            if k == "payment_link":
+                new = new.strip()[:300]
+                if new and not new.startswith("https://"): continue
+            s[k] = new
+        except Exception: pass
+    save_settings(s)
+    if s["paid_mode"] and not was_paid:                                               # monetisation just switched on: everyone gets a fresh trial first
+        d = str(today() + datetime.timedelta(days=int(s["trial_days"])))
+        db.x("UPDATE users SET trial_end=:d", d=d); db.x("UPDATE accounts SET trial_end=:d WHERE user_id IS NULL", d=d)
+        _flash(f"Saved. Charging for real accounts is ON: every real account has a free trial until {d}. Demo accounts stay free.")
+    else: _flash("Saved.")
+    return redirect("/admin")
+
+@app.route("/admin/password", methods=["POST"])
+@admin_only
+def admin_password():
+    f = request.form
+    if not check_admin(f.get("cur", "")): _flash("Current password is wrong.")
+    elif len(f.get("new", "")) < 8 or f.get("new") != f.get("new2"): _flash("New passwords must match and be at least 8 characters.")
+    else: set_admin_password(f["new"]); _flash("Password changed.")
+    return redirect("/admin")
+
+@app.route("/admin/logout", methods=["POST"])
+def admin_logout(): session.clear(); return redirect("/admin")
+
+def _ret(): r = request.form.get("ret", "/admin"); return r if r.startswith("/admin") else "/admin"
+
+@app.route("/admin/account", methods=["POST"])
+@admin_only
+def admin_account():
+    try: aid = int(request.form.get("id", ""))
+    except ValueError: return redirect("/admin")
+    op, s = request.form.get("op", ""), load_settings(fresh=True)
+    a = db.one("SELECT * FROM accounts WHERE id=:i", i=aid)
+    if a and op in ("activate", "free", "pause", "resume", "real", "demo", "auto", "reset", "delete"):
+        if op == "activate":
+            base = max(today(), parse_date(a["paid_until"]) or today()); db.x("UPDATE accounts SET paid_until=:p WHERE id=:i", p=str(base + datetime.timedelta(days=int(s["plan_days"]))), i=aid)
+        elif op == "free": db.x("UPDATE accounts SET paid_until='2099-12-31' WHERE id=:i", i=aid)
+        elif op == "pause": db.x("UPDATE accounts SET blocked=1 WHERE id=:i", i=aid)
+        elif op == "resume": db.x("UPDATE accounts SET blocked=0 WHERE id=:i", i=aid)
+        elif op in ("real", "demo"): db.x("UPDATE accounts SET tier_override=:t, tier=:t, tier_src='admin', tier_note='Set by the owner' WHERE id=:i", t=op, i=aid)
+        elif op in ("auto", "reset"):
+            a["tier_override"] = "" if op == "auto" else a["tier_override"]
+            if op == "reset": a.update(ever_real=0, flags="", fp_changes=0)
+            tc = tier_cols(a, s); db.x("UPDATE accounts SET tier_override=:o, ever_real=:e, flags=:f, fp_changes=:c, tier=:t, tier_src=:s, tier_note=:n WHERE id=:i", o=a["tier_override"], e=a["ever_real"], f=a["flags"], c=a["fp_changes"], t=tc["tier"], s=tc["tier_src"], n=tc["tier_note"], i=aid)
+        elif op == "delete": db.x("DELETE FROM orders WHERE account_id=:i", i=aid); db.x("DELETE FROM accounts WHERE id=:i", i=aid)
+        _flash(f"Done: {op} account #{aid}.")
+    return redirect(_ret())
+
+@app.route("/admin/user", methods=["POST"])
+@admin_only
+def admin_user():
+    try: uid = int(request.form.get("id", ""))
+    except ValueError: return redirect("/admin")
+    op, s = request.form.get("op", ""), load_settings(fresh=True)
+    u = db.one("SELECT * FROM users WHERE id=:i", i=uid)
+    if u and op in ("ban", "unban", "resetpw", "free", "trial", "delete"):
+        if op in ("ban", "unban"): db.x("UPDATE users SET blocked=:b WHERE id=:i", b=1 if op == "ban" else 0, i=uid)
+        elif op == "resetpw":
+            tmp = secrets.token_urlsafe(9); salt = os.urandom(16).hex(); db.x("UPDATE users SET pw_salt=:s, pw_hash=:h WHERE id=:i", s=salt, h=pw_hash(tmp, salt), i=uid)
+            _flash(f"Temporary password for {u['email']} (tell them to log in with it): {tmp}"); return redirect(_ret())
+        elif op == "free": db.x("UPDATE accounts SET paid_until='2099-12-31' WHERE user_id=:i", i=uid)
+        elif op == "trial": db.x("UPDATE users SET trial_end=:d WHERE id=:i", d=str(today() + datetime.timedelta(days=int(s["trial_days"]))), i=uid)
+        elif op == "delete":
+            db.x("DELETE FROM orders WHERE account_id IN (SELECT id FROM accounts WHERE user_id=:i)", i=uid); db.x("DELETE FROM accounts WHERE user_id=:i", i=uid); db.x("DELETE FROM users WHERE id=:i", i=uid)
+        _flash(f"Done: {op} user #{uid}.")
+    return redirect(_ret())
+
+@app.route("/admin/2fa", methods=["POST"])
+@admin_only
+def admin_2fa():
+    f, op = request.form, request.form.get("op")
+    if op == "start":
+        if crypto_ready(): TOTP_PENDING["secret"] = base64.b32encode(os.urandom(20)).decode().rstrip("=")
+        else: _flash("Set DATA_KEY on Render first, then try again.")
+    elif op == "confirm":
+        sec = TOTP_PENDING["secret"]
+        if sec and totp_ok(sec, f.get("code", "")):
+            kv_set("admin_totp", json.dumps({"enabled": True, "secret": "enc2:" + _enc2(sec, "admin:totp", kdf_salt())})); TOTP_PENDING["secret"] = None; _flash("2-step login is ON.")
+        else: _flash("That code is not right. Check the clock on your phone and try again.")
+    elif op == "disable":
+        sec = _totp_secret()
+        if check_admin(f.get("pw", "")) and sec and totp_ok(sec, f.get("code", "")): kv_set("admin_totp", "null"); _flash("2-step login is OFF.")
+        else: _flash("Password or code is wrong.")
+    return redirect("/admin")
+
+@app.route("/admin/scan", methods=["POST"])
+@admin_only
+def admin_scan(): run_scan(); return redirect("/orders")
+
+@app.route("/admin/upload", methods=["POST"])
+@admin_only
+def upload():
+    f = request.files.get("img")
+    ext = os.path.splitext(secure_filename(f.filename or ""))[1].lower() if f else ""
+    if ext not in (".png", ".jpg", ".jpeg", ".webp"): return "Unsupported file", 400
+    name = uuid.uuid4().hex + ext; f.save(os.path.join(UPLOADS, name)); fm = request.form; jid = uuid.uuid4().hex[:8]
+    j = {"id": jid, "file": name, "symbol": fm.get("symbol", "")[:30], "result": fm.get("result", "")[:12], "note": fm.get("note", "")[:500], "time": now_s()}
+    db.x("INSERT INTO journal (id, created, data) VALUES (:i, :c, :d)", i=jid, c=j["time"], d=json.dumps(j)); return redirect("/admin")
+
+@app.route("/uploads/<name>")
+@admin_only
+def uploads(name): return send_from_directory(UPLOADS, secure_filename(name))
+
+@app.route("/admin/analyze/<jid>", methods=["POST"])
+@admin_only
+def analyze(jid):
+    r = db.one("SELECT data FROM journal WHERE id=:i", i=jid)
+    if not r: abort(404)
+    j = json.loads(r["data"]); ext = j["file"].rsplit(".", 1)[-1]; mt = {"png": "image/png", "webp": "image/webp"}.get(ext, "image/jpeg")
+    with open(os.path.join(UPLOADS, secure_filename(j["file"])), "rb") as fh: b64 = base64.b64encode(fh.read()).decode()
+    sysmsg = "You review trading chart screenshots against the user's rules: " + S()["strategy_text"]
+    txt = f"Symbol {j['symbol']}, result {j['result']}. Notes: {j['note']}. Identify the BOS, the liquidity, the entry order block, SL and TP shown. Say whether each follows the rules, what went wrong or right, and one concrete rule/filter change to test. Be specific; say if the image is unclear."
+    j["analysis"] = claude([{"type": "image", "source": {"type": "base64", "media_type": mt, "data": b64}}, {"type": "text", "text": txt}], sysmsg)
+    db.x("UPDATE journal SET data=:d WHERE id=:i", d=json.dumps(j), i=jid); return redirect("/admin")
+
+@app.route("/admin/synthesize", methods=["POST"])
+@admin_only
+def synthesize():
+    st, n = stats(track_rows(None)); js = [json.loads(r["data"]) for r in db.q("SELECT data FROM journal ORDER BY created DESC LIMIT 10")]
+    notes = "\n---\n".join(f"{j['symbol']} {j['result']}: {j.get('analysis', '')[:700]}" for j in js)
+    out = claude(f"Strategy rules: {S()['strategy_text']}\nBot stats ({n} trades): {json.dumps(st)}\nScreenshot reviews:\n{notes}\n\nFind repeating patterns in the losses and propose at most 3 testable changes (settings or filters). Flag small sample sizes honestly.", "You are a careful quantitative trading reviewer. Do not overfit; recommend paper-testing every change.")
+    kv_set("lessons", out); return redirect("/admin")
+
+# ======================================================================================================================
+if os.environ.get("AUTOSCAN") == "1": threading.Thread(target=worker_main, daemon=True).start()      # tiny installs only; real traffic: run `python app.py worker` separately
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "worker": worker_main()
+    else: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), threaded=True)
