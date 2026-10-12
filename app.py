@@ -130,12 +130,24 @@ class DB:
         cur = c.execute(sql, p)
         return ([dict(r) for r in cur.fetchall()] if cur.description else []), cur.rowcount
 
+    def _retry(self, fn):
+        """PostgreSQL closes idle connections (Render does this). A pooled connection may be dead: it is discarded by conn(), so just try again."""
+        attempts = 3 if self.pg else 1
+        for i in range(attempts):
+            try: return fn()
+            except Exception:
+                if i == attempts - 1: raise
+
     def q(self, sql, **p):
-        with self.conn() as c: return self._exec(c, sql, p)[0]
+        def go():
+            with self.conn() as c: return self._exec(c, sql, p)[0]
+        return self._retry(go)
     def one(self, sql, **p):
         r = self.q(sql, **p); return r[0] if r else None
     def x(self, sql, **p):
-        with self.conn() as c: return self._exec(c, sql, p)[1]
+        def go():
+            with self.conn() as c: return self._exec(c, sql, p)[1]
+        return self._retry(go)
 
     @contextlib.contextmanager
     def tx(self):
@@ -293,9 +305,15 @@ def _ip(): return request.remote_addr or "?"
 def throttled(name, limit=10, window=600, add=False, ident=None): return RL.hit(name, ident or _ip(), limit, window, add)
 # ---------------- strategy engine ----------------
 def fetch_candles(symbol, interval="30m", limit=300):
-    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
-    with urllib.request.urlopen(url, timeout=10) as r: rows = json.loads(r.read())[:-1]   # drop forming candle
-    return [{"t": x[0], "o": float(x[1]), "h": float(x[2]), "l": float(x[3]), "c": float(x[4])} for x in rows]
+    """Binance futures first. fapi.binance.com answers HTTP 451 to US servers, so fall back to Binance's public market-data host (spot prices, very close)."""
+    last = None
+    for url in (f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}",
+                f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"):
+        try:
+            with urllib.request.urlopen(url, timeout=10) as r: rows = json.loads(r.read())[:-1]   # drop forming candle
+            return [{"t": x[0], "o": float(x[1]), "h": float(x[2]), "l": float(x[3]), "c": float(x[4])} for x in rows]
+        except Exception as e: last = e
+    raise last
 
 def _swing(c, i, n, kind):
     k = "h" if kind == "high" else "l"
@@ -887,7 +905,11 @@ label{font-weight:600;font-size:12px;color:#334155}
 pre{white-space:pre-wrap;background:#f1f5f9;padding:12px;border-radius:10px;font-size:12px;margin-top:6px}h2,h3{margin-bottom:8px}
 table th{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.05em}
 table tr:hover td{background:#f8fafc}
-.foot{text-align:center;color:var(--mut);font-size:12px;padding:30px 20px 40px}
+.foot{text-align:center;color:var(--mut);font-size:12px;padding:30px 20px 90px}
+.instbar{position:fixed;left:12px;right:12px;bottom:12px;z-index:100;display:none;align-items:center;gap:10px;background:#0f172a;color:#fff;border-radius:16px;padding:12px 14px;box-shadow:0 12px 40px rgba(0,0,0,.35);max-width:560px;margin:0 auto}
+.instbar b{flex:1;font-size:14px}
+.instbar .btn{padding:9px 14px;box-shadow:none;white-space:nowrap}
+.instbar .x{background:none;border:0;color:#94a3b8;font-size:22px;cursor:pointer;padding:0 4px;line-height:1}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 """
 
@@ -924,12 +946,19 @@ def service_worker():
          "self.addEventListener('fetch',function(e){e.respondWith(fetch(e.request).catch(function(){return new Response('You are offline. Reconnect to open the app.',{headers:{'Content-Type':'text/plain'}})}))});"
     return js, 200, {"Content-Type": "application/javascript", "Service-Worker-Allowed": "/", "Cache-Control": "no-cache"}
 
-PWA_JS = ("<script>if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js');var dp=null,b=document.getElementById('inst');"
+# Install prompts: a banner at the bottom of every page, the button in the top bar, and one in the home page hero. All of them
+# share the class .instbtn (or id #inst) and are hidden automatically once the app is installed / opened as an app.
+PWA_JS = ("<div class='instbar' id='instbar'><b>📲 Install the app on your phone</b><button class='btn instbtn' type='button'>INSTALL</button><button class='x' id='instx' type='button' aria-label='Close'>×</button></div>"
+          "<script>if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js');var dp=null,bar=document.getElementById('instbar');"
           "function inApp(){return (window.matchMedia&&matchMedia('(display-mode: standalone)').matches)||navigator.standalone===true}"
-          "if(b&&inApp())b.style.display='none';"
+          "function hideAll(){document.querySelectorAll('.instbtn,#inst').forEach(function(e){e.style.display='none'});if(bar)bar.style.display='none'}"
+          "var closed=false;try{closed=sessionStorage.getItem('instx')==='1'}catch(e){}"
+          "if(inApp())hideAll();else if(bar&&!closed)bar.style.display='flex';"
           "addEventListener('beforeinstallprompt',function(e){e.preventDefault();dp=e});"
-          "addEventListener('appinstalled',function(){if(b)b.style.display='none'});"
-          "if(b)b.onclick=function(x){x.preventDefault();if(dp){dp.prompt();dp=null}else{alert('To install: open your browser menu (the three dots) and tap Install app or Add to Home screen. On iPhone use Safari: tap Share, then Add to Home Screen.')}};</script>")
+          "addEventListener('appinstalled',hideAll);"
+          "document.getElementById('instx').onclick=function(){bar.style.display='none';try{sessionStorage.setItem('instx','1')}catch(e){}};"
+          "document.querySelectorAll('.instbtn,#inst').forEach(function(b){b.onclick=function(x){x.preventDefault();"
+          "if(dp){dp.prompt();dp=null}else{alert('To install: open your browser menu (the three dots) and tap Install app or Add to Home screen. On iPhone use Safari: tap Share, then Add to Home Screen.')}}});</script>")
 
 LOGO_SVG = "<svg width='18' height='18' viewBox='0 0 18 18'><rect x='2' y='8' width='3' height='8' rx='1' fill='#fff'/><rect x='7.5' y='3' width='3' height='13' rx='1' fill='#fff'/><rect x='13' y='6' width='3' height='10' rx='1' fill='#fff' opacity='.85'/></svg>"
 
@@ -956,10 +985,15 @@ def secure_headers(r):
 
 @app.before_request
 def csrf_guard():
-    """Browsers always send Origin on form posts: refuse posts that come from another website."""
+    """Browsers always send Origin on form posts: refuse posts that come from another website. The site's own address may arrive as Host or X-Forwarded-Host."""
     if request.method == "POST" and request.path not in ("/ea/sync",):
         o = request.headers.get("Origin")
-        if o and urllib.parse.urlparse(o).netloc != request.host: abort(403)
+        if o:
+            h = urllib.parse.urlparse(o).netloc.lower()
+            ok = {request.host.lower(), (request.headers.get("Host") or "").lower(), (request.headers.get("X-Forwarded-Host") or "").split(",")[0].strip().lower()}
+            if h not in ok:
+                print("CSRF blocked: Origin", o, "| host", request.host, "| X-Forwarded-Host", request.headers.get("X-Forwarded-Host"))
+                abort(403)
 
 # ---------------- users ----------------
 def pw_hash(pw, salt): return hashlib.scrypt(pw.encode(), salt=bytes.fromhex(salt), n=2 ** 14, r=8, p=1, maxmem=64 * 1024 * 1024, dklen=32).hex()
@@ -1224,7 +1258,7 @@ HOME_TPL = """
   <span class='badge'><span class='dot'></span>@@MODE@@ MODE · SCANNING THE MARKET</span>
   <h1><span class='grad'>@@NAME@@</span><br>@@TAGLINE@@</h1>
   <p class='lead'>@@LEAD@@</p>
-  <div class='cta'><a class='btn' href='/setup'>CONNECT ACCOUNT →</a><a class='btn ghost' href='/performance'>VIEW PERFORMANCE</a></div>
+  <div class='cta'><a class='btn' href='/setup'>CONNECT ACCOUNT →</a><a class='btn ghost' href='/performance'>VIEW PERFORMANCE</a><a class='btn ghost instbtn' href='#'>📲 INSTALL APP</a></div>
   <div class='kpis'>
    <div class='kpi'><b data-to='@@TRADES@@'>0</b><span>Closed trades · @@TFK@@</span></div>
    <div class='kpi'><b data-to='@@WIN@@' data-dec='1' data-suf='%'>0</b><span>Win rate · @@TFK@@</span></div>
@@ -1277,6 +1311,23 @@ def home():
 def healthz():
     try: db.one("SELECT 1 AS ok"); return "ok", 200
     except Exception: return "database down", 503
+
+
+@app.route("/ping")
+def ping():
+    """Lightweight liveness endpoint: confirms the Flask web process responds."""
+    return "ok", 200, {"Cache-Control": "no-store"}
+
+@app.route("/health")
+def health():
+    """Readiness endpoint: confirms the app can reach its configured database."""
+    try:
+        db.one("SELECT 1 AS ok")
+        return jsonify(ok=True), 200, {"Cache-Control": "no-store"}
+    except Exception:
+        # Do not expose database exception details on a public endpoint.
+        app.logger.exception("Health check database query failed")
+        return jsonify(ok=False, error="database unavailable"), 503, {"Cache-Control": "no-store"}
 
 @app.route("/api/status")
 def status():
@@ -1407,11 +1458,14 @@ def _make_acc(f, user, s):
 def _insert_account(a, user, s):
     ref = secrets.token_hex(8); a.update(ref=ref, user_id=user["id"] if user else None, created=str(today()), trial_end=None)
     a.update(tier_cols(a, s))
+    # Accounts made WITHOUT a sign-up carry their own free trial (signed-up users get theirs through start_trial, once per user).
+    trial_end = None
+    if not user and a["tier"] == "real" and s.get("paid_mode") and int(s.get("trial_days") or 0) > 0:
+        trial_end = str(today() + datetime.timedelta(days=int(s["trial_days"])))
     row = dict(ref=ref, user_id=a["user_id"], platform=a["platform"], tf=a["tf"], env=a["env"], server=a["server"], secrets=seal(ref, a["secrets"]) if a["secrets"] else "{}",
-               key_hash=a.get("key_hash"), balance=a["balance"], created=a["created"], tier=a["tier"], tier_src=a["tier_src"], tier_note=a["tier_note"], attest=json.dumps(a["attest"]), fp=a.get("fp"))
-    if not user and int(s.get("trial_days") or 0): row["trial_end"] = None
-    r = db.q("INSERT INTO accounts (ref, user_id, platform, tf, env, server, secrets, key_hash, balance, created, tier, tier_src, tier_note, attest, fp) VALUES "
-             "(:ref, :user_id, :platform, :tf, :env, :server, :secrets, :key_hash, :balance, :created, :tier, :tier_src, :tier_note, :attest, :fp) RETURNING id", **row)
+               key_hash=a.get("key_hash"), balance=a["balance"], created=a["created"], trial_end=trial_end, tier=a["tier"], tier_src=a["tier_src"], tier_note=a["tier_note"], attest=json.dumps(a["attest"]), fp=a.get("fp"))
+    r = db.q("INSERT INTO accounts (ref, user_id, platform, tf, env, server, secrets, key_hash, balance, created, trial_end, tier, tier_src, tier_note, attest, fp) VALUES "
+             "(:ref, :user_id, :platform, :tf, :env, :server, :secrets, :key_hash, :balance, :created, :trial_end, :tier, :tier_src, :tier_note, :attest, :fp) RETURNING id", **row)
     if a["tier"] == "real" and user: start_trial(user["id"])
     return r[0]["id"]
 
@@ -1482,7 +1536,7 @@ def _key_ok(a, key):
 def tier_badge(a):
     t = a["tier"]; col = "#16a34a" if t == "demo" else "#b45309"
     src = {"endpoint": "proven by the exchange", "metaapi": "verified through MetaApi", "ea": "reported by the EA", "admin": "set by the owner", "unverified": "not verified yet"}.get(a["tier_src"], "")
-    return f"<span style='background:{col};color:#fff;border-radius:999px;padding:2px 10px;font-size:11px;font-weight:800'>{t.upper()}</span> <span class='muted'>{escape(src)}{' 路 ' + escape(a['tier_note']) if a['tier_note'] else ''}</span>"
+    return f"<span style='background:{col};color:#fff;border-radius:999px;padding:2px 10px;font-size:11px;font-weight:800'>{t.upper()}</span> <span class='muted'>{escape(src)}{' · ' + escape(a['tier_note']) if a['tier_note'] else ''}</span>"
 
 def _online(a):
     try: return bool(a["last_seen"]) and (datetime.datetime.utcnow() - datetime.datetime.strptime(a["last_seen"][:19], "%Y-%m-%d %H:%M:%S")).total_seconds() < max(180, 4 * int(S()["ea_poll_seconds"]))
@@ -1502,8 +1556,8 @@ def my_status():
         return render_account(a, key=key)
     if u:
         rows = db.q("SELECT * FROM accounts WHERE user_id=:u ORDER BY id", u=u["id"])
-        cards = "".join(f"<div style='border:1px solid #e2e8f0;border-radius:12px;padding:12px;margin:8px 0'><b>Account #{a['id']} 路 {escape(a['platform'])} 路 {escape(a['tf'])} chart</b><br>{tier_badge(a)}<br>"
-                        f"<span style='color:{'#16a34a' if sub_state(a, s, u)[0] else '#dc2626'};font-weight:600'>{escape(sub_state(a, s, u)[1])}</span> 路 <a href='/account/{a['id']}'>Open</a></div>" for a in rows) or "<p class='muted'>No accounts yet. <a href='/setup'>Connect one</a>.</p>"
+        cards = "".join(f"<div style='border:1px solid #e2e8f0;border-radius:12px;padding:12px;margin:8px 0'><b>Account #{a['id']} · {escape(a['platform'])} · {escape(a['tf'])} chart</b><br>{tier_badge(a)}<br>"
+                        f"<span style='color:{'#16a34a' if sub_state(a, s, u)[0] else '#dc2626'};font-weight:600'>{escape(sub_state(a, s, u)[1])}</span> · <a href='/account/{a['id']}'>Open</a></div>" for a in rows) or "<p class='muted'>No accounts yet. <a href='/setup'>Connect one</a>.</p>"
         return layout("My account", f"<div class='card' style='max-width:760px'><h2>My accounts</h2><p class='muted'>Signed in as {escape(u['email'])}</p>{cards}<p><a class='btn' href='/setup'>+ Connect another account</a></p></div>"
                                     f"<div class='card' style='max-width:760px'><h3>Have an older account without sign-up?</h3><p class='muted'>Enter its number and key to link it to your profile.</p>{_status_form('', bare=True)}</div>")
     if s["require_signup"]: return redirect("/login?next=/status")
@@ -1513,7 +1567,7 @@ def _status_form(err, bare=False):
     e = f"<p style='color:#dc2626;font-weight:600;margin-bottom:8px'>{escape(err)}</p>" if err else ""
     f = (f"{e}<form method='post' action='/status'><label>Account #</label><input class='input' name='id' required><br><br><label>Key (EA key, or the exchange API key)</label>"
          "<input class='input' name='key' type='password' required><br><br><button class='btn'>Open my account</button></form>")
-    return f if bare else f"<div class='card' style='max-width:520px'><h2>My account</h2><p class='muted' style='margin-bottom:10px'>Log in to see your accounts, or enter an account number and key.</p>{f}<p class='muted' style='margin-top:12px'><a href='/login?next=/status'>Log in</a> 路 <a href='/signup'>Sign up</a></p></div>"
+    return f if bare else f"<div class='card' style='max-width:520px'><h2>My account</h2><p class='muted' style='margin-bottom:10px'>Log in to see your accounts, or enter an account number and key.</p>{f}<p class='muted' style='margin-top:12px'><a href='/login?next=/status'>Log in</a> · <a href='/signup'>Sign up</a></p></div>"
 
 @app.route("/account/<aid>")
 def account_page(aid):
@@ -1527,14 +1581,14 @@ def render_account(a, key="", note=""):
     ok, txt = sub_state(a, s, owner)
     if ee:
         ls = a["last_seen"] or ""; on = _online(a)
-        badge = (f"<b style='color:#16a34a'>鈼� Connected</b> <span class='muted'>(EA last heard {escape(ls)} UTC)</span>" if on else
-                 f"<b style='color:#dc2626'>鈼� Not connected</b> <span class='muted'>({'last heard ' + escape(ls) + ' UTC' if ls else 'the EA has not contacted the app yet'})</span>")
-    else: badge = f"<b style='color:#64748b'>鈼� {escape(note) if note else 'Saved. Press Test connection to check your keys.'}</b>"
+        badge = (f"<b style='color:#16a34a'>● Connected</b> <span class='muted'>(EA last heard {escape(ls)} UTC)</span>" if on else
+                 f"<b style='color:#dc2626'>● Not connected</b> <span class='muted'>({'last heard ' + escape(ls) + ' UTC' if ls else 'the EA has not contacted the app yet'})</span>")
+    else: badge = f"<b style='color:#64748b'>● {escape(note) if note else 'Saved. Press Test connection to check your keys.'}</b>"
     mode = "LIVE: orders are sent to your account." if s["mode"] == "live" else "PAPER: practice mode. Trades are recorded here but not sent to your account."
     mine = [row_to_order(r) for r in db.q("SELECT * FROM orders WHERE account_id=:a ORDER BY created DESC LIMIT 200", a=a["id"])]
     p = perf(mine); tr = f"{p['total_r']:+}R"
     box = lambda l, v: f"<div style='border:1px solid #e2e8f0;border-radius:12px;padding:12px'><div class='muted'>{l}</div><div style='font-size:22px;font-weight:800'>{v}</div></div>"
-    rows = "".join(f"<div style='padding:8px;border-bottom:1px solid #f1f5f9;font-size:12px'>{escape(o.get('time', '')[:16])} 路 {escape(o.get('symbol', ''))} {escape(o.get('side', ''))} 路 E {o['entry']:.6g} SL {o['sl']:.6g} TP {o['tp']:.6g} 路 <b>{escape(o.get('outcome', ''))}</b> {escape(str(o.get('status', '')))}</div>"
+    rows = "".join(f"<div style='padding:8px;border-bottom:1px solid #f1f5f9;font-size:12px'>{escape(o.get('time', '')[:16])} · {escape(o.get('symbol', ''))} {escape(o.get('side', ''))} · E {o['entry']:.6g} SL {o['sl']:.6g} TP {o['tp']:.6g} · <b>{escape(o.get('outcome', ''))}</b> {escape(str(o.get('status', '')))}</div>"
                    for o in mine[:10] if "entry" in o) or "<p class='muted'>No trades yet. The robot only trades when its pattern appears.</p>"
     pay = f"<p style='margin:8px 0'>{tier_badge(a)}</p><p style='margin:8px 0'><b style='color:{'#16a34a' if ok else '#dc2626'}'>Plan: {escape(txt)}</b></p>"
     if a["tier"] == "real" and s["paid_mode"] and not (ok and txt.startswith("Free access")):
@@ -1552,8 +1606,8 @@ def render_account(a, key="", note=""):
              "<li>Install MetaTrader 5 and log in to your broker account (demo or real).</li><li>Use <b>New EA key + code</b> above to get the code. In MT5 press F4 (MetaEditor), File, New, Expert Advisor (template), name it ISIG_EA, select all, paste, press F7: 0 errors.</li>"
              f"<li>In MT5: Tools, Options, Expert Advisors. Tick Allow WebRequest and add <b>{escape(request.host_url.rstrip('/'))}</b></li>"
              "<li>Open a chart of your pair on the timeframe you chose, drag ISIG_EA onto it, tick Allow Algo Trading, press OK, and turn on the Algo Trading button.</li></ol></details>") if ee else ""
-    body = (f"<div class='card' style='max-width:760px'><h2>Account #{a['id']} 路 {escape(a['platform'])}</h2><p style='margin:8px 0'>{badge}</p>"
-            f"<p class='muted'>Balance: {a['balance']:,.2f} 路 risk per trade {s['risk_pct']}% 路 target 1:{s['rr']} 路 chart {escape(a['tf'])}</p><p class='muted' style='margin:6px 0 12px'>Mode: {escape(mode)}</p>{pay}{tfform}{btns}{guide}</div>"
+    body = (f"<div class='card' style='max-width:760px'><h2>Account #{a['id']} · {escape(a['platform'])}</h2><p style='margin:8px 0'>{badge}</p>"
+            f"<p class='muted'>Balance: {a['balance']:,.2f} · risk per trade {s['risk_pct']}% · target 1:{s['rr']} · chart {escape(a['tf'])}</p><p class='muted' style='margin:6px 0 12px'>Mode: {escape(mode)}</p>{pay}{tfform}{btns}{guide}</div>"
             f"<div class='card' style='max-width:760px'><h3>My results</h3><div class='grid'>{box('Closed trades', p['trades'])}{box('Win rate', str(p['win_rate']) + '%')}{box('Total result', tr)}</div>"
             f"<h3 style='margin-top:14px'>My latest trades</h3>{rows}</div>")
     return layout("My account", body)
@@ -1727,7 +1781,7 @@ def trade_table(trs, tf=""):
         typ = "PAPER" if str(o.get("status", "")).startswith("PAPER") else "LIVE"
         cells = [escape(o["time"][:16]), escape(o["symbol"]), escape(o.get("tf") or "30m"), o["side"], f"{o['entry']:.6g}", f"{o['sl']:.6g}", f"{o['tp']:.6g}", f"<b style='color:{col}'>{o['outcome']} {o['r']:+}R</b>", typ]
         rows += "<tr style='border-top:1px solid #f1f5f9'>" + "".join(f"<td style='padding:6px'>{c}</td>" for c in cells) + "</tr>"
-    return f"<div class='card'><h2>Trade log ({len(trs)})</h2><p class='muted'><a href='/trades.csv?tf={escape(tf)}'>Download CSV</a> 路 latest 300 shown</p><div style='overflow-x:auto;font-size:12px'><table style='width:100%;border-collapse:collapse'>{h}{rows}</table></div></div>"
+    return f"<div class='card'><h2>Trade log ({len(trs)})</h2><p class='muted'><a href='/trades.csv?tf={escape(tf)}'>Download CSV</a> · latest 300 shown</p><div style='overflow-x:auto;font-size:12px'><table style='width:100%;border-collapse:collapse'>{h}{rows}</table></div></div>"
 
 @app.route("/trades.csv")
 def trades_csv():
@@ -1749,13 +1803,13 @@ def performance():
     box = lambda label, val, col="#0f172a": f"<div style='border:1px solid #e2e8f0;border-radius:12px;padding:14px'><div class='muted'>{label}</div><div style='font-size:24px;font-weight:800;color:{col}'>{val}</div></div>"
     tabs = "".join(f"<a class='btn' style='padding:6px 14px;margin-right:6px;{'' if v == view else 'background:#e2e8f0;color:#0f172a'}' href='/performance?view={v}&tf={tf}'>{v.upper()}</a>" for v in ("all", "paper", "live"))
     pf = p["profit_factor"] if p["profit_factor"] is not None else "-"
-    body = f"""<div class='card'><h2>Bot performance 路 {escape(tf)} chart</h2><p class='muted'>Each timeframe has its own record. Nothing is combined. One row per signal; personal account results are private.</p><div style='margin:10px 0'>{tftabs}</div><div style='margin:10px 0'>{tabs}</div>
+    body = f"""<div class='card'><h2>Bot performance · {escape(tf)} chart</h2><p class='muted'>Each timeframe has its own record. Nothing is combined. One row per signal; personal account results are private.</p><div style='margin:10px 0'>{tftabs}</div><div style='margin:10px 0'>{tabs}</div>
 <div class='grid'>{box('Closed trades', p['trades'])}{box('Win rate', str(p['win_rate']) + '%', good(p['win_rate'] - 33.4))}{box('Total result', f"{p['total_r']:+}R", good(p['total_r']))}
 {box('Avg win / avg loss', f"{p['avg_win_r']:+}R / {p['avg_loss_r']:+}R")}{box('Profit factor', pf)}{box('Max drawdown', f"-{p['max_drawdown_r']}R", '#dc2626')}{box('Avg per trade', f"{p['avg_r']:+}R", good(p['avg_r']))}</div>
 <h3 style='margin-top:16px'>Equity curve (cumulative R)</h3>{_curve_svg(p['curve'])}
 <p class='muted' style='margin-top:12px'>1R = the amount risked on one trade. Results are measured from market price data after each signal, not from broker statements. PAPER trades are simulated. Past results do not guarantee future results; this is not financial advice.</p></div>"""
     tfstat = stats(track_rows(None))[0].get("tf", {})
-    if tfstat: body += "<div class='card'><h2>By timeframe</h2>" + "".join(f"<p style='margin:6px 0'><b>{escape(k)}</b>: {m['n']} trades 路 win {m['win']}% 路 average {m['exp']:+}R</p>" for k, m in sorted(tfstat.items())) + "<p class='muted'>Each signal counted once.</p></div>"
+    if tfstat: body += "<div class='card'><h2>By timeframe</h2>" + "".join(f"<p style='margin:6px 0'><b>{escape(k)}</b>: {m['n']} trades · win {m['win']}% · average {m['exp']:+}R</p>" for k, m in sorted(tfstat.items())) + "<p class='muted'>Each signal counted once.</p></div>"
     body += trade_table(closed_trades(rows, view, tf), tf)
     return layout("Performance", body)
 
@@ -1769,7 +1823,7 @@ def api_performance():
 def orders():
     rows = [row_to_order(r) for r in db.q("SELECT * FROM orders WHERE platform='SIGNAL' ORDER BY created DESC LIMIT 40")]
     n = db.one("SELECT COUNT(*) AS n FROM track")["n"]
-    def row(r): return f"<div style='padding:8px;border-bottom:1px solid #f1f5f9;font-size:12px'>{escape(r.get('time', '')[:16])} 路 {escape(r.get('symbol', ''))} {escape(r.get('side', ''))} {escape(r.get('tf', ''))} 路 E {r['entry']:.6g} SL {r['sl']:.6g} TP {r['tp']:.6g} 路 <b>{escape(r.get('outcome', ''))}</b></div>"
+    def row(r): return f"<div style='padding:8px;border-bottom:1px solid #f1f5f9;font-size:12px'>{escape(r.get('time', '')[:16])} · {escape(r.get('symbol', ''))} {escape(r.get('side', ''))} {escape(r.get('tf', ''))} · E {r['entry']:.6g} SL {r['sl']:.6g} TP {r['tp']:.6g} · <b>{escape(r.get('outcome', ''))}</b></div>"
     return layout("Signals", f"<div class='card'><h2>Latest signals</h2><p class='muted'>{n} resolved signals</p>{''.join(row(r) for r in rows) or '<p class=muted>No signals yet.</p>'}</div>")
 
 # ======================================================================================================================
@@ -1802,9 +1856,9 @@ def _arow(a, s, ret):
     def btn(op, label, style="", conf=""):
         return (f"<form action='/admin/account' method='post' style='display:inline'{conf}><input type='hidden' name='id' value='{a['id']}'><input type='hidden' name='op' value='{op}'><input type='hidden' name='ret' value='{escape(ret)}'>"
                 f"<button class='btn' style='padding:4px 9px;font-size:11px;margin:2px;{style}'>{label}</button></form>")
-    flags = f" 路 <b style='color:#dc2626'>鈿� {escape(a['flags'])}</b>" if a["flags"] else ""
-    return (f"<div style='border-top:1px solid #e2e8f0;padding:10px 0;font-size:13px'><b>#{a['id']}</b> 路 {escape(a['platform'])} 路 {escape(a['tf'])} 路 {escape(a.get('email') or 'no sign-up')}{flags}<br>{tier_badge(a)}<br>"
-            f"<span style='color:{'#16a34a' if ok else '#dc2626'}'>{escape(txt)}</span> 路 balance {a['balance']:,.2f} 路 last seen {escape(a['last_seen'] or '-')}<br>"
+    flags = f" · <b style='color:#dc2626'>⚑ {escape(a['flags'])}</b>" if a["flags"] else ""
+    return (f"<div style='border-top:1px solid #e2e8f0;padding:10px 0;font-size:13px'><b>#{a['id']}</b> · {escape(a['platform'])} · {escape(a['tf'])} · {escape(a.get('email') or 'no sign-up')}{flags}<br>{tier_badge(a)}<br>"
+            f"<span style='color:{'#16a34a' if ok else '#dc2626'}'>{escape(txt)}</span> · balance {a['balance']:,.2f} · last seen {escape(a['last_seen'] or '-')}<br>"
             + btn("activate", f"Activate +{int(s['plan_days'])} days") + btn("free", "Free access") + (btn("resume", "Resume") if a["blocked"] else btn("pause", "Pause"))
             + btn("real", "Force REAL", "background:#b45309") + btn("demo", "Force DEMO", "background:#16a34a") + (btn("auto", "Back to automatic") if a["tier_override"] else "")
             + (btn("reset", "Clear flags") if a["flags"] or a["ever_real"] else "") + btn("delete", "Delete", "background:#dc2626", " onsubmit='return confirm(&quot;Delete this account?&quot;)'") + "</div>")
@@ -1867,11 +1921,11 @@ def _admin_page(s):
         return (f"<form action='/admin/user' method='post' style='display:inline'{conf}><input type='hidden' name='id' value='{uid}'><input type='hidden' name='op' value='{op}'><input type='hidden' name='ret' value='{escape(ret)}'>"
                 f"<button class='btn' style='padding:4px 9px;font-size:11px;margin:2px;{style}'>{label}</button></form>")
     def urow(u):
-        return (f"<div style='border-top:1px solid #e2e8f0;padding:8px 0;font-size:13px'><b>#{u['id']}</b> {escape(u['email'])} 路 {u['n']} accounts 路 joined {escape(str(u['created'])[:10])}"
-                f"{' 路 <b style=color:#dc2626>BANNED</b>' if u['blocked'] else ''} 路 <a href='/admin?user={u['id']}'>accounts</a><br>"
+        return (f"<div style='border-top:1px solid #e2e8f0;padding:8px 0;font-size:13px'><b>#{u['id']}</b> {escape(u['email'])} · {u['n']} accounts · joined {escape(str(u['created'])[:10])}"
+                f"{' · <b style=color:#dc2626>BANNED</b>' if u['blocked'] else ''} · <a href='/admin?user={u['id']}'>accounts</a><br>"
                 + (ubtn(u["id"], "unban", "Unban") if u["blocked"] else ubtn(u["id"], "ban", "Ban", "background:#dc2626")) + ubtn(u["id"], "resetpw", "Reset password") + ubtn(u["id"], "free", "Free access (all)") + ubtn(u["id"], "trial", "Restart trial")
                 + ubtn(u["id"], "delete", "Delete user", "background:#dc2626", " onsubmit='return confirm(&quot;Delete this user and all their accounts?&quot;)'") + "</div>")
-    nav = (f"<p style='margin-top:10px'>" + (f"<a href='{ids}&page={page - 1}'>鈫� newer</a> " if page else "") + (f"<a href='{ids}&page={page + 1}'>older 鈫�</a>" if len(urows) > per else "") + "</p>")
+    nav = (f"<p style='margin-top:10px'>" + (f"<a href='{ids}&page={page - 1}'>← newer</a> " if page else "") + (f"<a href='{ids}&page={page + 1}'>older →</a>" if len(urows) > per else "") + "</p>")
     users = (f"<div class='card'><h2>Users</h2><form method='get' action='/admin' style='display:flex;gap:8px;margin:8px 0'><input class='input' name='q' value='{escape(q)}' placeholder='Search by email'><button class='btn'>Search</button></form>"
              + ("".join(urow(u) for u in urows[:per]) or "<p class='muted'>No users yet.</p>") + nav + "</div>")
     # ---- accounts
@@ -1900,11 +1954,11 @@ def _admin_page(s):
     tbl, tips = "", []
     for f, gr in st.items():
         for k, mm in gr.items():
-            tbl += f"<div class='muted'>{f}={escape(k)}: {mm['n']} trades 路 win {mm['win']}% 路 avg {mm['exp']}R</div>"
+            tbl += f"<div class='muted'>{f}={escape(k)}: {mm['n']} trades · win {mm['win']}% · avg {mm['exp']}R</div>"
             if mm["n"] >= 10 and mm["exp"] < 0: tips.append(f"Consider filtering {f}={k} ({mm['n']} trades, {mm['exp']}R avg)")
-    jr = "".join(f"<div style='border-top:1px solid #e2e8f0;padding:10px 0'><img src='/uploads/{escape(j['file'])}' style='max-width:100%;max-height:260px;border-radius:8px'><div class='muted'>{escape(j['symbol'])} 路 {escape(j['result'])} 路 {escape(j['note'])}</div><pre>{escape(j.get('analysis', '(not analysed)'))}</pre><form action='/admin/analyze/{j['id']}' method='post'><button class='btn' style='padding:6px 12px'>Analyse with Claude</button></form></div>"
+    jr = "".join(f"<div style='border-top:1px solid #e2e8f0;padding:10px 0'><img src='/uploads/{escape(j['file'])}' style='max-width:100%;max-height:260px;border-radius:8px'><div class='muted'>{escape(j['symbol'])} · {escape(j['result'])} · {escape(j['note'])}</div><pre>{escape(j.get('analysis', '(not analysed)'))}</pre><form action='/admin/analyze/{j['id']}' method='post'><button class='btn' style='padding:6px 12px'>Analyse with Claude</button></form></div>"
                  for j in (json.loads(r["data"]) for r in db.q("SELECT data FROM journal ORDER BY created DESC LIMIT 15")))
-    errs = "".join(f"<div class='muted'>{escape(r['created'][:16])} 路 {escape(r['symbol'])} 路 {escape(r['status'])}</div>" for r in db.q("SELECT created, symbol, status FROM orders WHERE platform='SYSTEM' ORDER BY created DESC LIMIT 5"))
+    errs = "".join(f"<div class='muted'>{escape(r['created'][:16])} · {escape(r['symbol'])} · {escape(r['status'])}</div>" for r in db.q("SELECT created, symbol, status FROM orders WHERE platform='SYSTEM' ORDER BY created DESC LIMIT 5"))
     return layout("Admin", f"""{msg}{_warnings(s)}{dash}{brand}{access}{trust}{scale}{users}{accts}<div class='card'><h2>1. Settings</h2><form action='/admin/save' method='post' class='grid'>{fields}
 <div><label>Type LIVE here to allow mode=live</label><input class='input' name='confirm'></div><div><button class='btn'>Save settings</button></div></form>
 <p class='muted' style='margin-top:8px'>Lists/filters are JSON. Example filter: {{"session": ["Asia"]}}</p>{errs}
