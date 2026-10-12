@@ -1,5 +1,5 @@
 """
-Nnanna Michael - single-file trading robot.
+Nnanna Michael - single-file trading robot
 Strategy: 30m major BOS -> liquidity (last OB/wick in the BOS leg) -> entry at TOP of the OB below it
 (bullish; bottom of the OB above it for bearish) -> SL at protected low/high -> TP at 1:RR.
 Everything (liquidity + entry OB) is taken from INSIDE the leg of the latest BOS.
