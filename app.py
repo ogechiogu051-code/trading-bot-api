@@ -46,6 +46,7 @@ DEFAULTS = {
     "symbols": ["BTCUSDT", "ETHUSDT"], "timeframe": "30m", "timeframes": ["30m", "1h"],
     "swing_n": 2, "min_bos": 2, "rr": 2.0, "ob_entry": "top",
     "risk_pct": 1.0, "max_mitigation_pct": 30.0, "min_leg_atr": 3.0,
+    "max_trades_per_day": 3,        # per account, per UTC day (0 = no limit)
     # --- access
     "require_signup": False,        # ON = nobody can add an account without signing up / logging in first
     "gmail_only": False, "max_users": 0, "max_accounts_per_user": 5, "block_unlinked": False,
@@ -195,6 +196,8 @@ def init_db():
         "CREATE TABLE IF NOT EXISTS journal (id TEXT PRIMARY KEY, created TEXT NOT NULL, data TEXT NOT NULL)",
     ]
     for s_ in stmts: db.x(s_)
+    try: db.x("ALTER TABLE accounts ADD COLUMN " + ("IF NOT EXISTS " if db.pg else "") + "paused INTEGER NOT NULL DEFAULT 0")     # start/stop switch; old databases get it here
+    except Exception: pass                                           # already there
 
 # ---------------- key/value + settings ----------------
 def kv_get(k, default=None):
@@ -385,7 +388,8 @@ def find_setup(c, s, tf=None):
     h = datetime.datetime.utcnow().hour
     sess = "Asia" if h < 7 else "London" if h < 13 else "NY" if h < 21 else "Late"
     return {"side": "BUY" if bull else "SELL", "entry": entry, "sl": sl, "tp": tp, "rr": rr, "liquidity": kind,
-            "session": sess, "bos_run": min(run, 5), "key": (f"{tf}-" if tf and tf != s["timeframe"] else "") + f"{last['dir']}-{c[bos_i]['t']}", "tf": tf or s["timeframe"], "mitigated_pct": round(100 * mit), "last_t": c[-1]["t"]}
+            "session": sess, "bos_run": min(run, 5), "key": (f"{tf}-" if tf and tf != s["timeframe"] else "") + f"{last['dir']}-{c[bos_i]['t']}", "tf": tf or s["timeframe"], "mitigated_pct": round(100 * mit), "last_t": c[-1]["t"],
+            "bos_t": c[bos_i]["t"], "ob_hi": ob["h"], "ob_lo": ob["l"]}
 
 def resolve(o, candles):
     """Walk candles since the order was created: PENDING -> OPEN -> WIN/LOSS/EXPIRED. SL wins ties (conservative)."""
@@ -668,7 +672,7 @@ def sub_state(a, s, u=None):
 
 def elig_sql(s):
     """Same rules as sub_state, as SQL, so thousands of accounts are selected with ONE statement."""
-    sql = "a.blocked = 0 AND COALESCE(u.blocked, 0) = 0 AND (a.tier = 'demo' OR :free = 1 OR a.paid_until >= :today OR COALESCE(u.trial_end, a.trial_end) >= :today)"
+    sql = "a.blocked = 0 AND a.paused = 0 AND COALESCE(u.blocked, 0) = 0 AND (a.tier = 'demo' OR :free = 1 OR a.paid_until >= :today OR COALESCE(u.trial_end, a.trial_end) >= :today)"
     if s.get("block_unlinked"): sql += " AND a.user_id IS NOT NULL"
     return sql, {"free": 0 if s.get("paid_mode") else 1, "today": str(today())}
 
@@ -765,6 +769,108 @@ def data_account():
     r = db.one("SELECT * FROM accounts WHERE platform IN ('MT4','MT5') AND secrets != '{}' ORDER BY id LIMIT 1")
     return acc_full(r) if r else None
 
+# ======================================================================================================================
+# FRESH ZONE CHECK: a setup is only worth an order while its zone is still good.
+#   A setup is STALE when: a newer break of structure has formed, OR price already traded into the entry zone (mitigated),
+#   OR price already reached the target without tapping the entry, OR the zone is more mitigated than allowed.
+#   * Before placing: every account job re-checks the setup (candles are fetched ONCE and shared, so 1000 accounts add no extra load).
+#   * After placing: an order that price has not tapped yet is cancelled automatically the moment it becomes stale.
+# ======================================================================================================================
+SCAN_EVERY = max(30, int(os.environ.get("SCAN_SECONDS", "120")))      # seconds between market scans (also how fast stale orders get cancelled)
+_CC, _CC_LOCK, _CC_KEYLOCK, _EVC = {}, threading.Lock(), {}, {}
+
+def fetch_candles_for(sym, tf):
+    if is_fx(sym):
+        ma = data_account()
+        if not ma: raise RuntimeError(f"{sym}: no MetaApi data account to read candles")
+        return fetch_candles_meta(ma, sym, tf)
+    return fetch_candles(sym, tf)
+
+def candles_cached(sym, tf):
+    """Closed candles shared by all jobs in this process. Reused for 10-45 s; refetched sooner if a new candle must have closed. Only ONE thread fetches at a time."""
+    k = (sym, tf)
+    def usable():
+        hit = _CC.get(k)
+        if not hit: return None
+        age, rows = time.time() - hit[0], hit[1]
+        if age < 10: return rows
+        if age < 45 and not (rows and time.time() * 1000 >= rows[-1]["t"] + 2 * TF_MS(tf)): return rows
+        return None
+    v = usable()
+    if v is not None: return v
+    with _CC_LOCK: kl = _CC_KEYLOCK.setdefault(k, threading.Lock())
+    with kl:
+        v = usable()
+        if v is not None: return v
+        rows = fetch_candles_for(sym, tf)
+        _CC[k] = (time.time(), rows)
+        return rows
+
+def bos_time(sig):
+    """Open time of the candle that made the BOS this setup is built on."""
+    try: return int(sig["bos_t"])
+    except Exception: pass
+    try: return int(str(sig.get("key", "")).rsplit("-", 1)[1])
+    except Exception: return 0
+
+def _event_times(c, n):
+    k = (c[0]["t"], c[0]["o"], c[-1]["t"], c[-1]["c"], len(c), n)
+    v = _EVC.get(k)
+    if v is None:
+        v = [c[e["i"]]["t"] for e in bos_events(c, n)]
+        if len(_EVC) > 200: _EVC.clear()
+        _EVC[k] = v
+    return v
+
+def setup_fresh(sig, c, s, strict=False):
+    """(True, '') while the setup is still good, otherwise (False, reason).
+    strict=True (used right before placing): if the setup cannot be verified, it is NOT fresh.
+    strict=False (used for orders already placed): if it cannot be verified, the order is left alone."""
+    bt = bos_time(sig)
+    if not bt or "entry" not in sig: return (not strict), "setup has no BOS time to check"
+    if not c: return (not strict), "no candle data to check the setup"
+    if bt < c[0]["t"]: return (not strict), "setup is older than the candle history available"
+    if any(t > bt for t in _event_times(c, int(s["swing_n"]))): return False, "a newer break of structure has formed"
+    bull, entry, tp = sig["side"] == "BUY", sig["entry"], sig["tp"]
+    after = [x for x in c if x["t"] > bt]
+    if after:
+        lo_, hi_ = min(x["l"] for x in after), max(x["h"] for x in after)
+        if (lo_ <= entry) if bull else (hi_ >= entry): return False, "price already traded into the entry zone (mitigated)"
+        if (hi_ >= tp) if bull else (lo_ <= tp): return False, "price already reached the target without tapping the entry"
+        zh, zl = sig.get("ob_hi"), sig.get("ob_lo")
+        if zh is not None and zl is not None and zh > zl:
+            frac = max(0.0, min(1.0, ((zh - lo_) if bull else (hi_ - zl)) / (zh - zl)))
+            if frac * 100 > float(s.get("max_mitigation_pct", 30)) + 1e-9: return False, f"zone is {round(frac * 100)}% mitigated"
+    return True, ""
+
+def expire_stale(o, why):
+    """Mark an order as cancelled because its setup went stale. Uses the existing EXPIRED flow, so the cancel is sent to the exchange / MetaApi / EA."""
+    pre = "PAPER" if str(o.get("status", "")).startswith("PAPER") else "LIVE"
+    o["outcome"], o["status"] = "EXPIRED", f"{pre}: cancelled, {why}"[:200]
+
+# ---------------- trade limit per day + start/stop control ----------------
+def trades_today(account_id):
+    """Trades this account has taken today (UTC): orders waiting for a tap, open, or finished. Cancelled / expired / rejected orders do not count."""
+    return db.one("SELECT COUNT(*) AS n FROM orders WHERE account_id=:a AND created >= :d AND outcome IN ('PENDING','OPEN','WIN','LOSS')", a=account_id, d=str(today()))["n"]
+
+def daily_cap_reached(account_id, s):
+    cap = int(s.get("max_trades_per_day") or 0)
+    return cap > 0 and trades_today(account_id) >= cap
+
+def over_cap_after_insert(o, s):
+    """Safety net for two jobs of the same account racing each other: after saving, an order ranked above the daily limit is cancelled."""
+    cap = int(s.get("max_trades_per_day") or 0)
+    if cap <= 0 or o.get("outcome") != "PENDING": return False
+    rank = db.one("SELECT COUNT(*) AS n FROM orders WHERE account_id=:a AND created >= :d AND outcome IN ('PENDING','OPEN','WIN','LOSS') AND (created < :c OR (created = :c AND id <= :i))",
+                  a=o["account"], d=str(today()), c=o["time"], i=o["id"])["n"]
+    return rank > cap
+
+def cancel_order_now(o, why):
+    """Cancel an order that is still waiting for price (exchange/MetaApi: a cancel job is queued; EA: the cancel is sent on its next call)."""
+    if o.get("platform") != "EA" and str(o.get("status", "")).startswith("LIVE: orders sent"):
+        db.x("INSERT INTO jobs (kind, account_id, payload, status, tries, created) VALUES ('cancel', :a, :p, 'new', 0, :now)", a=int(o["account"]), p=o["id"], now=now_s())
+    expire_stale(o, why); save_order_state(o)
+
 def record_data_error(sym, tf, e):
     msg = f"DATA ERROR {tf}: {e}"[:300]
     last = db.one("SELECT status FROM orders WHERE platform='SYSTEM' AND symbol=:s AND status LIKE :p ORDER BY created DESC LIMIT 1", s=sym, p=f"DATA ERROR {tf}:%")
@@ -792,11 +898,16 @@ def run_scan():
                     if not ma: raise RuntimeError(f"{sym}: add an MT4/MT5 account (via MetaApi) or set META_TOKEN/META_ACCOUNT to get forex/gold candles")
                     cache[(sym, tf)] = fetch_candles_meta(ma, sym, tf)
                 else: cache[(sym, tf)] = fetch_candles(sym, tf)
+                _CC[(sym, tf)] = (time.time(), cache[(sym, tf)])      # shared with the order placers: no second download
             return cache[(sym, tf)]
         for r in db.q("SELECT * FROM orders WHERE platform='SIGNAL' AND outcome IN ('PENDING','OPEN')"):         # 1) resolve open signals
             o = row_to_order(r)
             try:
-                if resolve(o, candles(o["symbol"], o.get("tf") or s["timeframe"])): save_order_state(o); finish_signal(o)
+                cs_ = candles(o["symbol"], o.get("tf") or s["timeframe"]); changed = resolve(o, cs_)
+                if o["outcome"] == "PENDING":                       # price has not tapped the zone yet
+                    ok_, why_ = setup_fresh(o, cs_, s)
+                    if not ok_: expire_stale(o, why_); changed = True
+                if changed: save_order_state(o); finish_signal(o)
             except Exception: pass
         for sym, tf in [(x, t) for x in s["symbols"] for t in s["timeframes"]]:                                  # 2) new setups
             try: sig = find_setup(candles(sym, tf), s, tf)
@@ -818,13 +929,17 @@ def run_scan():
 def job_place(j, s):
     r = db.one("SELECT * FROM accounts WHERE id=:i", i=j["account_id"])
     if not r: return
-    if not sub_state(r, s, user_of(r))[0]: return                                    # blocked / unpaid since the job was queued
+    if r.get("paused") or not sub_state(r, s, user_of(r))[0]: return                                    # blocked / unpaid since the job was queued
     sg = db.one("SELECT data FROM sigs WHERE skey=:k", k=j["payload"])
     if not sg: return
     d = json.loads(sg["data"]); sym, sig = d["sym"], d["sig"]
     if db.one("SELECT 1 AS x FROM orders WHERE account_id=:a AND sig_key=:k AND symbol=:s", a=r["id"], k=sig["key"], s=sym): return          # retry-safe: never place twice
     if db.one("SELECT 1 AS x FROM orders WHERE account_id=:a AND symbol=:s AND tf=:t AND outcome IN ('PENDING','OPEN')", a=r["id"], s=sym, t=sig["tf"]): return
-    insert_order(place_order(acc_full(r), sig, sym, s))
+    if daily_cap_reached(r["id"], s): return                      # max trades per day reached
+    cs_ = candles_cached(sym, sig["tf"])                  # one shared fetch for all accounts
+    if not setup_fresh(sig, cs_, s, strict=True)[0]: return        # zone mitigated / new BOS formed: forget this order
+    o_ = place_order(acc_full(r), sig, sym, s); insert_order(o_)
+    if over_cap_after_insert(o_, s): cancel_order_now(o_, "daily trade limit reached")
 
 def job_cancel(j):
     r, o = db.one("SELECT * FROM accounts WHERE id=:i", i=j["account_id"]), db.one("SELECT * FROM orders WHERE id=:i", i=j["payload"])
@@ -862,7 +977,7 @@ def worker_main():
     print("worker", wid, "started")
     while True:
         try:
-            if take_lease("scan", wid, 120) and time.time() - last >= 300:
+            if take_lease("scan", wid, 120) and time.time() - last >= SCAN_EVERY:
                 last = time.time(); run_scan(); maintenance()
         except Exception as e: print("scan error", e)
         try: rows = claim_jobs(wid)
@@ -961,8 +1076,150 @@ PWA_JS = ("<div class='instbar' id='instbar'><b>📲 Install the app on your pho
 LOGO_SVG = "<svg width='18' height='18' viewBox='0 0 18 18'><rect x='2' y='8' width='3' height='8' rx='1' fill='#fff'/><rect x='7.5' y='3' width='3' height='13' rx='1' fill='#fff'/><rect x='13' y='6' width='3' height='10' rx='1' fill='#fff' opacity='.85'/></svg>"
 
 
+# ---------------- how to connect (shown on /setup) ----------------
+CONNECT_GUIDE = """
+<style>
+.cg details{border:1px solid var(--line);border-radius:14px;padding:12px 14px;margin:10px 0;background:#fff}
+.cg summary{cursor:pointer;font-weight:700;line-height:1.4}
+.cg ol{margin:8px 0 0 20px;line-height:1.8;font-size:14px;color:#334155}
+.cg p{font-size:14px;color:#334155;margin:8px 0}
+.cg table{width:100%;border-collapse:collapse;font-size:13px;margin:10px 0}
+.cg td,.cg th{padding:8px;border-top:1px solid #f1f5f9;text-align:left;vertical-align:top}
+.cg .fill{background:#f8fafc;border:1px solid var(--line);border-radius:10px;padding:10px 12px;font-size:13px;line-height:1.7;margin:8px 0;color:#334155}
+.cg .tag{display:inline-block;border-radius:999px;padding:2px 10px;font-size:11px;font-weight:800;color:#fff;margin-left:6px;white-space:nowrap}
+.cg .free{background:#16a34a}.cg .paid{background:#b45309}
+.plathint{grid-column:1/-1;background:#eff6ff;border:1px solid #bfdbfe;color:#1e3a8a;border-radius:12px;padding:10px 12px;font-size:13px;line-height:1.6}
+</style>
+<div class='card cg' style='max-width:1100px'>
+<h2>How to connect your account</h2>
+<p class='muted'>Pick ONE way to connect. Tap an option below to see the exact steps and what to type in each box. We recommend starting with a <b>demo account</b> (practice money).</p>
+<div style='overflow-x:auto'><table>
+<tr><th>Option</th><th>What it costs to connect</th><th>Computer must stay on?</th></tr>
+<tr><td><b>1. Your own computer (EA)</b></td><td>Free <span class='tag free'>FREE</span></td><td>Yes (or a rented VPS)</td></tr>
+<tr><td><b>2. Cloud link (MetaApi)</b></td><td>MetaApi charges its own fee <span class='tag paid'>PAID TO METAAPI</span></td><td>No, works 24/7</td></tr>
+<tr><td><b>3. Crypto exchange key</b></td><td>Free to connect (exchange trading fees apply) <span class='tag free'>FREE</span></td><td>No, works 24/7</td></tr>
+</table></div>
+<p class='muted'><b>Our plan:</b> demo accounts are free forever. @@COST@@</p>
+
+<details><summary>Option 1 · Use your own computer (EA) <span class='tag free'>FREE</span></summary>
+<p>A small free program (the EA) runs inside MetaTrader 5 on your own computer and places the robot's trades on your broker account. Your computer and MetaTrader 5 must stay switched on and online while you want the robot to trade. Many people rent a cheap VPS for this.</p>
+<div class='fill'><b>What to fill in the form below</b><br>Platform: <b>EA</b> · Chart: choose 30 minutes or 1 hour · Demo/Real: ignore it<br><b>Leave EMPTY:</b> API key, API secret, Extra, MetaApi region, Balance (your EA key is created for you)</div>
+<ol>
+<li>Choose Platform <b>EA</b> in the form below, pick your chart, and press <b>Save</b>. The next page shows your EA key and the EA code. Keep the key private.</li>
+<li>Install <b>MetaTrader 5</b> and log in to your broker account. Use a <b>demo</b> account first to practise.</li>
+<li>In MT5 press <b>F4</b> (MetaEditor), then File, New, Expert Advisor (template). Name it ISIG_EA, select all, paste the code, press <b>F7</b>. It should say 0 errors.</li>
+<li>In MT5 go to Tools, Options, Expert Advisors. Tick <b>Allow WebRequest</b> and add this website's address (it is shown on the key page).</li>
+<li>Open a chart on the <b>same timeframe</b> you chose, drag ISIG_EA onto it, tick Allow Algo Trading, press OK, and switch on the <b>Algo Trading</b> button at the top.</li>
+<li>Open <b>My account</b>. It should say <b>Connected</b>. Keep MT5 open.</li>
+</ol></details>
+
+<details><summary>Option 2 · Cloud link with MetaApi (works even when your computer is off) <span class='tag paid'>PAID TO METAAPI</span></summary>
+<p>MetaApi (metaapi.cloud) is a separate cloud service that logs in to your MetaTrader 4 or 5 broker account for the robot, so it can trade 24/7 without your computer. It works with most MT4/MT5 brokers. MetaApi charges its own fee to you, so check the current plans on their website. On top of that, our plan above applies to real accounts.</p>
+<div class='fill'><b>What to fill in the form below</b><br>Platform: <b>MT5</b> or <b>MT4</b> (the same type as your broker account) · Chart: choose 30 minutes or 1 hour<br>
+API key / login: your <b>MetaApi API token</b><br>API secret: type any text (for example <b>x</b>)<br>Extra: your <b>MetaApi Account ID</b><br>MetaApi region: for example <b>new-york</b> or <b>london</b> (the region of your MetaApi account)<br>
+<b>Leave EMPTY:</b> Balance. The Demo/Real box is ignored here: the app reads your broker server and decides by itself.</div>
+<ol>
+<li>Create an account on <b>metaapi.cloud</b> and sign in.</li>
+<li>Add your broker account inside MetaApi (your MT4/MT5 login number, password and broker server name). Wait until it shows as connected.</li>
+<li>Copy your <b>MetaApi API token</b> from your MetaApi dashboard (look for the API access / token page).</li>
+<li>Copy the <b>Account ID</b> of the broker account you added, and note its <b>region</b>.</li>
+<li>Fill the form below as listed above and press <b>Save</b>, then press <b>Test connection</b> on your account page. It shows your balance when everything is right.</li>
+</ol></details>
+
+<details><summary>Option 3 · Crypto exchange (Binance, Bybit, OKX, Bitget) <span class='tag free'>FREE</span></summary>
+<p>You create an API key on the exchange and give it to the robot. Orders go straight to your exchange account and work 24/7. Connecting is free (the exchange's normal trading fees apply).</p>
+<div class='fill'><b>What to fill in the form below</b><br>Platform: your exchange · Chart: choose 30 minutes or 1 hour<br>Demo/Real box: choose <b>Demo / testnet</b> only if your keys are testnet keys, otherwise <b>Real</b><br>
+API key and API secret: from the exchange<br>Extra: the <b>passphrase</b> for OKX and Bitget. <b>Leave empty</b> for Binance and Bybit<br><b>Leave EMPTY:</b> MetaApi region, Balance</div>
+<ol>
+<li>On the exchange (or its testnet for practice) create a new <b>API key</b>.</li>
+<li>Allow <b>reading</b> and <b>trading</b> only. Keep <b>withdrawals switched OFF</b>.</li>
+<li>Paste the key (and secret, and passphrase if asked) in the form below and press <b>Save</b>.</li>
+<li>Open your account page and press <b>Test connection</b>.</li>
+</ol></details>
+<p class='muted' style='margin-top:10px'><b>Not sure which to choose?</b> Want to practise for free: Option 1 with a demo account. Want it running 24/7 without your computer: Option 2 (MT4/MT5) or Option 3 (crypto).</p>
+</div>
+<script>
+document.addEventListener('DOMContentLoaded',function(){
+var sel=document.querySelector('select[name=platform]');if(!sel)return;
+var box=document.createElement('div');box.className='plathint';sel.parentNode.insertAdjacentElement('afterend',box);
+var T={EA:'<b>EA (your computer):</b> leave API key, API secret, Extra and MetaApi region <b>empty</b>. Just choose your chart and press Save. Your key is shown on the next page.',
+MT5:'<b>MetaApi (MT5):</b> API key = your MetaApi token. API secret = type any text (for example x). Extra = your MetaApi Account ID. Region = for example new-york. Leave Balance empty.',
+MT4:'<b>MetaApi (MT4):</b> API key = your MetaApi token. API secret = type any text (for example x). Extra = your MetaApi Account ID. Region = for example new-york. Leave Balance empty.',
+BINANCE:'<b>Binance:</b> fill API key and API secret. Leave Extra and MetaApi region <b>empty</b>. Choose Demo/testnet only if these are testnet keys.',
+BYBIT:'<b>Bybit:</b> fill API key and API secret. Leave Extra and MetaApi region <b>empty</b>. Choose Demo/testnet only if these are testnet keys.',
+OKX:'<b>OKX:</b> fill API key, API secret and put the passphrase in Extra. Leave MetaApi region <b>empty</b>.',
+BITGET:'<b>Bitget:</b> fill API key, API secret and put the passphrase in Extra. Leave MetaApi region <b>empty</b>. Demo is not supported on Bitget.'};
+function upd(){box.innerHTML=T[sel.value]||'';box.style.display=T[sel.value]?'block':'none'}
+sel.addEventListener('change',upd);upd()});
+</script>
+"""
+
+def _connect_guide(s):
+    if s.get("paid_mode"):
+        cost = f"Real-money accounts need the monthly plan after a {int(s['trial_days'])}-day free trial. {escape(s['price_text'])}"
+    else:
+        cost = "Real-money accounts are free for now. A monthly plan may be introduced later (demo always stays free)."
+    return CONNECT_GUIDE.replace("@@COST@@", str(cost))
+
+# ---------------- welcome prompt (shown ONCE, right after sign-up, only when "Require sign-up" is ON) ----------------
+WELCOME_TPL = """
+<style>
+#wlc{position:fixed;inset:0;z-index:300;display:flex;align-items:center;justify-content:center;padding:14px;background:rgba(2,6,23,.72);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);animation:wlfade .35s ease both}
+@keyframes wlfade{from{opacity:0}to{opacity:1}}
+.wl{background:#fff;border-radius:24px;max-width:520px;width:100%;max-height:92vh;overflow:auto;box-shadow:0 40px 120px rgba(0,0,0,.55);animation:wlpop .5s cubic-bezier(.2,.9,.3,1.2) both}
+@keyframes wlpop{from{opacity:0;transform:translateY(24px) scale(.96)}to{opacity:1;transform:none}}
+.wl-top{position:relative;overflow:hidden;background:radial-gradient(500px 220px at 80% -20%,#4338ca 0,transparent 60%),linear-gradient(135deg,#0b1220,#13214a);padding:22px 20px 14px;text-align:center;color:#fff}
+.wl-top h2{font-size:22px;font-weight:800;margin:8px 0 2px;letter-spacing:-.01em}.wl-top p{color:#cbd5e1;font-size:13px;margin:0}
+.wl-shield{width:96px;height:112px;margin:0 auto;display:block;animation:wlbob 4s ease-in-out infinite;filter:drop-shadow(0 12px 28px rgba(59,130,246,.55))}
+@keyframes wlbob{50%{transform:translateY(-6px)}}
+.wl-ring{transform-box:fill-box;transform-origin:center;animation:wlring 2.4s ease-out infinite}
+@keyframes wlring{from{transform:scale(.8);opacity:.7}to{transform:scale(1.5);opacity:0}}
+.wl-tick{stroke-dasharray:80;stroke-dashoffset:80;animation:wltick 1s .5s ease forwards}
+@keyframes wltick{to{stroke-dashoffset:0}}
+.wl-c{position:absolute;bottom:0;width:10px;border-radius:2px;opacity:.85;animation:wlrise 3.2s ease-in-out infinite}
+@keyframes wlrise{50%{transform:translateY(-14px)}}
+.wl-body{padding:16px 20px 20px}
+.wl-step{display:flex;gap:12px;align-items:flex-start;margin:0 0 12px}
+.wl-n{flex:none;width:30px;height:30px;border-radius:10px;background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;display:grid;place-items:center;font-weight:800;font-size:14px}
+.wl-step b{display:block;font-size:14px;color:#0f172a}.wl-step span{font-size:13px;color:#475569;line-height:1.5}
+.wl-risk{background:#fffbeb;border:1px solid #fde68a;border-radius:14px;padding:11px 13px;font-size:12px;line-height:1.55;color:#78350f;margin:14px 0 12px}
+.wl-risk b{color:#92400e}
+.wl-ck{display:flex;gap:10px;align-items:flex-start;font-size:13px;font-weight:600;color:#0f172a;cursor:pointer;margin-bottom:12px}
+.wl-ck input{margin-top:3px;width:17px;height:17px;flex:none}
+.wl .btn{width:100%;text-align:center;font-size:15px}
+.wl .wl-off{opacity:.45;cursor:not-allowed;box-shadow:none;transform:none}
+</style>
+<div id='wlc' role='dialog' aria-modal='true' aria-labelledby='wlt'><div class='wl'>
+<div class='wl-top'>
+<svg class='wl-shield' viewBox='0 0 120 140' aria-hidden='true'><defs><linearGradient id='wlg' x1='0' y1='0' x2='1' y2='1'><stop offset='0' stop-color='#3b82f6'/><stop offset='1' stop-color='#8b5cf6'/></linearGradient></defs>
+<path class='wl-ring' d='M60 8 L108 26 V68 C108 100 86 124 60 134 C34 124 12 100 12 68 V26 Z' fill='none' stroke='#60a5fa' stroke-width='2'/>
+<path d='M60 8 L108 26 V68 C108 100 86 124 60 134 C34 124 12 100 12 68 V26 Z' fill='url(#wlg)'/>
+<path d='M60 20 L98 34 V68 C98 94 80 114 60 122 C40 114 22 94 22 68 V34 Z' fill='rgba(255,255,255,.12)'/>
+<path class='wl-tick' d='M40 70 L56 86 L84 52' fill='none' stroke='#fff' stroke-width='9' stroke-linecap='round' stroke-linejoin='round'/></svg>
+<h2 id='wlt'>Welcome to @@NAME@@</h2><p>Your account is ready. Here is the safest way to begin.</p>
+</div>
+<div class='wl-body'>
+<div class='wl-step'><div class='wl-n'>1</div><div><b>Practice on a demo account first</b><span>Connect a demo account (free forever) and let the robot trade with practice money. Nothing real is at risk.</span></div></div>
+<div class='wl-step'><div class='wl-n'>2</div><div><b>Build trust from the results</b><span>Watch every trade and its result on the Performance page. Take as long as you need.</span></div></div>
+<div class='wl-step'><div class='wl-n'>3</div><div><b>Switch to a real account when you are ready</b><span>It is always your choice and your timing. You are never forced to go real.</span></div></div>
+<div class='wl-risk'><b>Important:</b> trading involves risk. You can lose some or all of the money you trade with, so only use money you can afford to lose. Past results do not guarantee future results, and nothing here is financial advice. Use exchange keys with trading permission only and withdrawals switched off.</div>
+<label class='wl-ck'><input type='checkbox' id='wlck'><span>I have read this and I understand the risks of trading.</span></label>
+<button type='button' class='btn wl-off' id='wlgo'>Show me how to connect</button>
+</div></div></div>
+<script>
+(function(){var o=document.getElementById('wlc'),c=document.getElementById('wlck'),b=document.getElementById('wlgo');
+document.body.style.overflow='hidden';
+c.onchange=function(){b.className=c.checked?'btn':'btn wl-off'};
+b.onclick=function(){if(!c.checked)return;o.style.display='none';document.body.style.overflow='';
+var g=document.querySelector('.cg');if(g){g.scrollIntoView({behavior:'smooth'})}else{location.href='/setup'}};})();
+</script>
+"""
+
+def _welcome_html(name): return WELCOME_TPL.replace("@@NAME@@", str(name))
+
+
 def layout(title, body):
-    name = escape(S()["site_name"]); u = cur_user()
+    name = escape(S()["site_name"]); u = cur_user(); welcome = _welcome_html(name) if session.pop("welcome", None) else ""
     nav = [("/", "HOME"), ("/setup", "SETUP"), ("/performance", "PERFORMANCE"), ("/orders", "SIGNALS"), ("/status", "MY ACCOUNT")]
     nav += [("/logout", "LOG OUT")] if u else [("/login", "LOG IN"), ("/signup", "SIGN UP")]
     nav += [("/admin", "ADMIN")]
@@ -970,7 +1227,7 @@ def layout(title, body):
     return (f"<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>{escape(title)} · {name}</title>"
             f"<link rel='preconnect' href='https://fonts.googleapis.com'><link href='https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap' rel='stylesheet'>"
             f"<link rel='manifest' href='/manifest.webmanifest'><meta name='theme-color' content='#2563eb'><link rel='apple-touch-icon' href='/icon-192.png'><style>{CSS}</style></head><body><div class='nav'><a class='logo' href='/'><span class='mark'>{LOGO_SVG}</span>{name}</a><div class='links'>{links}</div></div>{body}"
-            f"<div class='foot'>© {datetime.datetime.utcnow().year} {name} · Trading involves risk. Past results do not guarantee future results. Not financial advice.</div>{PWA_JS}</body></html>")
+            f"<div class='foot'>© {datetime.datetime.utcnow().year} {name} · Trading involves risk. Past results do not guarantee future results. Not financial advice.</div>{welcome}{PWA_JS}</body></html>")
 
 @app.after_request
 def secure_headers(r):
@@ -1366,7 +1623,9 @@ def signup():
         r = db.q("INSERT INTO users (email, pw_salt, pw_hash, created, ip) VALUES (:e, :s, :h, :c, :ip) RETURNING id, blocked", e=em, s=salt, h=pw_hash(pw, salt), c=now_s(), ip=_ip())
     except Exception: return bad("That email is already registered. Log in instead.")
     throttled("su", 10, 3600, add=True)
-    login_user({"id": r[0]["id"], "blocked": 0}); return redirect(nxt if nxt != "/status" else "/setup")
+    login_user({"id": r[0]["id"], "blocked": 0})
+    if s["require_signup"]: session["welcome"] = 1                     # welcome prompt: shown ONCE, only when sign-up is required
+    return redirect(nxt if nxt != "/status" else "/setup")
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -1402,7 +1661,7 @@ def setup():
            ("<p class='muted'><a href='/signup?next=/setup'>Sign up</a> or <a href='/login?next=/setup'>log in</a> to link accounts to your profile (recommended).</p>"))
     money = ("<p class='muted' style='margin:6px 0'><b>Pricing:</b> demo accounts are free forever. Real-money accounts "
              + (f"need a monthly plan after a {int(s['trial_days'])}-day free trial. {escape(s['price_text'])}" if s["paid_mode"] else "are free for now; a monthly plan may be introduced later (demo stays free).") + "</p>")
-    return layout("Setup", f"""<div class='card'><h2>Connect an account</h2>{who}{money}
+    return layout("Setup", f"""{_connect_guide(s)}<div class='card'><h2>Connect an account</h2>{who}{money}
 <form action='/save_account' method='post' class='grid'>
 <div><label>Platform</label><select class='input' name='platform'>{plats}</select></div>
 <div><label>Which chart should the robot trade for you? (choose one)</label><select class='input' name='tf' required>{tfopts}</select></div>
@@ -1465,9 +1724,9 @@ def _insert_account(a, user, s):
     if not user and a["tier"] == "real" and s.get("paid_mode") and int(s.get("trial_days") or 0) > 0:
         trial_end = str(today() + datetime.timedelta(days=int(s["trial_days"])))
     row = dict(ref=ref, user_id=a["user_id"], platform=a["platform"], tf=a["tf"], env=a["env"], server=a["server"], secrets=seal(ref, a["secrets"]) if a["secrets"] else "{}",
-               key_hash=a.get("key_hash"), balance=a["balance"], created=a["created"], trial_end=trial_end, tier=a["tier"], tier_src=a["tier_src"], tier_note=a["tier_note"], attest=json.dumps(a["attest"]), fp=a.get("fp"))
-    r = db.q("INSERT INTO accounts (ref, user_id, platform, tf, env, server, secrets, key_hash, balance, created, trial_end, tier, tier_src, tier_note, attest, fp) VALUES "
-             "(:ref, :user_id, :platform, :tf, :env, :server, :secrets, :key_hash, :balance, :created, :trial_end, :tier, :tier_src, :tier_note, :attest, :fp) RETURNING id", **row)
+               key_hash=a.get("key_hash"), balance=a["balance"], created=a["created"], trial_end=trial_end, tier=a["tier"], tier_src=a["tier_src"], tier_note=a["tier_note"], attest=json.dumps(a["attest"]), fp=a.get("fp"), paused=1)
+    r = db.q("INSERT INTO accounts (ref, user_id, platform, tf, env, server, secrets, key_hash, balance, created, trial_end, tier, tier_src, tier_note, attest, fp, paused) VALUES "
+             "(:ref, :user_id, :platform, :tf, :env, :server, :secrets, :key_hash, :balance, :created, :trial_end, :tier, :tier_src, :tier_note, :attest, :fp, :paused) RETURNING id", **row)
     if a["tier"] == "real" and user: start_trial(user["id"])
     return r[0]["id"]
 
@@ -1598,6 +1857,14 @@ def render_account(a, key="", note=""):
                 + (f"<p class='muted'>{escape(s['pay_note'])}</p>" if s["pay_note"] else "") + f"<p class='muted'>Quote your account number: <b>#{a['id']}</b></p>")
     tfopts = "".join(f"<option value='{escape(t)}'{' selected' if t == a['tf'] else ''}>{escape({'30m': '30 minutes', '1h': '1 hour'}.get(t, t))}</option>" for t in s["timeframes"])
     act = f"/account/{a['id']}"
+    running = not a.get("paused")
+    col, bg, btncol = ("#16a34a", "#f0fdf4", "#dc2626") if running else ("#dc2626", "#fef2f2", "#16a34a")
+    cap_ = int(s.get("max_trades_per_day") or 0)
+    msg_ = (("The robot is watching the market for you and places a trade only when its setup appears" + (f" (maximum {cap_} per day)." if cap_ else ".")) if running
+            else "The robot will NOT place any new trade on this account. Press START TRADING when you are ready.")
+    trade = (f"<div style='border:2px solid {col};background:{bg};border-radius:14px;padding:14px;margin:10px 0'><b style='font-size:16px;color:{col}'>{'● TRADING IS ON' if running else '● TRADING IS OFF'}</b>"
+             f"<p class='muted' style='margin:6px 0 10px'>{msg_}</p><form method='post' action='{act}/{'stop' if running else 'start'}'>{hid}<button class='btn' style='background:{btncol}'>{'STOP TRADING' if running else 'START TRADING'}</button></form>"
+             + ("<p class='muted' style='margin-top:8px'>Stopping cancels orders that are not filled yet. Trades that are already open keep their stop loss and take profit.</p>" if running else "") + "</div>")
     tfform = (f"<form method='post' action='{act}/tf' style='margin:10px 0'>{hid}<label>Chart the robot trades for you (one at a time)</label><div style='display:flex;gap:8px;margin-top:4px'>"
               f"<select class='input' name='tf' style='max-width:200px'>{tfopts}</select><button class='btn'>Save</button></div></form>")
     btns = f"<form method='post' action='{act}' style='display:inline'>{hid}<button class='btn'>Refresh</button></form> "
@@ -1609,7 +1876,7 @@ def render_account(a, key="", note=""):
              f"<li>In MT5: Tools, Options, Expert Advisors. Tick Allow WebRequest and add <b>{escape(request.host_url.rstrip('/'))}</b></li>"
              "<li>Open a chart of your pair on the timeframe you chose, drag ISIG_EA onto it, tick Allow Algo Trading, press OK, and turn on the Algo Trading button.</li></ol></details>") if ee else ""
     body = (f"<div class='card' style='max-width:760px'><h2>Account #{a['id']} · {escape(a['platform'])}</h2><p style='margin:8px 0'>{badge}</p>"
-            f"<p class='muted'>Balance: {a['balance']:,.2f} · risk per trade {s['risk_pct']}% · target 1:{s['rr']} · chart {escape(a['tf'])}</p><p class='muted' style='margin:6px 0 12px'>Mode: {escape(mode)}</p>{pay}{tfform}{btns}{guide}</div>"
+            f"<p class='muted'>Balance: {a['balance']:,.2f} · risk per trade {s['risk_pct']}% · target 1:{s['rr']} · chart {escape(a['tf'])}{(' · max ' + str(s['max_trades_per_day']) + ' trades per day') if s.get('max_trades_per_day') else ''}</p><p class='muted' style='margin:6px 0 12px'>Mode: {escape(mode)}</p>{trade}{pay}{tfform}{btns}{guide}</div>"
             f"<div class='card' style='max-width:760px'><h3>My results</h3><div class='grid'>{box('Closed trades', p['trades'])}{box('Win rate', str(p['win_rate']) + '%')}{box('Total result', tr)}</div>"
             f"<h3 style='margin-top:14px'>My latest trades</h3>{rows}</div>")
     return layout("My account", body)
@@ -1634,6 +1901,11 @@ def account_op(aid, op):
             note = f"Connected. Your balance: {b:,.2f}"
         except Exception as e: note = "Could not connect: " + str(e)[:200]
         return render_account(db.one("SELECT * FROM accounts WHERE id=:i", i=a["id"]), key, note)
+    if op in ("start", "stop"):
+        db.x("UPDATE accounts SET paused=:p WHERE id=:i", p=0 if op == "start" else 1, i=a["id"])
+        if op == "stop":
+            for r_ in db.q("SELECT * FROM orders WHERE account_id=:a AND outcome='PENDING'", a=a["id"]): cancel_order_now(row_to_order(r_), "trading stopped by you")
+        return render_account(db.one("SELECT * FROM accounts WHERE id=:i", i=a["id"]), key, "Trading started." if op == "start" else "Trading stopped.")
     if op == "rekey" and a["platform"] == "EA":
         k = secrets.token_urlsafe(24); db.x("UPDATE accounts SET key_hash=:h WHERE id=:i", h=_h(k), i=a["id"]); return _ea_created(a["id"], k)
     if op == "delete":
@@ -1737,7 +2009,7 @@ def _ea_sync(s, head, rows, placed, failed, sym):
     if upd:
         db.x("UPDATE accounts SET " + ", ".join(f"{k}=:{k}" for k in upd if k in UPD_OK) + " WHERE id=:id", id=a["id"], **{k: v for k, v in upd.items() if k in UPD_OK})
         if "tier" in upd and upd["tier"] == "real": start_trial(a["user_id"])
-    u = user_of(a); okk, why = sub_state(a, s, u)
+    u = user_of(a); okk, why = sub_state(a, s, u); paused = bool(a.get("paused"))
     for pid in placed: db.x("UPDATE orders SET ack=1 WHERE id=:i AND account_id=:a", i=pid, a=a["id"])
     for f in failed:
         oid, _, err = f.partition("~")
@@ -1747,15 +2019,21 @@ def _ea_sync(s, head, rows, placed, failed, sym):
             o = row_to_order(r)
             if resolve(o, rows):
                 save_order_state(o); record_track(o) if o["outcome"] in ("WIN", "LOSS") else None
+            if o["outcome"] == "PENDING" and "entry" in o:        # not tapped yet: cancel it if the setup is no longer fresh
+                ok_, why_ = setup_fresh(o, rows, s)
+                if not ok_: expire_stale(o, why_); save_order_state(o)
         sig = cached_setup(rows, s, tf)
-        if sig and okk and seen_new(f"ea:{a['id']}:{sym}-{sig['key']}"):                                  # a setup missed while the plan was inactive is not marked as seen
+        if sig and okk and not paused and seen_new(f"ea:{a['id']}:{sym}-{sig['key']}"):                                  # a setup missed while the plan was inactive is not marked as seen
             skip = any(str(sig[f]) in s["filters"].get(f, []) for f in s["filters"] if f in sig)
             busy = db.one("SELECT 1 AS x FROM orders WHERE account_id=:a AND symbol=:s AND tf=:t AND outcome IN ('PENDING','OPEN')", a=a["id"], s=sym, t=tf)
-            if not skip and not busy: insert_order(place_order(a, sig, sym, s))
+            if not skip and not busy and not daily_cap_reached(a["id"], s):
+                o_ = place_order(a, sig, sym, s); insert_order(o_)
+                if over_cap_after_insert(o_, s): cancel_order_now(o_, "daily trade limit reached")
     poll = max(10, int(s["ea_poll_seconds"])); poll += int(kh[:4], 16) % max(5, poll // 4)                 # spread the EAs out so they do not all call at once
     out = [f"OK {s['mode']}", f"NEXT|{poll}", f"TIER|{a['tier']}|{a['tier_note']}"]
     if not okk: out.append("MSG|" + why + ". Open the My Account page in the app.")
-    if s["mode"] == "live" and okk:
+    if paused and okk: out.append("MSG|Trading is stopped. Press START TRADING on your account page.")
+    if s["mode"] == "live" and okk and not paused:
         for r in db.q("SELECT * FROM orders WHERE account_id=:a AND symbol=:s AND tf=:t AND ack=0 AND outcome='PENDING' AND status LIKE 'LIVE: queued%'", a=a["id"], s=sym, t=tf):
             o = row_to_order(r); out.append(f"ORDER|{o['id']}|{o['side']}|{o['entry']!r}|{o['sl']!r}|{o['tp']!r}|{o['risk_amount']}")
     for r in db.q("SELECT id FROM orders WHERE account_id=:a AND symbol=:s AND tf=:t AND outcome='EXPIRED' AND status LIKE 'LIVE%' AND created > :c", a=a["id"], s=sym, t=tf, c=str(datetime.datetime.utcnow() - datetime.timedelta(days=3))): out.append(f"CANCEL|{r['id']}")
@@ -1993,6 +2271,7 @@ def admin_save():
             if k in ("max_users", "max_accounts_per_user"): new = min(10 ** 9, max(0, new))
             if k == "ea_poll_seconds": new = min(600, max(10, new))
             if k == "max_inflight": new = min(5000, max(10, new))
+            if k == "max_trades_per_day": new = min(100, max(0, new))
             if k == "demo_max_balance": new = max(0.0, new)
             if k == "ea_demo_trust" and new not in ("strict", "off"): continue
             if k in ("demo_servers", "demo_blocklist"): new = ",".join(csv_list(new))[:400]
