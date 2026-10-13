@@ -99,8 +99,13 @@ class DB:
             import pg8000.native
             u = urllib.parse.urlparse(DATABASE_URL)
             local = (u.hostname or "") in ("localhost", "127.0.0.1")
+            ctx = None
+            if not local:
+                ctx = ssl.create_default_context()
+                if os.environ.get("DB_SSL_VERIFY", "1") == "0":      # Supabase: still encrypted, but the server certificate is not checked against public authorities
+                    ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
             return pg8000.native.Connection(user=urllib.parse.unquote(u.username or ""), password=urllib.parse.unquote(u.password or ""), host=u.hostname,
-                                            port=u.port or 5432, database=(u.path or "/").lstrip("/"), ssl_context=None if local else ssl.create_default_context(), timeout=20)
+                                            port=u.port or 5432, database=(u.path or "/").lstrip("/"), ssl_context=ctx, timeout=20)
         import sqlite3
         c = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None, timeout=30)
         c.row_factory = sqlite3.Row
@@ -1231,7 +1236,7 @@ def layout(title, body):
 
 @app.after_request
 def secure_headers(r):
-    if request.path == "/ping": return r                    # keep-alive pings stay tiny: no extra headers
+    if request.path in ("/ping", "/healthz"): return r      # keep-alive pings stay tiny: no extra headers
     r.headers.update({"X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer",
         "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
         "Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; object-src 'none'"})
