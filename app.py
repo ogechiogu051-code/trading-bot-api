@@ -1231,6 +1231,7 @@ def layout(title, body):
 
 @app.after_request
 def secure_headers(r):
+    if request.path == "/ping": return r                    # keep-alive pings stay tiny: no extra headers
     r.headers.update({"X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer",
         "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
         "Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; object-src 'none'"})
@@ -1295,9 +1296,19 @@ def _totp_secret():
     t = _totp()
     return _dec2(t["secret"][5:], "admin:totp", kdf_salt()) if t.get("enabled") and t.get("secret") else ""
 
+ADMIN_IDLE = int(os.environ.get("ADMIN_IDLE_SECONDS", "120"))      # admin is logged out after this many seconds without activity (default 2 minutes)
+# Runs on the admin page only: the moment the page is hidden (you switch app, lock the phone, change tab) the browser tells the server to log the admin out.
+ADMIN_JS = "<script>document.addEventListener('visibilitychange',function(){if(document.visibilityState==='hidden'){navigator.sendBeacon('/admin/logout')}});</script>"
+def admin_ok():
+    """True only while the admin is logged in AND active within the last ADMIN_IDLE seconds. Each admin page view renews the timer."""
+    if session.get("admin") is not True: return False
+    if time.time() - float(session.get("admin_t", 0)) > ADMIN_IDLE:
+        session.pop("admin", None); session.pop("admin_t", None); return False
+    session["admin_t"] = time.time(); return True
+
 def admin_only(f):
     def w(*a, **k):
-        if session.get("admin") is not True: return redirect("/admin")
+        if not admin_ok(): return redirect("/admin")
         return f(*a, **k)
     w.__name__ = f.__name__; return w
 
@@ -1572,10 +1583,10 @@ def healthz():
     except Exception: return "database down", 503
 
 
-@app.route("/ping")
+@app.route("/ping", methods=["GET", "HEAD"])
 def ping():
-    """Lightweight liveness endpoint: confirms the Flask web process responds."""
-    return "ok", 200, {"Cache-Control": "no-store"}
+    """Keep-alive endpoint: empty reply (no body, no extra headers), still wakes the web process."""
+    return Response(status=204)
 
 @app.route("/health")
 def health():
@@ -2118,10 +2129,10 @@ def admin():
         else:
             pw = request.form.get("pw", ""); tot = _totp(); on = bool(tot.get("enabled")) and os.environ.get("DISABLE_ADMIN_2FA") != "1"
             sec = _totp_secret() if on else ""
-            if check_admin(pw) and (not on or (sec and totp_ok(sec, request.form.get("code", "")))): session.clear(); session["admin"] = True; session.permanent = True
+            if check_admin(pw) and (not on or (sec and totp_ok(sec, request.form.get("code", "")))): session.clear(); session["admin"] = True; session["admin_t"] = time.time(); session.permanent = False
             else: throttled("adm", 5, 600, add=True); throttled("adm*", 20, 600, add=True, ident="all"); _flash("Wrong password or code.")
         return redirect("/admin")
-    if session.get("admin") is not True:
+    if not admin_ok():
         m = session.pop("msg", None)
         note = f"<p style='color:#dc2626;margin:8px 0;font-weight:600'>{escape(m)}</p>" if m else ""
         return layout("Admin", f"<div class='card' style='max-width:420px'><h2>Admin login</h2><p class='muted'>Only the owner can open this panel.</p>{note}<form method='post'><input class='input' name='pw' type='password' placeholder='Password' autofocus><br><br><input class='input' name='code' inputmode='numeric' autocomplete='one-time-code' placeholder='Authenticator code (only if 2-step login is on)'><br><br><button class='btn'>Unlock</button></form></div>")
@@ -2248,7 +2259,7 @@ def _admin_page(s):
 <div class='card'><h2>3. Screenshot journal</h2><form action='/admin/upload' method='post' enctype='multipart/form-data' class='grid'>
 <div><label>Chart screenshot (entry, SL, TP drawn)</label><input class='input' type='file' name='img' accept='image/*' required></div>
 <div><label>Symbol</label><input class='input' name='symbol'></div><div><label>Result</label><select class='input' name='result'><option>WIN</option><option>LOSS</option><option>BREAKEVEN</option></select></div>
-<div><label>Notes (what happened)</label><input class='input' name='note'></div><div><button class='btn'>Upload</button></div></form>{jr}</div>{security}{twofa}""")
+<div><label>Notes (what happened)</label><input class='input' name='note'></div><div><button class='btn'>Upload</button></div></form>{jr}</div>{security}{twofa}{ADMIN_JS}""")
 
 @app.route("/admin/save", methods=["POST"])
 @admin_only
