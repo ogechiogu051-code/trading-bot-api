@@ -97,10 +97,16 @@ class DB:
     def _new(self):
         if self.pg:
             import pg8000.native
-            u = urllib.parse.urlparse(DATABASE_URL)
+                        u = urllib.parse.urlparse(DATABASE_URL)
             local = (u.hostname or "") in ("localhost", "127.0.0.1")
+            if local:
+                ssl_ctx = None
+            else:
+                ssl_ctx = ssl.create_default_context()
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode = ssl.CERT_NONE
             return pg8000.native.Connection(user=urllib.parse.unquote(u.username or ""), password=urllib.parse.unquote(u.password or ""), host=u.hostname,
-                                            port=u.port or 5432, database=(u.path or "/").lstrip("/"), ssl_context=None if local else ssl.create_default_context(), timeout=20)
+                                            port=u.port or 5432, database=(u.path or "/").lstrip("/"), ssl_context=ssl_ctx, timeout=20)
         import sqlite3
         c = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None, timeout=30)
         c.row_factory = sqlite3.Row
