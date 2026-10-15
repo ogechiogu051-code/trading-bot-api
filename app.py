@@ -15,7 +15,7 @@ Env:   DATABASE_URL, SECRET_KEY, DATA_KEY, ADMIN_PASSWORD, WEBHOOK_SECRET (optio
        AUTOSCAN=1 (tiny installs only: runs the worker inside the web process), TRUSTED_PROXIES (default 1), DB_POOL (default 8 per process),
        META_TOKEN / META_ACCOUNT / META_REGION (optional dedicated MetaApi feed for forex/gold candles), ANTHROPIC_API_KEY (optional).
 """
-import os, re, json, hmac, hashlib, time, datetime, threading, uuid, base64, secrets, struct, queue, random, ssl, contextlib, copy, collections
+import math, os, re, json, hmac, hashlib, time, datetime, threading, uuid, base64, secrets, struct, queue, random, ssl, contextlib, copy, collections
 import urllib.request, urllib.parse, urllib.error
 from decimal import Decimal, ROUND_DOWN
 from concurrent.futures import ThreadPoolExecutor
@@ -49,6 +49,7 @@ DEFAULTS = {
     "paper_currency": "USD",         # label shown next to paper balances
     "paper_min_balance": 100.0,      # smallest starting balance a person may choose; a paper account below this is "finished" and may be reset
     "paper_default_balance": 10000.0,   # balance suggested for new paper accounts and given back by a reset
+    "max_rr": 4.0,                   # on A+ setups a person may ask for more than 1:2 reward, never more than this (and never beyond the Daily level that would form a new BOS)
     "htf_filter": True,              # ON = only A+ setups (same direction as the Daily and Weekly leg, Monthly not against); OFF = every setup is taken, A+ ones are just labelled
     "max_risk_pct": 2.0,            # highest risk per trade any user may choose for their own account (never above 2)
     # --- access
@@ -215,6 +216,12 @@ def init_db():
             kv_set("mig_symbols_v2", "1")
     except Exception: pass
     try: db.x("ALTER TABLE accounts ADD COLUMN " + ("IF NOT EXISTS " if db.pg else "") + "resets INTEGER NOT NULL DEFAULT 0")          # how many times a paper account was reset (shown for honesty)
+    except Exception: pass
+    try: db.x("ALTER TABLE accounts ADD COLUMN " + ("IF NOT EXISTS " if db.pg else "") + "rr_aplus DOUBLE PRECISION")                 # reward the person asks for on A+ setups (empty = the normal 1:2)
+    except Exception: pass
+    try: db.x("ALTER TABLE accounts ADD COLUMN " + ("IF NOT EXISTS " if db.pg else "") + "cur TEXT")
+    except Exception: pass
+    try: db.x("ALTER TABLE accounts ADD COLUMN " + ("IF NOT EXISTS " if db.pg else "") + "fx DOUBLE PRECISION")                          # exchange rate locked at start / reset
     except Exception: pass
     try: db.x("ALTER TABLE orders ADD COLUMN " + ("IF NOT EXISTS " if db.pg else "") + "risk_amt DOUBLE PRECISION NOT NULL DEFAULT 0")   # money risked on this order (practice or real)
     except Exception: pass                                           # already there
@@ -760,6 +767,10 @@ def place_order(acc, sig, sym, s):
     o = {"id": uuid.uuid4().hex[:12], "time": now_s(), "account": acc["id"], "platform": acc["platform"],
          "symbol": sym, "size": round(risk_amt / dist, 6) if dist else 0, "risk_amount": round(risk_amt, 2),
          "outcome": "PENDING", "bars": 0, **sig}
+    if acc["platform"] == "PAPER" and sig.get("grade") == "A+" and dist:                  # A+ setup: the person's own (bigger) reward, kept short of the level that forms a new BOS
+        use = aplus_rr(acc, sig, s)
+        if use > float(s["rr"]) + 1e-9:
+            o["tp"] = round(sig["entry"] + use * dist if sig["side"] == "BUY" else sig["entry"] - use * dist, 8); o["rr"] = use; o["key"] = sig["key"] + "|rr"      # own key: this order is resolved on its own, not copied from the signal
     if s["mode"] == "paper" or acc["platform"] == "PAPER": o["status"] = "PAPER"             # paper accounts are ALWAYS simulated, whatever the app mode is
     elif acc["platform"] == "EA": o["status"], o["ea_ack"] = "LIVE: queued for EA", False
     elif acc["platform"] in LIVE:
@@ -856,15 +867,32 @@ def fetch_htf(sym, tf):
                 except Exception: raise e
     return rows[:-1]
 
+def present_leg(c, n):
+    """The leg the market is in RIGHT NOW (not the overall trend): it began at the latest confirmed swing point. Latest swing high = price is moving down (bear), latest swing low = moving up (bull).
+    tip = the extreme the leg has already reached or the previous swing in its direction: the level that has to break to form a new BOS in the leg's direction."""
+    hi = lo = None
+    for j in range(n, len(c) - n):
+        if _swing(c, j, n, "high"): hi = j
+        if _swing(c, j, n, "low"): lo = j
+    if hi is None and lo is None: return None
+    if lo is None or (hi is not None and hi > lo):
+        tip = min(c[k]["l"] for k in range(hi, len(c)))
+        if lo is not None: tip = min(tip, c[lo]["l"])
+        return {"dir": "bear", "tip": tip}
+    tip = max(c[k]["h"] for k in range(lo, len(c)))
+    if hi is not None: tip = max(tip, c[hi]["h"])
+    return {"dir": "bull", "tip": tip}
+
 _BIAS = {}
 def htf_bias(sym, s):
-    """{'M': 'bull'|'bear'|None, 'W': ..., 'D': ...}: direction of the latest break of structure on each bigger chart (= the leg the market is in now). '?' = could not be read."""
+    """{'M': 'bull'|'bear'|None, 'W': ..., 'D': ...}: direction of the PRESENT LEG on each bigger chart. '?' = could not be read. 'tipD' = the Daily level that would form a new BOS in the leg's direction."""
     h = _BIAS.get(sym)
     if h and time.time() - h[0] < h[2]: return h[1]
     out, bad = {}, False
     for tf, name in HTF:
         try:
-            ev = bos_events(fetch_htf(sym, tf), int(s["swing_n"])); out[name] = ev[-1]["dir"] if ev else None
+            leg = present_leg(fetch_htf(sym, tf), int(s["swing_n"])); out[name] = leg["dir"] if leg else None
+            if name == "D" and leg: out["tipD"] = leg["tip"]
         except Exception:
             out[name] = None if name == "M" else "?"; bad = bad or name != "M"                   # a young market may have no monthly history: that is fine
     if len(_BIAS) > 200: _BIAS.clear()
@@ -872,10 +900,23 @@ def htf_bias(sym, s):
     return out
 
 def grade_setup(sig, s, sym):
-    """-> (take_it, grade, bias). A+ = same direction as the Daily and the Weekly leg, and the Monthly leg is not against it."""
+    """-> (take_it, grade, bias). A+ = same direction as the present Daily and Weekly leg, and the present Monthly leg is not against it."""
     b = htf_bias(sym, s); want = "bull" if sig["side"] == "BUY" else "bear"
     aplus = b["D"] == want and b["W"] == want and b["M"] in (want, None)
     return (aplus or not s.get("htf_filter", True)), ("A+" if aplus else "B"), b
+
+def aplus_max_rr(sig, s):
+    """Highest reward (1:x) an A+ setup allows: the take profit has to stay SHORT of the Daily level that would form a new BOS in the leg's direction (and below the owner's max_rr)."""
+    base = float(s["rr"]); lim = sig.get("tp_limit")
+    if sig.get("grade") != "A+" or lim is None: return base
+    risk = abs(sig["entry"] - sig["sl"]); room = (sig["entry"] - lim) if sig["side"] == "SELL" else (lim - sig["entry"])
+    if risk <= 0 or room <= 0: return base
+    return max(base, min(math.floor(0.98 * room / risk * 10) / 10, float(s["max_rr"])))
+
+def aplus_rr(acc, sig, s):
+    """The reward this person gets on this setup: what they asked for, cut down to what the setup allows (never below the normal 1:2)."""
+    want = acc.get("rr_aplus")
+    return round(max(float(s["rr"]), min(float(want) if want else float(s["rr"]), aplus_max_rr(sig, s))), 2)
 
 def bias_text(b):
     nm = {"bull": "bullish", "bear": "bearish", None: "unclear", "?": "unknown"}
@@ -1004,6 +1045,15 @@ def run_scan():
                     if not ok_: expire_stale(o, why_); changed = True
                 if changed: save_order_state(o); finish_signal(o)
             except Exception: pass
+        for r in db.q("SELECT * FROM orders WHERE platform='PAPER' AND sig_key LIKE '%|rr' AND outcome IN ('PENDING','OPEN')"):    # 1b) paper orders with their own bigger reward are resolved one by one
+            o = row_to_order(r)
+            try:
+                cs_ = candles(o["symbol"], o.get("tf") or s["timeframe"]); changed = resolve(o, cs_)
+                if o["outcome"] == "PENDING":
+                    ok_, why_ = setup_fresh(o, cs_, s)
+                    if not ok_: expire_stale(o, why_); changed = True
+                if changed: save_order_state(o)
+            except Exception: pass
         for sym in s["symbols"]:                                                                                  # 2) new setups: read every chart, keep the better one
             found = []
             for tf in s["timeframes"]:
@@ -1012,7 +1062,10 @@ def run_scan():
                 if not sg_: continue
                 try: ok_, gr_, b_ = grade_setup(sg_, s, sym)
                 except Exception as e: record_data_error(sym, "bias", e); continue
-                if ok_: sg_["grade"], sg_["bias"] = gr_, b_; found.append(sg_)        # setups against the bigger picture are skipped
+                if ok_:                                                                      # setups against the bigger picture are skipped
+                    sg_["grade"], sg_["bias"] = gr_, {k: v for k, v in b_.items() if k != "tipD"}
+                    if gr_ == "A+" and b_.get("tipD") is not None: sg_["tp_limit"] = b_["tipD"]
+                    found.append(sg_)
             if not found: continue
             sig = max(found, key=lambda x: TF_MS(x["tf"]))                                                         # both charts have a setup: the higher timeframe (1 hour) wins; 30 minutes only when the 1 hour has none
             if db.one("SELECT 1 AS x FROM orders WHERE platform='SIGNAL' AND symbol=:s AND outcome IN ('PENDING','OPEN')", s=sym): continue    # one live signal per market
@@ -1039,7 +1092,7 @@ def job_place(j, s):
     sg = db.one("SELECT data FROM sigs WHERE skey=:k", k=j["payload"])
     if not sg: return
     d = json.loads(sg["data"]); sym, sig = d["sym"], d["sig"]
-    if db.one("SELECT 1 AS x FROM orders WHERE account_id=:a AND sig_key=:k AND symbol=:s", a=r["id"], k=sig["key"], s=sym): return          # retry-safe: never place twice
+    if db.one("SELECT 1 AS x FROM orders WHERE account_id=:a AND sig_key IN (:k, :k2) AND symbol=:s", a=r["id"], k=sig["key"], k2=sig["key"] + "|rr", s=sym): return          # retry-safe: never place twice
     if db.one("SELECT 1 AS x FROM orders WHERE account_id=:a AND symbol=:s AND outcome IN ('PENDING','OPEN')", a=r["id"], s=sym): return
     if daily_cap_reached(r["id"], s): return                      # max trades per day reached
     if r["platform"] == "PAPER" and paper_balance(r) < float(s["paper_min_balance"]): return      # practice money has run out: the person must reset first
@@ -1115,6 +1168,10 @@ a{color:var(--brand)}
 .mark{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,var(--brand),var(--brand2));display:grid;place-items:center;box-shadow:0 6px 16px rgba(37,99,235,.35)}
 .links a{margin-left:4px;text-decoration:none;color:#475569;font-weight:700;font-size:12px;letter-spacing:.04em;padding:8px 12px;border-radius:999px;transition:.2s}
 .links a:hover{background:#eef2ff;color:var(--brand)}
+.links a{white-space:nowrap}
+.links a.hot{background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;box-shadow:0 4px 12px rgba(37,99,235,.3)}
+.links a.hot:hover{color:#fff;filter:brightness(1.08)}
+@media(max-width:760px){.nav{padding:10px 12px}.links{display:flex;width:100%;gap:6px;overflow-x:auto;padding-bottom:4px;-webkit-overflow-scrolling:touch;scrollbar-width:none}.links::-webkit-scrollbar{display:none}.links a{margin-left:0;flex:none;background:#f1f5f9}}
 .card{background:#fff;border:1px solid var(--line);border-radius:18px;padding:22px;margin:16px auto;max-width:1100px;box-shadow:0 8px 30px rgba(15,23,42,.05);animation:fade .5s ease both}
 @keyframes fade{from{opacity:0;translate:0 10px}to{opacity:1;translate:0 0}}
 .btn{background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;padding:11px 18px;border-radius:12px;border:none;font-weight:700;cursor:pointer;text-decoration:none;display:inline-block;transition:.2s;box-shadow:0 8px 20px rgba(37,99,235,.25)}
@@ -1331,7 +1388,7 @@ def layout(title, body):
     nav = [("/", "HOME"), ("/paper", "PAPER TRADING"), ("/setup", "SETUP"), ("/performance", "PERFORMANCE"), ("/orders", "SIGNALS"), ("/status", "MY ACCOUNT")]
     nav += [("/logout", "LOG OUT")] if u else [("/signup", "SIGN UP / LOG IN")]
     nav += [("/admin", "ADMIN")]
-    links = "".join(f"<a href='{h}'>{t}</a>" for h, t in nav)
+    links = "".join(f"<a href='{h}'{' class=\"hot\"' if h == '/paper' else ''}>{t}</a>" for h, t in nav)
     return (f"<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>{escape(title)} · {name}</title>"
             f"<link rel='preconnect' href='https://fonts.googleapis.com'><link href='https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap' rel='stylesheet'>"
             f"<link rel='manifest' href='/manifest.webmanifest'><meta name='theme-color' content='#2563eb'><meta name='mobile-web-app-capable' content='yes'><meta name='apple-mobile-web-app-capable' content='yes'><meta name='apple-mobile-web-app-title' content='{name}'><link rel='apple-touch-icon' href='/icon-192.png'><style>{CSS}</style></head><body><div class='nav'><a class='logo' href='/'><span class='mark'>{LOGO_SVG}</span>{name}</a><div class='links'>{links}</div></div>{body}"
@@ -2301,12 +2358,43 @@ def live_market(symbol, tf):
         return {"closed": closed[-120:], "forming": forming, "setup": sig, "cv": int(time.time() * 1000)}
     return _shared(_MK, (symbol, tf), MK_TTL, build)
 
+# ---------------- the person's own currency: money is kept in US dollars inside, shown in the currency they chose at the exchange rate of the day they started ----------------
+CURRENCIES = ["USD", "EUR", "GBP", "NGN", "GHS", "KES", "ZAR", "INR", "CAD", "AUD", "NZD", "JPY", "CHF", "AED", "BRL", "MXN", "PHP", "IDR", "PKR", "TRY"]
+_RATES = {"t": 0.0, "v": {}}
+def usd_rates():
+    """{code: units of that currency per 1 US dollar}, from a free public feed, refreshed every 6 hours (an old copy is used if the feed is down)."""
+    if _RATES["v"] and time.time() - _RATES["t"] < 21600: return _RATES["v"]
+    try:
+        with urllib.request.urlopen("https://open.er-api.com/v6/latest/USD", timeout=8) as r: j = json.loads(r.read())
+        v = {k: float(x) for k, x in (j.get("rates") or {}).items() if k in CURRENCIES and float(x) > 0}
+        if v.get("USD"): _RATES.update(t=time.time(), v=v)
+    except Exception: pass
+    if not _RATES["v"]:
+        v = {"USD": 1.0}; t_end = time.time() + 12
+        for c in CURRENCIES:
+            if c == "USD" or time.time() > t_end: continue
+            try: v[c] = fetch_yahoo_price("USD" + c)
+            except Exception: pass
+        if len(v) > 1: _RATES.update(t=time.time(), v=v)
+        else: _RATES["t"] = time.time() - 21000                       # nothing worked: try again in about 10 minutes
+    return _RATES["v"] or {"USD": 1.0}
+
+def fx_rate(cur):
+    r = usd_rates().get(cur)
+    if not r: raise RuntimeError("The exchange rate for " + cur + " is not available right now. Please try again in a few minutes, or choose USD.")
+    return float(r)
+
+def acc_cur(acc):
+    """(currency code, rate locked when the account was started or reset)"""
+    if acc and acc.get("cur") and acc.get("fx"): return acc["cur"], float(acc["fx"])
+    return "USD", 1.0
+
 def size_info(symbol, entry, sl, risk_amt):
     """Practice position size for a risk amount: units (crypto) or lots (forex/gold, USD account). An estimate for display only."""
     dist = abs(entry - sl)
     if dist <= 0: return None
     out = {"risk_amount": round(risk_amt, 2), "units": round(risk_amt / dist, 6), "lots": None}
-    if is_fx(symbol) and S().get("paper_currency", "USD") == "USD":
+    if is_fx(symbol):
         core = re.sub(r"[a-z._#]+$", "", symbol); cs = 100 if core.startswith("XAU") else 100000
         per_lot = dist * cs if core.endswith("USD") else (dist * cs / entry if core.startswith("USD") else None)
         out["lots"] = round(risk_amt / per_lot, 2) if per_lot else None
@@ -2359,11 +2447,17 @@ def api_live():
     except Exception:
         last = m["forming"] or m["closed"][-1]; bid = ask = last["c"]
     cap = risk_cap(s)
-    try: bal = max(10.0, min(float(request.args.get("balance", 10000)), 1e9))
+    try: bal = max(1.0, min(float(request.args.get("balance", 10000)), 1e12))
     except ValueError: bal = 10000.0
+    u = cur_user(); acc = paper_account(u)
+    if acc: cc, fx = acc_cur(acc)
+    else:
+        cc = request.args.get("cur", "USD")
+        try: fx = fx_rate(cc) if cc in CURRENCIES else 1.0
+        except Exception: cc, fx = "USD", 1.0
     try: rp = max(0.1, min(float(request.args.get("risk", s["risk_pct"])), cap))
     except ValueError: rp = effective_risk({}, s)
-    u = cur_user(); acc = paper_account(u); mine = []
+    mine = []
     if acc:
         for r in db.q("SELECT * FROM orders WHERE account_id=:a AND symbol=:s ORDER BY created DESC LIMIT 12", a=acc["id"], s=sym):
             o = row_to_order(r)
@@ -2381,6 +2475,12 @@ def api_live():
         if good: pick = max(good, key=lambda x: TF_MS(x["tf"]))                      # the 1 hour chart wins when both have a good setup
     except Exception: pick = None
     sig = pick if (pick and pick["tf"] == tf) else None                              # the chart only draws the setup the robot would really take
+    aplus = None
+    if pick and pick.get("grade") == "A+":
+        mr = aplus_max_rr(pick, s); use = aplus_rr(acc or {}, pick, s)
+        aplus = {"max_rr": mr, "use": use, "limited": bool(pick.get("tp_limit") is not None and mr < float(s["max_rr"]) - 1e-9), "limit": pick.get("tp_limit")}
+        if sig and use > float(s["rr"]) + 1e-9:
+            sig = dict(sig, rr=use, tp=(sig["entry"] + use * abs(sig["entry"] - sig["sl"])) if sig["side"] == "BUY" else (sig["entry"] - use * abs(sig["entry"] - sig["sl"])))
     live_o = [o for o in mine if o["outcome"] in ("PENDING", "OPEN")]
     if not online: st = ("offline", "The market scanner is not running right now, so no new setups can be found until it starts.")
     elif acc and acc["paused"]: st = ("stopped", "Your paper trading is stopped. Press START to let the robot trade your practice account.")
@@ -2394,8 +2494,8 @@ def api_live():
     return jsonify({"symbol": sym, "tf": tf, "tfms": TF_MS(tf), "cv": m["cv"], "candles": [cl(c) for c in m["closed"]] if cv != m["cv"] else None,
                     "forming": cl(m["forming"]) if m["forming"] else None, "bid": bid, "ask": ask,
                     "setup": ({k: sig.get(k) for k in ("side", "entry", "sl", "tp", "rr", "liquidity", "session", "ob_hi", "ob_lo", "grade", "bias", "tf")} if sig else None),
-                    "size": size_info(sym, sig["entry"], sig["sl"], bal * rp / 100) if sig else None, "orders": mine,
-                    "status": {"code": st[0], "text": st[1]}, "scan_age": age, "scan_every": SCAN_EVERY, "pick_tf": pick["tf"] if pick else None}), 200, hdr
+                    "size": (dict(size_info(sym, sig["entry"], sig["sl"], bal * rp / 100 / fx), risk_amount=round(bal * rp / 100, 2)) if (sig and size_info(sym, sig["entry"], sig["sl"], 1.0)) else None), "currency": cc, "orders": mine,
+                    "status": {"code": st[0], "text": st[1]}, "scan_age": age, "scan_every": SCAN_EVERY, "pick_tf": pick["tf"] if pick else None, "aplus": aplus}), 200, hdr
 
 @app.route("/api/paper")
 def api_paper():
@@ -2408,6 +2508,7 @@ def api_paper():
     st = db.one("SELECT COUNT(*) AS n, COALESCE(SUM(CASE WHEN r > 0 THEN 1 ELSE 0 END), 0) AS w, COALESCE(SUM(r), 0) AS tr, COALESCE(SUM(r * risk_amt), 0) AS pnl "
                 "FROM orders WHERE account_id=:a AND outcome IN ('WIN','LOSS')", a=acc["id"])
     start, realized = float(acc["balance"] or 0), float(st["pnl"] or 0)
+    cc, fx = acc_cur(acc); M = lambda v: round(float(v) * fx, 2)                       # USD inside -> the person's currency
     positions, history, journal, floating = [], [], [], 0.0
     for o in rows:
         if "entry" not in o: continue
@@ -2415,8 +2516,8 @@ def api_paper():
         risk_amt = float(o.get("risk_amount") or 0); si = size_info(sym, o["entry"], o["sl"], risk_amt) or {}
         size = si.get("lots") if (is_fx(sym) and si.get("lots")) else o.get("size"); unit = "lots" if (is_fx(sym) and si.get("lots")) else "units"
         t0, tend = _ms(o.get("time")), int(o.get("last_t") or 0)
-        base = {"id": o["id"], "t": t0, "symbol": sym, "side": o["side"], "tf": o.get("tf") or "", "entry": o["entry"], "sl": o["sl"], "tp": o["tp"], "size": size, "unit": unit, "risk_amount": risk_amt, "outcome": oc}
-        journal.append({"t": t0, "kind": "order", "text": "Robot placed " + _otype(o, True) + " " + sym + " at " + format(o["entry"], ".6g") + " (stop loss " + format(o["sl"], ".6g") + ", take profit " + format(o["tp"], ".6g") + ", risk " + format(risk_amt, ",.2f") + ")"})
+        base = {"id": o["id"], "t": t0, "symbol": sym, "side": o["side"], "tf": o.get("tf") or "", "entry": o["entry"], "sl": o["sl"], "tp": o["tp"], "size": size, "unit": unit, "risk_amount": M(risk_amt), "outcome": oc}
+        journal.append({"t": t0, "kind": "order", "text": "Robot placed " + _otype(o, True) + " " + sym + " at " + format(o["entry"], ".6g") + " (stop loss " + format(o["sl"], ".6g") + ", take profit " + format(o["tp"], ".6g") + ", risk " + format(M(risk_amt), ",.2f") + " " + cc + ")"})
         if oc in ("PENDING", "OPEN"):
             try: bid_, ask_ = quote_cached(sym)
             except Exception: bid_ = ask_ = None
@@ -2425,19 +2526,19 @@ def api_paper():
                 price = bid_ if buy else ask_
                 if oc == "OPEN":
                     dist = abs(o["entry"] - o["sl"]); rn = (((bid_ - o["entry"]) if buy else (o["entry"] - ask_)) / dist) if dist else 0.0
-                    profit = round(rn * risk_amt, 2); floating += profit
+                    profit = M(rn * risk_amt); floating += profit
                 else: touched = (ask_ <= o["entry"]) if buy else (bid_ >= o["entry"])
             positions.append(dict(base, type=_otype(o), price=price, profit=profit, touched=touched))
         elif len(history) < 40:
-            rr_ = o.get("r"); profit = round(float(rr_) * risk_amt, 2) if rr_ is not None else None
+            rr_ = o.get("r"); profit = M(float(rr_) * risk_amt) if rr_ is not None else None
             history.append(dict(base, end=tend, type=_otype(o, False), r=rr_, profit=profit, note=str(o.get("status", ""))[:80]))
-            if oc in ("WIN", "LOSS"): journal.append({"t": tend or t0, "kind": "win" if oc == "WIN" else "loss", "text": ("Take profit hit" if oc == "WIN" else "Stop loss hit") + ": " + sym + " closed " + format(float(rr_ or 0), "+g") + "R (" + format(profit or 0, "+,.2f") + ")"})
+            if oc in ("WIN", "LOSS"): journal.append({"t": tend or t0, "kind": "win" if oc == "WIN" else "loss", "text": ("Take profit hit" if oc == "WIN" else "Stop loss hit") + ": " + sym + " closed " + format(float(rr_ or 0), "+g") + "R (" + format(profit or 0, "+,.2f") + " " + cc + ")"})
             elif oc == "EXPIRED": journal.append({"t": tend or t0, "kind": "cancel", "text": "Order cancelled on " + sym + ": " + str(o.get("status", ""))[:90]})
     for g_ in sigs[:12]: journal.append({"t": g_["t"], "kind": "signal", "text": "Market scan found a " + g_["side"] + " setup on " + g_["symbol"] + " " + g_["tf"] + " (entry " + format(g_["entry"], ".6g") + ")"})
     journal.sort(key=lambda e: e["t"], reverse=True)
     n = int(st["n"] or 0); w = int(st["w"] or 0); balance_ = max(0.0, start + realized)
-    return jsonify({"account": {"start": start, "realized": round(realized, 2), "balance": round(balance_, 2), "floating": round(floating, 2), "equity": round(balance_ + floating, 2), "risk_pct": effective_risk(acc, s),
-                                "tf": "auto", "currency": s["paper_currency"], "min_balance": float(s["paper_min_balance"]), "default_balance": float(s["paper_default_balance"]), "resets": int(acc.get("resets") or 0),
+    return jsonify({"account": {"start": M(start), "realized": M(realized), "balance": M(balance_), "floating": round(floating, 2), "equity": round(M(balance_) + floating, 2), "risk_pct": effective_risk(acc, s),
+                                "tf": "auto", "currency": cc, "min_balance": M(s["paper_min_balance"]), "default_balance": M(s["paper_default_balance"]), "resets": int(acc.get("resets") or 0),
                                 "depleted": balance_ < float(s["paper_min_balance"]), "running": not acc["paused"], "max_trades": int(s.get("max_trades_per_day") or 0), "trades_today": trades_today(acc["id"])},
                     "stats": {"n": n, "wins": w, "win_rate": round(100 * w / n, 1) if n else 0, "total_r": round(float(st["tr"] or 0), 2)},
                     "positions": positions, "history": history[:30], "journal": journal[:40], "signals": sigs, "logged": True}), 200, hdr
@@ -2452,22 +2553,32 @@ def paper_start():
     if throttled("pp", 30, 3600, add=True): return layout("Slow down", "<div class='card' style='max-width:520px'>Too many requests from your network. Try again later.</div>"), 429
     f = request.form; tf = "auto"                                   # the robot reads the 30 minute AND the 1 hour chart and takes the better setup
     acc = paper_account(u); mn, cur_ = float(s["paper_min_balance"]), s["paper_currency"]; bal = 0.0
+    cc, fx = "USD", 1.0
     if not acc:                                                     # the account size is chosen once; after that only a reset can change it
-        try: bal = float(f.get("balance", ""))
+        cc = f.get("cur", "USD")
+        if cc not in CURRENCIES: return _paper_err("Please choose a currency from the list.")
+        try: fx = fx_rate(cc)
+        except Exception as e: return _paper_err(str(e))
+        try: amount = float(f.get("balance", ""))
         except ValueError: return _paper_err("Please type your account size as a number.")
-        if not (mn <= bal <= 1e9): return _paper_err(f"The account size must be at least {mn:,.0f} {cur_} (and at most 1,000,000,000).")
+        bal = amount / fx                                           # inside, money is kept in US dollars
+        if amount != amount or bal < mn - 0.005 or bal > 1e9: return _paper_err(f"The account size must be at least {mn * fx:,.0f} {cc} (and at most {1e9 * fx:,.0f}).")
     try: rp = float(f.get("risk", ""))
     except ValueError: return _paper_err("Please type the risk as a number, for example 1.")
     if rp != rp: return _paper_err("Please type the risk as a number, for example 1.")
+    try: rr_ = float(f.get("rr", s["rr"]))
+    except ValueError: return _paper_err("Please type the reward as a number, for example 3.")
+    if rr_ != rr_: return _paper_err("Please type the reward as a number, for example 3.")
+    rr_ = round(max(float(s["rr"]), min(rr_, float(s["max_rr"]))), 2)
     rp = round(max(0.1, min(rp, risk_cap(s))), 2); bal = round(bal, 2)
     if acc:
         if paper_balance(acc) < mn: return _paper_err("Your practice money has run out. Press RESET to start again with a new balance.")
-        db.x("UPDATE accounts SET risk_pct=:r, tf=:t, paused=0 WHERE id=:i", r=rp, t=tf, i=acc["id"])
+        db.x("UPDATE accounts SET risk_pct=:r, rr_aplus=:rr, tf=:t, paused=0 WHERE id=:i", r=rp, rr=rr_, t=tf, i=acc["id"])
     else:
         tc = tier_cols({"platform": "PAPER", "tier_override": ""}, s)
-        db.q("INSERT INTO accounts (ref, user_id, platform, tf, env, server, secrets, key_hash, balance, created, trial_end, tier, tier_src, tier_note, attest, fp, paused, risk_pct) VALUES "
-             "(:ref, :u, 'PAPER', :tf, '', '', '{}', NULL, :b, :c, NULL, :tier, :src, :note, '{}', NULL, 0, :r) RETURNING id",
-             ref=secrets.token_hex(8), u=u["id"], tf=tf, b=bal, c=str(today()), tier=tc["tier"], src=tc["tier_src"], note=tc["tier_note"], r=rp)
+        db.q("INSERT INTO accounts (ref, user_id, platform, tf, env, server, secrets, key_hash, balance, created, trial_end, tier, tier_src, tier_note, attest, fp, paused, risk_pct, rr_aplus, cur, fx) VALUES "
+             "(:ref, :u, 'PAPER', :tf, '', '', '{}', NULL, :b, :c, NULL, :tier, :src, :note, '{}', NULL, 0, :r, :rr, :cc, :fx) RETURNING id",
+             ref=secrets.token_hex(8), u=u["id"], tf=tf, b=bal, c=str(today()), tier=tc["tier"], src=tc["tier_src"], note=tc["tier_note"], r=rp, rr=rr_, cc=cc, fx=fx)
     return redirect("/paper?started=1")
 
 @app.route("/paper/reset", methods=["POST"])
@@ -2481,7 +2592,11 @@ def paper_reset():
     if paper_balance(acc) >= float(s["paper_min_balance"]): return _paper_err("You can only reset when your practice money has run out.")
     if db.one("SELECT 1 AS x FROM orders WHERE account_id=:a AND outcome='OPEN'", a=acc["id"]): return _paper_err("You still have an open trade. Wait for it to close, then reset.")
     for r_ in db.q("SELECT * FROM orders WHERE account_id=:a AND outcome='PENDING'", a=acc["id"]): cancel_order_now(row_to_order(r_), "account reset by you")
-    db.x("UPDATE accounts SET balance=:b, resets=resets + 1 WHERE id=:i", b=round(float(s["paper_default_balance"]) - paper_realized(acc["id"]), 2), i=acc["id"])      # balance = chosen base + results, so base = default - results so far
+    cc, fx = acc_cur(acc); want = request.form.get("cur", "")
+    if want in CURRENCIES and want != cc:
+        try: fx = fx_rate(want); cc = want
+        except Exception as e: return _paper_err(str(e))
+    db.x("UPDATE accounts SET balance=:b, resets=resets + 1, cur=:c, fx=:x WHERE id=:i", b=round(float(s["paper_default_balance"]) - paper_realized(acc["id"]), 2), c=cc, x=fx, i=acc["id"])      # balance = chosen base + results, so base = default - results so far
     return redirect("/paper?reset=1")
 
 @app.route("/paper/stop", methods=["POST"])
@@ -2551,10 +2666,12 @@ PAPER_TPL = """
    <form method='post' action='/paper/start'>
     @@BALFIELD@@
     <label style='display:block;margin-top:10px'>Risk per trade, in percent (maximum @@CAP@@%)</label><input class='input' id='prisk' name='risk' type='number' step='0.1' min='0.1' max='@@CAP@@' value='@@RISK@@' required>
+    <label style='display:block;margin-top:10px'>Reward on A+ setups: 1 : (from @@RRMIN@@ to @@RRMAX@@)</label><input class='input' name='rr' type='number' step='0.1' min='@@RRMIN@@' max='@@RRMAX@@' value='@@RRV@@' required>
+    <p class='muted'>A+ means the setup goes the same way as the present Daily and Weekly leg. On those you can ask for more than 1:@@RRMIN@@. The take profit is never allowed to reach the Daily level that would form a new BOS, so a setup may give less than you ask for. Other setups always use 1:@@RRMIN@@.</p>
     <p class='muted'>The robot reads the 30 minute and the 1 hour chart on every pair and takes the clearer setup. It takes at most @@MAXT@@ trades a day on your account and uses the same rules for everybody.</p>
     <button class='btn'>@@BTN@@</button></form>@@STOP@@
    <div id='rbox' style='display:none;margin-top:12px'><p style='color:#dc2626;font-weight:700;margin-bottom:8px'>Your practice money has run out.</p>
-    <form method='post' action='/paper/reset'><button class='btn' style='background:#7c3aed'>RESET WITH @@DEF@@ @@CUR@@</button></form></div></div>
+    <form method='post' action='/paper/reset'><label>Currency</label><select class='input' name='cur'>@@RCUR@@</select><button class='btn' style='background:#7c3aed;margin-top:8px'>RESET WITH @@DEF@@ @@CUR@@ (or the same value in the currency you pick)</button></form></div></div>
  </div>
 </div>
 @@RESULTS@@
@@ -2677,14 +2794,15 @@ function applyLive(d){
  $('psub').textContent='Bid '+fmt(d.bid)+' / Ask '+fmt(d.ask)+' · Spread '+fmt(d.ask-d.bid);
  var st=d.status||{};$('pbot').className='pbot '+(st.code||'');$('pbot').textContent=st.text||'';
  var s=d.setup,h;
- if(s){h='<b>'+esc(s.grade||'')+' '+esc(s.side)+' setup</b> on '+esc(s.tf||'')+' ('+esc(s.liquidity||'')+', '+esc(s.session||'')+' session)<br>Entry '+fmt(s.entry)+' · Stop loss '+fmt(s.sl)+' · Take profit '+fmt(s.tp)+' (1:'+esc(s.rr)+')<br><span class="muted">Bigger picture: '+esc(s.bias||'')+'</span>'}else{h='No valid setup on this chart right now.'}
+ if(s){h='<b>'+esc(s.grade||'')+' '+esc(s.side)+' setup</b> on '+esc(s.tf||'')+' ('+esc(s.liquidity||'')+', '+esc(s.session||'')+' session)<br>Entry '+fmt(s.entry)+' · Stop loss '+fmt(s.sl)+' · Take profit '+fmt(s.tp)+' (1:'+esc(s.rr)+')<br><span class="muted">Bigger picture (present leg): '+esc(s.bias||'')+'</span>'}else{h='No valid setup on this chart right now.'}
+ var ap=d.aplus;if(ap){h+='<br><span class="muted">A+ reward: your setting gives <b>1:'+ap.use+'</b>. This setup allows up to 1:'+ap.max_rr+(ap.limited?' (the take profit has to stay short of the Daily level '+fmt(ap.limit)+', which would form a new BOS)':'')+'.</span>'}
  $('pset').innerHTML=h;
  var z=d.size;$('psize').innerHTML=z?('With your account size and risk: risk amount <b>'+money(z.risk_amount)+' '+esc(CUR())+'</b>, position size <b>'+sz(z.units)+'</b> units'+(z.lots?' (about <b>'+z.lots+'</b> lots)':'')+'.'):'Your position size appears here when the robot has a setup.';
  var a=d.scan_age;$('pscan').textContent=(a===null||a===undefined)?'No market scan has been recorded yet.':'Last market scan: '+a+' seconds ago. The robot scans about every '+d.scan_every+' seconds.';
  $('pstat').textContent='Prices update every 2 seconds · last update '+new Date().toLocaleTimeString()+' · drag the chart to move it, scroll or pinch to zoom';
  renderTerm();kick();
 }
-function url(){return '/api/live?symbol='+encodeURIComponent(CFG.symbol)+'&tf='+encodeURIComponent(CFG.tf)+'&cv='+cvn+'&balance='+encodeURIComponent($('pbal').value||10000)+'&risk='+encodeURIComponent($('prisk').value||1)}
+function url(){return '/api/live?symbol='+encodeURIComponent(CFG.symbol)+'&tf='+encodeURIComponent(CFG.tf)+'&cv='+cvn+'&balance='+encodeURIComponent($('pbal').value||10000)+'&cur='+encodeURIComponent(CFG.cur||'USD')+'&risk='+encodeURIComponent($('prisk').value||1)}
 function poll(){
  if(busy||document.hidden)return;busy=true;var sym=CFG.symbol,tf=CFG.tf;
  fetch(url(),{credentials:'same-origin'}).then(function(r){return r.json().then(function(j){return [r.ok,j]})}).then(function(a){
@@ -2748,6 +2866,7 @@ function renderTerm(){
 var tabs=document.querySelectorAll('.tab');
 for(var ti=0;ti<tabs.length;ti++)tabs[ti].onclick=function(){tab=this.getAttribute('data-tab');for(var q=0;q<tabs.length;q++)tabs[q].className='tab'+(tabs[q]===this?' on':'');renderTerm()};
 function reset(){C=[];F=null;SF=null;cvn=0;cur=null;tgt=null;setup=null;orders=[];off=0;errmsg='';kick();poll()}
+var pc=$('pcur');if(pc)pc.onchange=function(){var c=this.value,r=(CFG.rates||{})[c]||1;CFG.cur=c;$('pcl').textContent=c;var mn=CFG.min_usd*r;$('pmin').textContent=Math.round(mn).toLocaleString();$('pbal').min=mn;$('pbal').value=(CFG.def_usd*r).toFixed(2);poll()};
 function setUrl(){try{history.replaceState(null,'','/paper?symbol='+encodeURIComponent(CFG.symbol)+'&tf='+encodeURIComponent(CFG.tf))}catch(e){}}
 $('psym').onchange=function(){CFG.symbol=this.value;setUrl();reset()};
 var pills=document.querySelectorAll('.pill');
@@ -2788,8 +2907,11 @@ def paper_page():
     tfn = {"30m": "30 minutes", "1h": "1 hour"}; tfl = {"30m": "M30", "1h": "H1"}
     opt = lambda items, cur, label=(lambda x: x): "".join("<option value='%s'%s>%s</option>" % (escape(i), " selected" if i == cur else "", escape(label(i))) for i in items)
     pills = "".join("<button type='button' class='pill%s' data-tf='%s'>%s</button>" % (" on" if t == tf else "", escape(t), escape(tfl.get(t, t))) for t in tfs)
-    cur_, mn_, df_ = s["paper_currency"], float(s["paper_min_balance"]), float(s["paper_default_balance"])
-    bal = paper_balance(acc) if acc else df_
+    mn_, df_ = float(s["paper_min_balance"]), float(s["paper_default_balance"])        # these two are in US dollars
+    rates = {k: v for k, v in usd_rates().items() if k in CURRENCIES}
+    cur_, fx_ = acc_cur(acc) if acc else ((s["paper_currency"] if s["paper_currency"] in rates else "USD"), rates.get(s["paper_currency"] if s["paper_currency"] in rates else "USD", 1.0))
+    bal = (paper_balance(acc) if acc else df_) * fx_
+    curopts = lambda cur: "".join("<option%s>%s</option>" % (" selected" if c == cur else "", c) for c in CURRENCIES if c in rates)
     rp = effective_risk(acc, s) if acc else min(effective_risk({}, s), cap)
     box = "border-radius:12px;padding:10px 12px;font-weight:600;margin-top:10px;"
     banner = ("<p style='" + box + "background:#ecfdf5;border:1px solid #a7f3d0'>Paper trading is ON. The robot will trade your practice account when its setup appears.</p>" if request.args.get("started") else
@@ -2805,15 +2927,18 @@ def paper_page():
         mine = [row_to_order(r) for r in db.q("SELECT * FROM orders WHERE account_id=:a ORDER BY created DESC LIMIT 200", a=acc["id"])]
         p = perf(mine)
         bx = lambda l, v: "<div style='border:1px solid #e2e8f0;border-radius:12px;padding:12px'><div class='muted'>%s</div><div style='font-size:22px;font-weight:800'>%s</div></div>" % (l, v)
-        tr_, money_ = "%+g" % p["total_r"], "%+.2f" % p["money"]
+        tr_, money_ = "%+g" % p["total_r"], "%+.2f %s" % (p["money"] * fx_, cur_)
         results = ("<div class='card'><h3>My paper trading performance</h3><div class='grid'>" + bx("Closed trades", p["trades"]) + bx("Win rate", str(p["win_rate"]) + "%") + bx("Total result", tr_ + "R") + bx("Practice profit / loss", money_)
                    + bx("Profit factor", p["profit_factor"] if p["profit_factor"] is not None else "-") + bx("Max drawdown", "-" + str(p["max_drawdown_r"]) + "R")
                    + "</div><h3 style='margin-top:14px'>Equity curve (cumulative R)</h3>" + _curve_svg(p["curve"]) + "<p class='muted' style='margin-top:8px'>1R is the amount you risk on one trade. Every closed trade is counted once.</p></div>")
     if acc: balfield = ("<input type='hidden' id='pbal' value='%.2f'><p>Account balance now: <b>%s %s</b>%s</p>" % (bal, format(bal, ",.2f"), escape(cur_), (" · resets: %d" % acc["resets"]) if acc.get("resets") else ""))
-    else: balfield = ("<label>Starting account size, in %s (minimum %s)</label><input class='input' id='pbal' name='balance' type='number' step='any' min='%s' value='%.2f' required>" % (escape(cur_), format(mn_, ",.0f"), mn_, df_))
-    cfg = json.dumps({"symbol": sym, "tf": tf, "tfms": TF_MS(tf), "logged": bool(u), "cur": s["paper_currency"]}).replace("</", "<\\/")
+    else: balfield = ("<label>Currency you want to trade in</label><select class='input' id='pcur' name='cur'>%s</select>"
+                      "<label style='display:block;margin-top:10px'>Starting account size, in <span id='pcl'>%s</span> (minimum <span id='pmin'>%s</span>)</label><input class='input' id='pbal' name='balance' type='number' step='any' min='%.2f' value='%.2f' required>"
+                      "<p class='muted'>Your balance is shown in this currency, converted at today's exchange rate.</p>" % (curopts(cur_), escape(cur_), format(mn_ * fx_, ",.0f"), mn_ * fx_, bal))
+    cfg = json.dumps({"symbol": sym, "tf": tf, "tfms": TF_MS(tf), "logged": bool(u), "cur": cur_, "rates": rates, "min_usd": mn_, "def_usd": df_, "newacc": not acc}).replace("</", "<\\/")
     rep = {"@@BANNER@@": banner, "@@SYMOPTS@@": opt(syms, sym), "@@TFPILLS@@": pills, 
-           "@@STATE@@": state, "@@BALFIELD@@": balfield, "@@DEF@@": format(df_, ",.0f"), "@@CUR@@": str(escape(cur_)), "@@RISK@@": str(rp), "@@CAP@@": str(cap), "@@MAXT@@": str(int(s.get("max_trades_per_day") or 0) or "any number of"),
+           "@@RRMIN@@": ("%g" % float(s["rr"])), "@@RRMAX@@": ("%g" % float(s["max_rr"])), "@@RRV@@": ("%g" % float((acc.get("rr_aplus") if acc and acc.get("rr_aplus") else s["rr"]))),
+           "@@STATE@@": state, "@@BALFIELD@@": balfield, "@@DEF@@": format(df_ * fx_, ",.0f"), "@@CUR@@": str(escape(cur_)), "@@RCUR@@": curopts(cur_), "@@RISK@@": str(rp), "@@CAP@@": str(cap), "@@MAXT@@": str(int(s.get("max_trades_per_day") or 0) or "any number of"),
            "@@BTN@@": "SAVE AND START" if acc else "START PAPER TRADING", "@@STOP@@": stop, "@@RESULTS@@": results, "@@CFG@@": cfg}
     html = PAPER_TPL
     for k, v in rep.items(): html = html.replace(k, v)
@@ -2988,6 +3113,7 @@ def admin_save():
             if k == "paper_currency":
                 new = re.sub(r"[^A-Za-z0-9$€£]", "", new)[:6].upper()
                 if not new: continue
+            if k == "max_rr": new = min(10.0, max(2.0, new))
             if k == "paper_min_balance": new = min(1e9, max(1.0, new))
             if k == "paper_default_balance": new = min(1e9, max(1.0, new))
             if k == "risk_pct": new = min(2.0, max(0.1, new))
