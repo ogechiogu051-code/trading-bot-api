@@ -43,8 +43,8 @@ DEFAULTS = {
     "lead": "A smart-money trading bot that reads market structure for you: it spots the break of structure, finds the liquidity, and places the entry, stop loss and take profit automatically. Every trade is recorded so you can see the real results.",
     "platforms": ["BINANCE", "BYBIT", "OKX", "BITGET", "MT5", "MT4", "EA"],
     "symbols": ["BTCUSDT", "ETHUSDT", "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD", "EURGBP", "EURJPY", "GBPJPY", "XAUUSD"], "timeframe": "30m", "timeframes": ["30m", "1h"],
-    "swing_n": 2, "htf_swing_n": 3, "min_bos": 1, "rr": 2.0, "ob_entry": "top",
-    "risk_pct": 1.0, "max_mitigation_pct": 30.0, "min_leg_atr": 2.0,
+    "swing_n": 4, "htf_swing_n": 3, "min_bos": 1, "rr": 2.0, "ob_entry": "top",
+    "risk_pct": 1.0, "max_mitigation_pct": 30.0, "min_leg_atr": 2.5,
     "max_pairs": 5,                 # most pairs one account may ask the robot to trade (advice shown to people: no more than 2)
     "max_trades_per_day": 3,        # per account, per UTC day (0 = no limit)
     "paper_currency": "USD",         # label shown next to paper balances
@@ -64,9 +64,10 @@ DEFAULTS = {
     "ea_poll_seconds": 30, "max_inflight": 200,
     "mode": "live",                                               # no longer used: paper accounts are always simulated, connected accounts are always live
     "filters": {"liquidity": [], "session": [], "side": [], "bos_run": [], "tf": []},
-    "strategy_text": "Trade only in the direction of the Daily present leg (bullish = buys only, bearish = sells only); the other way only on the second break of structure on the 30m / 1h chart. Liquidity = last order block (or wick) before the breakout. "
-                     "Entry = top of the OB below the liquidity (bullish), bottom of the OB above it (bearish). "
-                     "SL at protected low/high of the BOS leg. TP = 1:2.",
+    "strategy_text": "Trade only in the direction of the Daily present leg (bullish = buys only, bearish = sells only); the other way only on the second break of structure on the 30m / 1h chart. "
+                     "Only a major break of structure counts (a big, clear leg). Liquidity = the last order block (or the last pullback wick) inside that leg, right before the breakout. "
+                     "Entry = the nearest order block further back than the liquidity: above it for sells (bottom of that block), below it for buys (top of that block), always inside the break of structure. No order block = no trade. "
+                     "SL at the protected high/low of the BOS leg. TP = the present low (sells) or present high (buys), the extreme the move has reached; if that gives less than 1:2 it is extended to 1:2, if it gives more, the bigger reward is kept.",
 }
 BRAND_KEYS = ("site_name", "tagline", "lead")
 ACCESS_KEYS = ("require_signup", "gmail_only", "max_users", "max_accounts_per_user", "block_unlinked", "paid_mode", "trial_days", "plan_days", "price_text", "price_usd", "price_ngn", "payment_link", "pay_note", "pay_ng", "pay_usdt", "pay_usdt_net")
@@ -232,6 +233,23 @@ def init_db():
     try:
         if not kv_get("mig_strategy_v4"):                             # one time: show the new strategy text (trend direction rule)
             st_ = json.loads(kv_get("settings", "{}") or "{}"); st_.pop("strategy_text", None); kv_set("settings", json.dumps(st_)); kv_set("mig_strategy_v4", "1")
+    except Exception: pass
+    try:
+        if not kv_get("mig_strategy_v5"):                             # one time: only MAJOR breaks of structure (bigger swings, bigger legs) + show the new strategy text
+            st_ = json.loads(kv_get("settings", "{}") or "{}")
+            st_["swing_n"] = 4; st_["min_leg_atr"] = 3.0; st_.pop("strategy_text", None)
+            kv_set("settings", json.dumps(st_)); kv_set("mig_strategy_v5", "1")
+    except Exception: pass
+    try:
+        if not kv_get("mig_strategy_v6"):                             # one time: take profit at the broken level (minimum 1:2), liquidity can be an order block or a wick, leg size 3
+            st_ = json.loads(kv_get("settings", "{}") or "{}")
+            if st_.get("min_leg_atr") == 4.0: st_["min_leg_atr"] = 3.0
+            st_.pop("strategy_text", None); kv_set("settings", json.dumps(st_)); kv_set("mig_strategy_v6", "1")
+    except Exception: pass
+    try:
+        if not kv_get("mig_strategy_v7"):                             # one time: leg size 2.5, take profit at the present low / high, new strategy text
+            st_ = json.loads(kv_get("settings", "{}") or "{}")
+            st_["min_leg_atr"] = 2.5; st_.pop("strategy_text", None); kv_set("settings", json.dumps(st_)); kv_set("mig_strategy_v7", "1")
     except Exception: pass
     try: db.x("ALTER TABLE accounts ADD COLUMN " + ("IF NOT EXISTS " if db.pg else "") + "resets INTEGER NOT NULL DEFAULT 0")          # how many times a paper account was reset (shown for honesty)
     except Exception: pass
@@ -423,24 +441,35 @@ def find_setup(c, s, tf=None, why=None):
     if s.get("min_leg_atr", 0) and len(ranges) >= 5 and leg_h < s["min_leg_atr"] * avg_rng: return no("the last break of structure is too small to trust")    # the BOS must be a big, clear move
 
     is_ob = (lambda x: x["c"] < x["o"]) if bull else (lambda x: x["c"] > x["o"])
-    obs = [k for k in range(origin, bos_i) if is_ob(c[k])]                     # only candles inside the leg
-    if obs:
-        liq = obs[-1]; kind = "order_block"
-        lower = [k for k in obs if k < liq and (c[k]["l"] < c[liq]["l"] if bull else c[k]["h"] > c[liq]["h"])]
-        cands = lower[::-1] + [origin]                 # nearest block below the liquidity first
-    else:
-        wick = (lambda x: min(x["o"], x["c"]) - x["l"]) if bull else (lambda x: x["h"] - max(x["o"], x["c"]))
-        liq = max(range(origin, bos_i), key=lambda k: wick(c[k]), default=origin); kind = "wick"; cands = [origin]
-    if (c[liq]["h"] > c[bos_i]["h"]) if bull else (c[liq]["l"] < c[bos_i]["l"]): return no("the break did not clear the liquidity")      # the BOS must reach at least the liquidity line
+    # LIQUIDITY = the LAST order block (opposing candle) inside the BOS leg, right before the breakout. If that does not give a trade, the last pullback WICK in the leg is used. Its size does not matter.
+    # ENTRY = the nearest real ORDER BLOCK further back than the liquidity: above it for sells, below it for buys. It must lie inside the BOS leg.
+    obs = [k for k in range(origin, bos_i) if is_ob(c[k])]                     # real opposing candles inside the leg only
+    if bull: pivs = [k for k in range(origin + 1, bos_i) if c[k]["l"] <= c[k - 1]["l"] and c[k]["l"] <= c[k + 1]["l"]]       # last pullback low (a wick)
+    else:    pivs = [k for k in range(origin + 1, bos_i) if c[k]["h"] >= c[k - 1]["h"] and c[k]["h"] >= c[k + 1]["h"]]       # last pullback high (a wick)
+    options = ([(obs[-1], "order_block")] if obs else []) + ([(pivs[-1], "wick")] if pivs else [])
+    if not options: return no("no order block or wick inside the break of structure, so there is no liquidity to trade from")
     maxm = float(s.get("max_mitigation_pct", 30)) / 100
-    ent = next((k for k in cands if mitigation(c, k, bull, bos_i + 1) <= maxm + 1e-9), None)       # entry block must be unmitigated since the breakout (or barely touched)
-    if ent is None: return no("price already came back into the entry order block")
+    liq = ent = kind = None; why_last = "no order block found"
+    for lq, kd in options:
+        if (c[lq]["h"] > c[bos_i]["h"]) if bull else (c[lq]["l"] < c[bos_i]["l"]): why_last = "the break did not clear the liquidity"; continue      # the BOS must reach at least the liquidity line
+        cands = [k for k in reversed(obs) if k < lq and (c[k]["l"] < c[lq]["l"] if bull else c[k]["h"] > c[lq]["h"])]         # nearest block to the liquidity first
+        if not cands: why_last = "no order block " + ("below" if bull else "above") + " the liquidity inside the break of structure to enter from"; continue
+        e = next((k for k in cands if mitigation(c, k, bull, bos_i + 1) <= maxm + 1e-9), None)       # entry block must be unmitigated since the breakout (or barely touched)
+        if e is None: why_last = "price already came back into the entry order block"; continue
+        liq, kind, ent = lq, kd, e; break
+    if ent is None: return no(why_last)
     ob = c[ent]; mit = mitigation(c, ent, bull, bos_i + 1)
     if bull: entry, sl = (ob["h"] if s["ob_entry"] == "top" else (ob["h"] + ob["l"]) / 2), protected
     else:    entry, sl = (ob["l"] if s["ob_entry"] == "top" else (ob["h"] + ob["l"]) / 2), protected
     risk = (entry - sl) if bull else (sl - entry)
     if risk <= 0: return no("the entry is not on the right side of the protected level")
-    tp = entry + rr * risk if bull else entry - rr * risk
+    if risk < 0.15 * leg_h: return no("the entry order block sits too close to the protected level to give a sensible stop")      # no hairline stops
+    # TAKE PROFIT = the PRESENT low (sells) / PRESENT high (buys): the most extreme candle the move has reached so far, from the start of the BOS leg up to now. Price has not broken it yet:
+    # when price comes back and hits this level, that is the break of structure in the direction of the trend. If it gives less than the minimum reward (rr, default 1:2) it is extended to the minimum; if it gives more, the bigger reward is kept.
+    ext = max(c[k]["h"] for k in range(start, len(c))) if bull else min(c[k]["l"] for k in range(start, len(c)))
+    room = (ext - entry) if bull else (entry - ext)
+    if room > 0 and room / risk >= rr: tp, rr = ext, round(room / risk, 2)
+    else: tp = entry + rr * risk if bull else entry - rr * risk
 
     after, price = c[bos_i + 1:], c[-1]["c"]
     if bull and (any(x["l"] <= entry for x in after) or price <= entry): return no("price already tapped the entry, so that setup is gone")   # already tapped / stale
@@ -818,7 +847,7 @@ def place_order(acc, sig, sym, s):
          "outcome": "PENDING", "bars": 0, **sig}
     if acc["platform"] == "PAPER" and sig.get("grade") == "A+" and dist:                  # A+ setup: the person's own (bigger) reward, kept short of the level that forms a new BOS
         use = aplus_rr(acc, sig, s)
-        if use > float(s["rr"]) + 1e-9:
+        if use > float(sig["rr"]) + 1e-9:
             o["tp"] = round(sig["entry"] + use * dist if sig["side"] == "BUY" else sig["entry"] - use * dist, 8); o["rr"] = use; o["key"] = sig["key"] + "|rr"      # own key: this order is resolved on its own, not copied from the signal
     if acc["platform"] == "PAPER": o["status"] = "PAPER"                                      # paper accounts are ALWAYS simulated; every connected account is ALWAYS live (no owner switch)
     elif acc["platform"] == "EA": o["status"], o["ea_ack"] = "LIVE: queued for EA", False
@@ -983,7 +1012,7 @@ def trend_check(sig, b, s):
 
 def aplus_max_rr(sig, s):
     """Highest reward (1:x) an A+ setup allows: the take profit has to stay SHORT of the Daily level that would form a new BOS in the leg's direction (and below the owner's max_rr)."""
-    base = float(s["rr"]); lim = sig.get("tp_limit")
+    base = float(sig.get("rr") or s["rr"]); lim = sig.get("tp_limit")
     if sig.get("grade") != "A+" or lim is None: return base
     risk = abs(sig["entry"] - sig["sl"]); room = (sig["entry"] - lim) if sig["side"] == "SELL" else (lim - sig["entry"])
     if risk <= 0 or room <= 0: return base
@@ -992,7 +1021,8 @@ def aplus_max_rr(sig, s):
 def aplus_rr(acc, sig, s):
     """The reward this person gets on this setup: what they asked for, cut down to what the setup allows (never below the normal 1:2)."""
     want = acc.get("rr_aplus")
-    return round(max(float(s["rr"]), min(float(want) if want else float(s["rr"]), aplus_max_rr(sig, s))), 2)
+    base = float(sig.get("rr") or s["rr"])
+    return round(max(base, min(float(want) if want else base, aplus_max_rr(sig, s))), 2)
 
 def bias_text(b):
     nm = {"bull": "bullish", "bear": "bearish", None: "unclear", "?": "unknown"}
@@ -2643,7 +2673,7 @@ def api_live():
     if pick and pick.get("grade") == "A+":
         mr = aplus_max_rr(pick, s); use = aplus_rr(acc or {}, pick, s)
         aplus = {"max_rr": mr, "use": use, "limited": bool(pick.get("tp_limit") is not None and mr < float(s["max_rr"]) - 1e-9), "limit": pick.get("tp_limit")}
-        if sig and use > float(s["rr"]) + 1e-9:
+        if sig and use > float(sig["rr"]) + 1e-9:
             sig = dict(sig, rr=use, tp=(sig["entry"] + use * abs(sig["entry"] - sig["sl"])) if sig["side"] == "BUY" else (sig["entry"] - use * abs(sig["entry"] - sig["sl"])))
     live_o = [o for o in mine if o["outcome"] in ("PENDING", "OPEN")]
     if not online: st = ("offline", "The market scanner is not running right now, so no new setups can be found until it starts.")
@@ -2839,7 +2869,7 @@ PAPER_TPL = """
     <div style='margin-top:10px'>@@PAIRS@@</div>
     <label style='display:block;margin-top:10px'>Risk per trade, in percent (maximum @@CAP@@%)</label><input class='input' id='prisk' name='risk' type='number' step='0.1' min='0.1' max='@@CAP@@' value='@@RISK@@' required>
     <label style='display:block;margin-top:10px'>Reward on A+ setups: 1 : (from @@RRMIN@@ to @@RRMAX@@)</label><input class='input' name='rr' type='number' step='0.1' min='@@RRMIN@@' max='@@RRMAX@@' value='@@RRV@@' required>
-    <p class='muted'>A+ means the setup goes the same way as the present Daily and Weekly leg. On those you can ask for more than 1:@@RRMIN@@. The take profit is never allowed to reach the Daily level that would form a new BOS, so a setup may give less than you ask for. Other setups always use 1:@@RRMIN@@.</p>
+    <p class='muted'>A+ means the setup goes the same way as the present Daily and Weekly leg. On those you can ask for more than 1:@@RRMIN@@. The take profit is never allowed to reach the Daily level that would form a new BOS, so a setup may give less than you ask for. Every setup puts its take profit at the present low (sells) or present high (buys) of the move, and never less than 1:@@RRMIN@@.</p>
     <p class='muted'>The robot reads the 30 minute and the 1 hour chart on every pair and takes the clearer setup. It takes at most @@MAXT@@ trades a day on your account and uses the same rules for everybody.</p>
     <button class='btn'>@@BTN@@</button></form>@@STOP@@
    <div id='rbox' style='display:none;margin-top:12px'><p style='color:#dc2626;font-weight:700;margin-bottom:8px'>Your practice money has run out.</p>
