@@ -44,8 +44,17 @@ DEFAULTS = {
     "platforms": ["BINANCE", "BYBIT", "OKX", "BITGET", "MT5", "MT4", "EA"],
     "symbols": ["BTCUSDT", "ETHUSDT", "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD", "EURGBP", "EURJPY", "GBPJPY", "XAUUSD"], "timeframe": "30m", "timeframes": ["30m", "1h"],
     "swing_n": 4, "htf_swing_n": 3, "min_bos": 1, "rr": 2.0, "ob_entry": "top",
-    "risk_pct": 1.0, "max_mitigation_pct": 30.0, "min_leg_atr": 2.5,
+    "risk_pct": 1.0, "max_mitigation_pct": 10.0, "min_leg_atr": 2.5,
     "max_pairs": 5,                 # most pairs one account may ask the robot to trade (advice shown to people: no more than 2)
+    "sl_buffer_pips": 2.5,          # stop loss = entry order block high/low plus this many pips (2-3)
+    "max_sl_pips": 40.0,            # skip the trade when the stop loss would be bigger than this (0 = no limit). Gold / crypto: a "pip" is the same % of price as a forex pip
+    "min_sl_pips": 5.0,             # skip the trade when the stop loss would be smaller than this (0 = no limit)
+    "min_rr": 1.5,                  # only take a setup when the target (next swing point) gives at least this reward (1:x)
+    "liq_inside_pct": 70.0,         # the liquidity and the entry block must be at least this % inside the break of structure
+    "ob_gap_pct": 15.0,             # the entry block must stay clear of the liquidity zone by at least this % of its own height
+    "reentry": True,                # after a stop loss with the protected level still unbroken, look for ONE re-entry (FVG / new order block / breaker / 5m MSS)
+    "reentry_bars": 48,             # how many candles after the stop loss the robot keeps looking for that re-entry
+    "snapshot_days": 2.0,            # how many days the robot's trade chart pictures are kept in Admin (0 = do not make them)
     "max_trades_per_day": 3,        # per account, per UTC day (0 = no limit)
     "paper_currency": "USD",         # label shown next to paper balances
     "paper_min_balance": 100.0,      # smallest starting balance a person may choose; a paper account below this is "finished" and may be reset
@@ -58,16 +67,17 @@ DEFAULTS = {
     "require_signup": False,        # ON = nobody can add an account without signing up / logging in first
     "gmail_only": False, "max_users": 0, "max_accounts_per_user": 5, "block_unlinked": False,
     # --- monetisation (paper trading = free forever; connected accounts = paid monthly once paid_mode is ON)
-    "paid_mode": False, "trial_days": 7, "plan_days": 30, "price_text": "", "price_usd": 20.0, "price_ngn": 0.0, "payment_link": "", "pay_note": "",
+    "paid_mode": False, "trial_days": 0, "plan_days": 30, "price_text": "", "price_usd": 20.0, "price_ngn": 0.0, "payment_link": "", "pay_note": "",
     "pay_ng": "", "pay_usdt": "", "pay_usdt_net": "TRC20 (Tron)",   # bank / OPay details for Nigerians, USDT wallet + network for crypto payers
     # --- scale
     "ea_poll_seconds": 30, "max_inflight": 200,
     "mode": "live",                                               # no longer used: paper accounts are always simulated, connected accounts are always live
     "filters": {"liquidity": [], "session": [], "side": [], "bos_run": [], "tf": []},
     "strategy_text": "Trade only in the direction of the Daily present leg (bullish = buys only, bearish = sells only); the other way only on the second break of structure on the 30m / 1h chart. "
-                     "Only a major break of structure counts (a big, clear leg). Liquidity = the last order block (or the last pullback wick) inside that leg, right before the breakout. "
-                     "Entry = the nearest order block further back than the liquidity: above it for sells (bottom of that block), below it for buys (top of that block), always inside the break of structure. No order block = no trade. "
-                     "SL at the protected high/low of the BOS leg. TP = the present low (sells) or present high (buys), the extreme the move has reached; if that gives less than 1:2 it is extended to 1:2, if it gives more, the bigger reward is kept.",
+                     "Only a major break of structure counts (a big, clear leg). Liquidity = the last order block (or, if there is none, the last pullback wick) right before the breakout; it must be at least 70% inside the break of structure. "
+                     "Entry = the nearest valid order block further back than the liquidity: above it for sells, below it for buys, also at least 70% inside the break. A block that sits inside or touches the liquidity zone, or that price already came back into (10%), is skipped and the next block is used. "
+                     "SL = just beyond the entry order block (2-3 pips); the protected high/low only says the idea is dead if price closes beyond it. Skip if the stop is over 40 pips. TP = the next swing point (the present low for sells, present high for buys), only if the reward is at least 1:1.5. "
+                     "If the stop is hit but the protected level is NOT broken, the robot looks for ONE re-entry in the same zone (new FVG, new order block, breaker block, or a 5 minute market structure shift) with a new stop at that new block. If the protected level breaks, the idea is dead.",
 }
 BRAND_KEYS = ("site_name", "tagline", "lead")
 ACCESS_KEYS = ("require_signup", "gmail_only", "max_users", "max_accounts_per_user", "block_unlinked", "paid_mode", "trial_days", "plan_days", "price_text", "price_usd", "price_ngn", "payment_link", "pay_note", "pay_ng", "pay_usdt", "pay_usdt_net")
@@ -205,6 +215,8 @@ def init_db():
         "CREATE TABLE IF NOT EXISTS journal (id TEXT PRIMARY KEY, created TEXT NOT NULL, data TEXT NOT NULL)",
         "CREATE TABLE IF NOT EXISTS payments (id TEXT PRIMARY KEY, account_id BIGINT NOT NULL, user_id BIGINT, method TEXT NOT NULL, ref TEXT NOT NULL, created TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending')",
         "CREATE INDEX IF NOT EXISTS ix_pay_status ON payments(status, created)",
+        "CREATE TABLE IF NOT EXISTS snaps (skey TEXT PRIMARY KEY, symbol TEXT NOT NULL, tf TEXT NOT NULL DEFAULT '', sig_key TEXT NOT NULL DEFAULT '', created TEXT NOT NULL, updated TEXT NOT NULL, outcome TEXT NOT NULL DEFAULT '', side TEXT NOT NULL DEFAULT '', svg TEXT NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS ix_snaps_upd ON snaps(updated)",
     ]
     for s_ in stmts: db.x(s_)
     try: db.x("ALTER TABLE accounts ADD COLUMN " + ("IF NOT EXISTS " if db.pg else "") + "paused INTEGER NOT NULL DEFAULT 0")     # start/stop switch; old databases get it here
@@ -247,9 +259,18 @@ def init_db():
             st_.pop("strategy_text", None); kv_set("settings", json.dumps(st_)); kv_set("mig_strategy_v6", "1")
     except Exception: pass
     try:
+        if not kv_get("mig_trial_off_v1"):                            # one time: no free trial for connected accounts unless the owner sets days in Admin
+            st_ = json.loads(kv_get("settings", "{}") or "{}"); st_["trial_days"] = 0; kv_set("settings", json.dumps(st_)); kv_set("mig_trial_off_v1", "1")
+    except Exception: pass
+    try:
         if not kv_get("mig_strategy_v7"):                             # one time: leg size 2.5, take profit at the present low / high, new strategy text
             st_ = json.loads(kv_get("settings", "{}") or "{}")
             st_["min_leg_atr"] = 2.5; st_.pop("strategy_text", None); kv_set("settings", json.dumps(st_)); kv_set("mig_strategy_v7", "1")
+    except Exception: pass
+    try:
+        if not kv_get("mig_strategy_v9"):                             # one time: the new rule set (10% mitigation, new strategy text)
+            st_ = json.loads(kv_get("settings", "{}") or "{}")
+            st_["max_mitigation_pct"] = 10.0; st_.pop("strategy_text", None); kv_set("settings", json.dumps(st_)); kv_set("mig_strategy_v9", "1")
     except Exception: pass
     try: db.x("ALTER TABLE accounts ADD COLUMN " + ("IF NOT EXISTS " if db.pg else "") + "resets INTEGER NOT NULL DEFAULT 0")          # how many times a paper account was reset (shown for honesty)
     except Exception: pass
@@ -411,13 +432,32 @@ def mitigation(c, k, bull, frm=None):
     depth = (hi - min(x["l"] for x in after)) if bull else (max(x["h"] for x in after) - lo)
     return max(0.0, min(1.0, depth / (hi - lo)))
 
-def find_setup(c, s, tf=None, why=None):
+def pip_size(sym, price):
+    """Size of ONE pip. Forex 0.0001 (JPY pairs 0.01). Gold, silver, oil and crypto have no real pips, so a 'pip' there is the same fraction of the price as a forex pip (about 0.009%).
+    That keeps the 2-3 pip buffer and the 40 pip limit fair on every market."""
+    core = re.sub(r"[a-z._#]+$", "", sym or "")
+    if sym and re.fullmatch(r"[A-Z]{6}", core) and core[:3] not in ("XAU", "XAG"): return 0.01 if core.endswith("JPY") else 0.0001
+    if not sym: return 0.0001 if price < 20 else 0.01 if price < 400 else price * 0.00009
+    return price * 0.00009
+
+def inside_frac(lo, hi, zlo, zhi):
+    """How much of the range lo..hi lies inside the zone zlo..zhi (0.0 to 1.0)."""
+    if hi <= lo: return 1.0 if zlo <= lo <= zhi else 0.0
+    return max(0.0, min(hi, zhi) - max(lo, zlo)) / (hi - lo)
+
+def mit_since_leave(c, k, bull):
+    """How deep price came BACK into order block c[k] after it had first moved away from it (the candles that simply move away from the block do not count)."""
+    ob = c[k]
+    L = next((j for j in range(k + 1, len(c)) if ((c[j]["c"] > ob["h"]) if bull else (c[j]["c"] < ob["l"]))), None)
+    return 0.0 if L is None else mitigation(c, k, bull, L + 1)
+
+def find_setup(c, s, tf=None, why=None, sym=None, tp_fixed=None):
     """The strategy: a break of structure (BOS) -> liquidity = the last order block before the breakout -> entry = the order block BELOW that liquidity (bullish; above it when bearish) -> SL at the protected low/high.
     Returns the setup, or None. If a list is passed as `why`, the reason for saying no is appended to it."""
     def no(msg):
         if why is not None: why.append(msg)
         return None
-    n, rr, min_bos = s["swing_n"], s["rr"], max(1, int(s["min_bos"]))
+    n, min_bos = s["swing_n"], max(1, int(s["min_bos"]))
     ev = bos_events(c, n)
     if not ev: return no("no break of structure on the chart yet")
     if len(ev) < min_bos: return no("not enough breaks of structure yet")
@@ -441,44 +481,62 @@ def find_setup(c, s, tf=None, why=None):
     if s.get("min_leg_atr", 0) and len(ranges) >= 5 and leg_h < s["min_leg_atr"] * avg_rng: return no("the last break of structure is too small to trust")    # the BOS must be a big, clear move
 
     is_ob = (lambda x: x["c"] < x["o"]) if bull else (lambda x: x["c"] > x["o"])
-    # LIQUIDITY = the LAST order block (opposing candle) inside the BOS leg, right before the breakout. If that does not give a trade, the last pullback WICK in the leg is used. Its size does not matter.
-    # ENTRY = the nearest real ORDER BLOCK further back than the liquidity: above it for sells, below it for buys. It must lie inside the BOS leg.
+    after, price = c[bos_i + 1:], c[-1]["c"]
+    if any(((x["c"] < protected) if bull else (x["c"] > protected)) for x in after): return no("the protected " + ("low" if bull else "high") + " was broken, so this idea is dead")      # final invalidation
+    # The BOS zone = from the protected level to the level the break went through. Liquidity and the entry block must be (at least 70%) inside it.
+    broken_p = last["broken"][1]
+    zlo, zhi = (protected, broken_p) if bull else (broken_p, protected)
+    inpct = float(s.get("liq_inside_pct", 70)) / 100
+    inside = lambda k: inside_frac(c[k]["l"], c[k]["h"], zlo, zhi) >= inpct - 1e-9
+    # LIQUIDITY = the LAST order block (opposing candle) in the BOS leg right before the breakout; only if the last pullback WICK is used instead (no usable order block) it must also be inside the zone.
     obs = [k for k in range(origin, bos_i) if is_ob(c[k])]                     # real opposing candles inside the leg only
     if bull: pivs = [k for k in range(origin + 1, bos_i) if c[k]["l"] <= c[k - 1]["l"] and c[k]["l"] <= c[k + 1]["l"]]       # last pullback low (a wick)
     else:    pivs = [k for k in range(origin + 1, bos_i) if c[k]["h"] >= c[k - 1]["h"] and c[k]["h"] >= c[k + 1]["h"]]       # last pullback high (a wick)
-    options = ([(obs[-1], "order_block")] if obs else []) + ([(pivs[-1], "wick")] if pivs else [])
-    if not options: return no("no order block or wick inside the break of structure, so there is no liquidity to trade from")
-    maxm = float(s.get("max_mitigation_pct", 30)) / 100
-    liq = ent = kind = None; why_last = "no order block found"
+    ob_in, pv_in = [k for k in obs if inside(k)], [k for k in pivs if inside(k)]
+    options = ([(ob_in[-1], "order_block")] if ob_in else []) + ([(pv_in[-1], "wick")] if pv_in else [])
+    if not options: return no(f"no order block or wick that is at least {round(inpct * 100)}% inside the break of structure, so there is no liquidity to trade from")
+    # ENTRY = the nearest valid ORDER BLOCK further back than the liquidity (above it for sells, below it for buys), inside the zone.
+    maxm = float(s.get("max_mitigation_pct", 10)) / 100                         # price came back into the block by more than this = block is used up
+    gap_pct = float(s.get("ob_gap_pct", 15)) / 100                              # the block must stay clear of the liquidity zone by at least this part of its own height
+    pip = pip_size(sym, c[-1]["c"]); buf = float(s.get("sl_buffer_pips") or 0) * pip
+    chosen, why_last = None, "no order block found"
     for lq, kd in options:
         if (c[lq]["h"] > c[bos_i]["h"]) if bull else (c[lq]["l"] < c[bos_i]["l"]): why_last = "the break did not clear the liquidity"; continue      # the BOS must reach at least the liquidity line
-        cands = [k for k in reversed(obs) if k < lq and (c[k]["l"] < c[lq]["l"] if bull else c[k]["h"] > c[lq]["h"])]         # nearest block to the liquidity first
+        cands = [k for k in reversed(obs) if k < lq and inside(k) and (c[k]["l"] < c[lq]["l"] if bull else c[k]["h"] > c[lq]["h"])]       # nearest block to the liquidity first
         if not cands: why_last = "no order block " + ("below" if bull else "above") + " the liquidity inside the break of structure to enter from"; continue
-        e = next((k for k in cands if mitigation(c, k, bull, bos_i + 1) <= maxm + 1e-9), None)       # entry block must be unmitigated since the breakout (or barely touched)
-        if e is None: why_last = "price already came back into the entry order block"; continue
-        liq, kind, ent = lq, kd, e; break
-    if ent is None: return no(why_last)
-    ob = c[ent]; mit = mitigation(c, ent, bull, bos_i + 1)
-    if bull: entry, sl = (ob["h"] if s["ob_entry"] == "top" else (ob["h"] + ob["l"]) / 2), protected
-    else:    entry, sl = (ob["l"] if s["ob_entry"] == "top" else (ob["h"] + ob["l"]) / 2), protected
+        lz = c[lq]                                                              # the liquidity zone
+        for k in cands:
+            o_ = c[k]; oh = o_["h"] - o_["l"]
+            gap = (lz["l"] - o_["h"]) if bull else (o_["l"] - lz["h"])         # negative = the block sits inside / overlaps the liquidity zone
+            if gap < gap_pct * oh - 1e-12: why_last = "the entry order block is inside or touching the liquidity zone, so it is skipped"; continue
+            m_ = mit_since_leave(c, k, bull)
+            if m_ > maxm + 1e-9: why_last = "price already came back into the entry order block"; continue
+            chosen = (lq, kd, k, m_); break
+        if chosen: break
+    if not chosen: return no(why_last)
+    liq, kind, ent, mit = chosen; ob = c[ent]
+    if bull: entry, sl = (ob["h"] if s["ob_entry"] == "top" else (ob["h"] + ob["l"]) / 2), ob["l"] - buf         # STOP LOSS = just beyond the entry order block (the protected level is only the "idea is dead" line)
+    else:    entry, sl = (ob["l"] if s["ob_entry"] == "top" else (ob["h"] + ob["l"]) / 2), ob["h"] + buf
     risk = (entry - sl) if bull else (sl - entry)
-    if risk <= 0: return no("the entry is not on the right side of the protected level")
-    if risk < 0.15 * leg_h: return no("the entry order block sits too close to the protected level to give a sensible stop")      # no hairline stops
-    # TAKE PROFIT = the PRESENT low (sells) / PRESENT high (buys): the most extreme candle the move has reached so far, from the start of the BOS leg up to now. Price has not broken it yet:
-    # when price comes back and hits this level, that is the break of structure in the direction of the trend. If it gives less than the minimum reward (rr, default 1:2) it is extended to the minimum; if it gives more, the bigger reward is kept.
-    ext = max(c[k]["h"] for k in range(start, len(c))) if bull else min(c[k]["l"] for k in range(start, len(c)))
+    if risk <= 0: return no("the entry is not on the right side of the stop loss")
+    rp = risk / pip
+    if float(s.get("max_sl_pips") or 0) and rp > float(s["max_sl_pips"]): return no(f"the stop loss would be {rp:.0f} pips, more than the {float(s['max_sl_pips']):g} pip limit")
+    if float(s.get("min_sl_pips") or 0) and rp < float(s["min_sl_pips"]): return no(f"the stop loss would be only {rp:.1f} pips, too tight to trade")
+    # TAKE PROFIT = the next swing point in the trade's direction: the PRESENT low (sells) / PRESENT high (buys), the most extreme candle of the move so far.
+    # Price has not broken it yet: when it does, that is the new break of structure in the trend's direction. Only taken when the reward is at least min_rr (default 1:1.5).
+    ext = tp_fixed if tp_fixed is not None else (max(c[k]["h"] for k in range(start, len(c))) if bull else min(c[k]["l"] for k in range(start, len(c))))
     room = (ext - entry) if bull else (entry - ext)
-    if room > 0 and room / risk >= rr: tp, rr = ext, round(room / risk, 2)
-    else: tp = entry + rr * risk if bull else entry - rr * risk
+    min_rr = float(s.get("min_rr") or 1.5)
+    if room <= 0 or room / risk < min_rr - 1e-9: return no(f"the target gives only 1:{max(0.0, room / risk):.1f}, less than the minimum 1:{min_rr:g}")
+    tp, rr = ext, round(room / risk, 2)
 
-    after, price = c[bos_i + 1:], c[-1]["c"]
     if bull and (any(x["l"] <= entry for x in after) or price <= entry): return no("price already tapped the entry, so that setup is gone")   # already tapped / stale
     if not bull and (any(x["h"] >= entry for x in after) or price >= entry): return no("price already tapped the entry, so that setup is gone")
     h = datetime.datetime.utcnow().hour
     sess = "Asia" if h < 7 else "London" if h < 13 else "NY" if h < 21 else "Late"
     return {"side": "BUY" if bull else "SELL", "entry": entry, "sl": sl, "tp": tp, "rr": rr, "liquidity": kind,
             "session": sess, "bos_run": min(run, 5), "key": (f"{tf}-" if tf and tf != s["timeframe"] else "") + f"{last['dir']}-{c[bos_i]['t']}", "tf": tf or s["timeframe"], "mitigated_pct": round(100 * mit), "last_t": c[-1]["t"],
-            "bos_t": c[bos_i]["t"], "ob_hi": ob["h"], "ob_lo": ob["l"], "leg_atr": round(leg_atr, 2),
+            "bos_t": c[bos_i]["t"], "ob_hi": ob["h"], "ob_lo": ob["l"], "ob_t": ob["t"], "liq_t": c[liq]["t"], "leg_t": c[start]["t"], "prot": protected, "swing_n": n, "sl_pips": round(rp, 1), "leg_atr": round(leg_atr, 2),
             "score": round(min(leg_atr, 12) + 1.5 * min(run, 5) - mit * 4 + (0.5 if tf == "1h" else 0), 2)}
 
 def resolve(o, candles):
@@ -807,15 +865,15 @@ def seen_new(k):
 
 # ---------------- setup detection, cached: many users on the same broker send identical candles ----------------
 _SETUP, _SETUP_LOCK = collections.OrderedDict(), threading.Lock()
-SETUP_KEYS = ("swing_n", "min_bos", "rr", "ob_entry", "max_mitigation_pct", "min_leg_atr", "timeframe")
-def cached_setup(rows, s, tf, why=None):
-    h = hashlib.sha1((tf + json.dumps([s[k] for k in SETUP_KEYS]) + ";".join(f"{x['t']},{x['o']},{x['h']},{x['l']},{x['c']}" for x in rows)).encode()).hexdigest()
+SETUP_KEYS = ("swing_n", "min_bos", "rr", "ob_entry", "max_mitigation_pct", "min_leg_atr", "timeframe", "sl_buffer_pips", "max_sl_pips", "min_sl_pips", "min_rr", "liq_inside_pct", "ob_gap_pct")
+def cached_setup(rows, s, tf, why=None, sym=None):
+    h = hashlib.sha1((str(sym) + tf + json.dumps([s[k] for k in SETUP_KEYS]) + ";".join(f"{x['t']},{x['o']},{x['h']},{x['l']},{x['c']}" for x in rows)).encode()).hexdigest()
     with _SETUP_LOCK:
         if h in _SETUP:
             _SETUP.move_to_end(h); v, w_ = _SETUP[h]
             if why is not None: why.extend(w_)
             return dict(v) if v else None
-    w_ = []; sig = find_setup(rows, s, tf, w_)
+    w_ = []; sig = find_setup(rows, s, tf, w_, sym)
     if why is not None: why.extend(w_)
     with _SETUP_LOCK:
         _SETUP[h] = (sig, w_)
@@ -1076,9 +1134,11 @@ def setup_fresh(sig, c, s, strict=False):
     if not bt or "entry" not in sig: return (not strict), "setup has no BOS time to check"
     if not c: return (not strict), "no candle data to check the setup"
     if bt < c[0]["t"]: return (not strict), "setup is older than the candle history available"
-    if any(t > bt for t in _event_times(c, int(s["swing_n"]))): return False, "a newer break of structure has formed"
+    if any(t > bt for t in _event_times(c, int(sig.get("swing_n") or s["swing_n"]))): return False, "a newer break of structure has formed"
     bull, entry, tp = sig["side"] == "BUY", sig["entry"], sig["tp"]
     after = [x for x in c if x["t"] > bt]
+    pr_ = sig.get("prot")
+    if pr_ is not None and any(((x["c"] < pr_) if bull else (x["c"] > pr_)) for x in after): return False, "the protected " + ("low" if bull else "high") + " was broken, so the idea is dead"
     if after:
         lo_, hi_ = min(x["l"] for x in after), max(x["h"] for x in after)
         if (lo_ <= entry) if bull else (hi_ >= entry): return False, "price already traded into the entry zone (mitigated)"
@@ -1132,6 +1192,200 @@ def finish_signal(o):
     db.x(f"UPDATE orders SET outcome=:o, r=:r, last_t=:lt, bars=:b WHERE {where}", o=o["outcome"], r=o.get("r"), lt=int(o["last_t"]), b=int(o.get("bars", 0)), **k)
     record_track(o)
 
+
+# ======================================================================================================================
+# TRADE CHART PICTURES: every trade the robot takes gets a picture drawn on the server (candles, break of structure, liquidity, entry order block,
+# entry / stop loss / take profit lines). Stored as small SVG text, shown in Admin, deleted automatically after `snapshot_days`.
+# ======================================================================================================================
+def snap_key(symbol, tf, key): return hashlib.sha1(f"{symbol}|{tf}|{str(key).split('|')[0]}".encode()).hexdigest()[:20]
+
+def _fp(v): return f"{v:.{2 if abs(v) >= 100 else 3 if abs(v) >= 10 else 5}f}"
+
+def snap_svg(o, candles):
+    cs = list(candles or [])
+    if len(cs) < 10 or "entry" not in o: return None
+    bull = o["side"] == "BUY"
+    t0 = int(o.get("leg_t") or o.get("bos_t") or cs[0]["t"])
+    i0 = next((i for i, x in enumerate(cs) if x["t"] >= t0), 0)
+    w = cs[max(0, i0 - 30):][-150:]
+    if len(w) < 10: return None
+    W, H, PR, PT, PB = 720, 440, 92, 46, 48
+    pw, ph = W - PR, H - PT - PB
+    lv = [o["entry"], o["sl"], o["tp"]] + ([o["prot"]] if o.get("prot") is not None else [])
+    lo, hi = min([x["l"] for x in w] + lv), max([x["h"] for x in w] + lv)
+    pad = (hi - lo) * 0.07 or abs(hi) * 0.001; lo -= pad; hi += pad
+    slot = pw / len(w)
+    X = lambda i: (i + 0.5) * slot
+    Y = lambda v: PT + (hi - v) / (hi - lo) * ph
+    idx = lambda t_: next((i for i, x in enumerate(w) if x["t"] == t_), None)
+    e = [f"<rect width='{W}' height='{H}' fill='#131722'/>"]
+    for g in range(6):
+        v = lo + (hi - lo) * g / 5; y = Y(v)
+        e.append(f"<line x1='0' x2='{pw}' y1='{y:.1f}' y2='{y:.1f}' stroke='#1e222d'/><text x='{pw + 6}' y='{y + 4:.1f}' font-size='10' fill='#787b86'>{_fp(v)}</text>")
+    for g in range(5):
+        i = int((len(w) - 1) * g / 4); x = X(i)
+        e.append(f"<line y1='{PT}' y2='{PT + ph}' x1='{x:.1f}' x2='{x:.1f}' stroke='#1e222d'/><text x='{x:.1f}' y='{H - 28}' font-size='10' fill='#787b86' text-anchor='middle'>{datetime.datetime.utcfromtimestamp(w[i]['t'] / 1000).strftime('%d %b %H:%M')}</text>")
+    bi, li, oi, ci = idx(o.get("bos_t")), idx(o.get("leg_t")), idx(o.get("ob_t")), idx(o.get("liq_t"))
+    if li is not None and bi is not None and bi >= li:                                         # the break of structure leg (dark red box, like on your own chart)
+        seg = w[li:bi + 1]; y1, y2 = Y(max(x["h"] for x in seg)), Y(min(x["l"] for x in seg))
+        e.append(f"<rect x='{X(li) - slot / 2:.1f}' y='{y1:.1f}' width='{X(bi) - X(li) + slot:.1f}' height='{y2 - y1:.1f}' fill='rgba(127,29,29,.10)' stroke='#7f1d1d' stroke-width='1.5'/>")
+    sx = X(bi if bi is not None else max(0, len(w) - 8))
+    ye, ys, yt = Y(o["entry"]), Y(o["sl"]), Y(o["tp"])
+    e.append(f"<rect x='{sx:.1f}' y='{min(ye, yt):.1f}' width='{pw - sx:.1f}' height='{abs(yt - ye):.1f}' fill='rgba(38,166,154,.13)'/><rect x='{sx:.1f}' y='{min(ye, ys):.1f}' width='{pw - sx:.1f}' height='{abs(ys - ye):.1f}' fill='rgba(239,83,80,.13)'/>")
+    if oi is not None and o.get("ob_hi") is not None:                                          # the entry order block
+        y1, y2 = Y(o["ob_hi"]), Y(o["ob_lo"])
+        e.append(f"<rect x='{X(oi) - slot / 2:.1f}' y='{y1:.1f}' width='{pw - X(oi) + slot / 2:.1f}' height='{max(2.0, y2 - y1):.1f}' fill='rgba(168,85,247,.25)' stroke='#a855f7'/><text x='{X(oi):.1f}' y='{(y1 - 5) if not bull else (y2 + 13):.1f}' font-size='10' font-weight='700' fill='#c084fc'>ENTRY ORDER BLOCK</text>")
+    bw = max(1.0, min(slot * 0.7, 9.0))
+    for i, c in enumerate(w):
+        col = "#26a69a" if c["c"] >= c["o"] else "#ef5350"; x = X(i)
+        e.append(f"<line x1='{x:.1f}' x2='{x:.1f}' y1='{Y(c['h']):.1f}' y2='{Y(c['l']):.1f}' stroke='{col}'/><rect x='{x - bw / 2:.1f}' y='{min(Y(c['o']), Y(c['c'])):.1f}' width='{bw:.1f}' height='{max(1.0, abs(Y(c['o']) - Y(c['c']))):.1f}' fill='{col}'/>")
+    for lab, v, col, y in (("TP", o["tp"], "#26a69a", yt), ("ENTRY", o["entry"], "#2962ff", ye), ("SL", o["sl"], "#ef5350", ys)):
+        e.append(f"<line x1='0' x2='{pw}' y1='{y:.1f}' y2='{y:.1f}' stroke='{col}' stroke-width='1.6'/><rect x='{pw}' y='{y - 9:.1f}' width='{PR}' height='18' fill='{col}'/><text x='{pw + 5}' y='{y + 4:.1f}' font-size='10' font-weight='700' fill='#fff'>{lab} {_fp(v)}</text>")
+    e.append(f"<text x='6' y='{yt - 5:.1f}' font-size='11' font-weight='700' fill='#26a69a'>TAKE PROFIT (1:{o.get('rr', '')})</text><text x='6' y='{ye - 5:.1f}' font-size='11' font-weight='700' fill='#6c9bff'>ENTRY ({o['side'].lower()} limit)</text><text x='6' y='{ys + (13 if not bull else 13):.1f}' font-size='11' font-weight='700' fill='#ef5350'>STOP LOSS (beyond the entry block)</text>")
+    if o.get("prot") is not None:                                                              # the protected high/low: if price CLOSES beyond it the idea is dead (it is not the stop loss)
+        yp = Y(o["prot"])
+        e.append(f"<line x1='0' x2='{pw}' y1='{yp:.1f}' y2='{yp:.1f}' stroke='#a1a1aa' stroke-width='1.2' stroke-dasharray='6 5'/><text x='6' y='{(yp + 12) if bull else (yp - 4):.1f}' font-size='10' font-weight='700' fill='#a1a1aa'>PROTECTED {'LOW' if bull else 'HIGH'} (idea is dead if price closes beyond)</text>")
+    if ci is not None:                                                                         # the liquidity candle
+        cx = X(ci); yy = Y(w[ci]["l"] if bull else w[ci]["h"]); sgn = 1 if bull else -1
+        e.append(f"<circle cx='{cx:.1f}' cy='{yy + sgn * 6:.1f}' r='4' fill='none' stroke='#eab308' stroke-width='2'/><text x='{cx:.1f}' y='{yy + sgn * 20:.1f}' font-size='10' font-weight='700' fill='#eab308' text-anchor='middle'>LIQUIDITY</text>")
+    if bi is not None:                                                                         # the candle that broke structure
+        cx = X(bi); yy = Y(w[bi]["l"] if not bull else w[bi]["h"]); sgn = 1 if not bull else -1
+        e.append(f"<text x='{cx:.1f}' y='{yy + sgn * 14:.1f}' font-size='11' font-weight='800' fill='#f59e0b' text-anchor='middle'>BOS</text>")
+    oc = o.get("outcome")
+    if oc in ("WIN", "LOSS"):
+        ei = idx(o.get("last_t"))
+        if ei is not None:
+            e.append(f"<circle cx='{X(ei):.1f}' cy='{(yt if oc == 'WIN' else ys):.1f}' r='5' fill='{'#26a69a' if oc == 'WIN' else '#ef5350'}' stroke='#fff'/>")
+    status = {"PENDING": ("WAITING: price has not reached the entry yet", "#9598a1"), "OPEN": ("OPEN: price touched the entry", "#2962ff"),
+              "WIN": (f"WIN +{o.get('r')}R: take profit hit", "#26a69a"), "LOSS": ("LOSS -1R: stop loss hit", "#ef5350")}.get(oc, ("CANCELLED: " + str(o.get("status", ""))[:90], "#f59e0b"))
+    head = f"{o.get('symbol', '')} · {o.get('tf', '')} · {o['side']}" + (f" · {o['grade']} setup" if o.get("grade") else "") + (" · RE-ENTRY" if o.get("re_of") else "")
+    e.append(f"<text x='8' y='18' font-size='14' font-weight='800' fill='#fff'>{escape(head)}</text><text x='8' y='34' font-size='10' fill='#787b86'>Robot trade picture · placed {escape(str(o.get('time', ''))[:16])} UTC · liquidity: {escape(str(o.get('liquidity', '')).replace('_', ' '))}</text>")
+    e.append(f"<text x='8' y='{H - 8}' font-size='12' font-weight='800' fill='{status[1]}'>{escape(status[0])}</text><text x='{W - 8}' y='{H - 8}' font-size='10' fill='#787b86' text-anchor='end'>risk to reward 1:{o.get('rr', '')}</text>")
+    return f"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 {W} {H}' width='100%' style='max-width:100%;height:auto;display:block;border-radius:12px;background:#131722'>{''.join(e)}</svg>"
+
+def snap_save(o, candles):
+    """Draw (or redraw) the picture of one trade. Never allowed to break trading: any problem is just printed."""
+    try:
+        if float(S().get("snapshot_days") or 0) <= 0: return
+        svg = snap_svg(o, candles)
+        if not svg: return
+        now = now_s()
+        db.x("INSERT INTO snaps (skey, symbol, tf, sig_key, created, updated, outcome, side, svg) VALUES (:k, :s, :tf, :sk, :n, :n, :oc, :sd, :svg) "
+             "ON CONFLICT (skey) DO UPDATE SET updated = EXCLUDED.updated, outcome = EXCLUDED.outcome, svg = EXCLUDED.svg",
+             k=snap_key(o["symbol"], o.get("tf") or "", o.get("key")), s=o["symbol"], tf=o.get("tf") or "", sk=str(o.get("key") or "").split("|")[0], n=now, oc=str(o.get("outcome", "")), sd=o["side"], svg=svg)
+    except Exception as ex: print("trade picture failed:", str(ex)[:150])
+
+def snap_have():
+    try: return {r["skey"] for r in db.q("SELECT skey FROM snaps")}
+    except Exception: return set()
+
+def snap_link(o, have):
+    if not o.get("key") or snap_key(o.get("symbol", ""), o.get("tf") or "", o["key"]) not in have: return ""
+    return f" · <a href='/snap/{urllib.parse.quote(o['symbol'], safe='')}/{urllib.parse.quote(o.get('tf') or '-', safe='')}/{urllib.parse.quote(str(o['key']).split('|')[0], safe='-')}'>chart</a>"
+
+@app.route("/snap/<symbol>/<tf>/<path:key>")
+def snap_view(symbol, tf, key):
+    r = db.one("SELECT svg FROM snaps WHERE skey=:k", k=snap_key(symbol, "" if tf == "-" else tf, key))
+    if not r: return layout("Trade chart", "<div class='card' style='max-width:560px'><h2>Chart not available</h2><p class='muted'>Trade pictures are kept for a short time only, then removed to save space.</p></div>"), 404
+    return layout("Trade chart", f"<div class='card' style='max-width:780px'><h2>Robot trade chart</h2>{r['svg']}<p class='muted' style='margin-top:10px'>Blue = entry, red = stop loss, green = take profit, purple = entry order block, yellow circle = liquidity, dark red box = the break of structure.</p></div>")
+
+def _snap_card(s):
+    days = float(s.get("snapshot_days") or 0)
+    if days <= 0: return "<div class='card' id='charts'><h2>Robot trade charts</h2><p class='muted'>Switched off. Set <b>snapshot_days</b> in the settings below to a number above 0 (for example 2) and every new trade gets a picture here.</p></div>"
+    rows = db.q("SELECT skey, symbol, tf, created, updated, outcome, side, svg FROM snaps ORDER BY updated DESC LIMIT 20")
+    total = db.one("SELECT COUNT(*) AS n FROM snaps")["n"]
+    items = "".join(f"<div style='border-top:1px solid #e2e8f0;padding:12px 0'><div style='display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px'>"
+                    f"<b>{escape(r['symbol'])} · {escape(r['tf'])} · {escape(r['side'])} · {escape(r['outcome'])}</b><span class='muted'>placed {escape(str(r['created'])[:16])} UTC</span>"
+                    f"<form action='/admin/snap' method='post' style='display:inline'><input type='hidden' name='op' value='delete'><input type='hidden' name='id' value='{escape(r['skey'])}'><button class='btn' style='padding:4px 10px;font-size:11px;background:#dc2626'>Delete</button></form></div>{r['svg']}</div>" for r in rows)
+    return (f"<div class='card' id='charts'><h2>Robot trade charts ({total})</h2><p class='muted' style='margin-bottom:8px'>A picture of every trade the robot takes: the break of structure, the liquidity, the entry order block, and the entry, stop loss and take profit lines. "
+            f"Pictures are removed automatically {days:g} day(s) after the trade last changed. Change this with <b>snapshot_days</b> in the settings below (0 = do not make pictures).</p>"
+            + ("<form action='/admin/snap' method='post' onsubmit='return confirm(&quot;Delete all trade pictures?&quot;)'><input type='hidden' name='op' value='all'><button class='btn' style='background:#dc2626'>Delete all pictures</button></form>" if total else "")
+            + (items or "<p class='muted' style='margin-top:10px'>No trades yet. A picture appears here as soon as the robot takes a trade.</p>") + (f"<p class='muted'>Showing the latest 20 of {total}.</p>" if total > 20 else "") + "</div>")
+
+
+
+# ======================================================================================================================
+# RE-ENTRY AFTER A SWEEP (max ONE per original setup)
+#   The stop loss was hit (the entry block was swept) but the PROTECTED high/low was NOT broken: the idea is still alive.
+#   The robot then waits INSIDE the same zone for: a new Fair Value Gap, a new order block, a breaker block, or a 5 minute market structure shift in our direction.
+#   The new stop loss goes just beyond THAT new block / gap. If the protected level is ever closed beyond, the idea is dead: no more re-entry on that side.
+# ======================================================================================================================
+def find_reentry(o, c, get5, s):
+    """-> ('dead' | 'wait' | 'found', signal). `o` = the stopped-out signal, `c` = candles of its chart, get5() = 5 minute candles (only fetched when needed)."""
+    bull, sym, prot = o["side"] == "BUY", o["symbol"], o.get("prot")
+    if prot is None or o.get("ob_hi") is None or not c: return "dead", None
+    bt = int(o.get("bos_t") or 0)
+    if any(((x["c"] < prot) if bull else (x["c"] > prot)) for x in c if x["t"] >= bt): return "dead", None      # final invalidation
+    si = next((i for i, x in enumerate(c) if x["t"] == int(o.get("last_t") or 0)), None)                          # the candle that hit the stop loss
+    n = len(c)
+    if si is None or n - 1 - si > int(s.get("reentry_bars") or 48): return "dead", None
+    zlo, zhi = (prot, o["ob_hi"]) if bull else (o["ob_lo"], prot)                                                  # the zone: the entry block up to the protected level
+    pip = pip_size(sym, o["entry"]); buf = float(s.get("sl_buffer_pips") or 0) * pip
+    pct, tf = float(s.get("liq_inside_pct", 70)) / 100, o.get("tf") or s["timeframe"]
+    near = lambda lo, hi: ((hi if bull else lo) if s["ob_entry"] == "top" else (hi + lo) / 2)
+    cands = []
+    def accept(rows, kind, lo, hi, fi, entry, sl, tf_):
+        if inside_frac(lo, hi, zlo, zhi) < pct: return                                                            # must be inside the same zone
+        risk = (entry - sl) if bull else (sl - entry)
+        if risk <= 0: return
+        rp = risk / pip
+        if (float(s.get("max_sl_pips") or 0) and rp > float(s["max_sl_pips"])) or (float(s.get("min_sl_pips") or 0) and rp < float(s["min_sl_pips"])): return
+        room = (o["tp"] - entry) if bull else (entry - o["tp"])
+        if room <= 0 or room / risk < float(s.get("min_rr") or 1.5) - 1e-9: return
+        aft = rows[fi + 1:]
+        if ((any(x["l"] <= entry for x in aft) or rows[-1]["c"] <= entry) if bull else (any(x["h"] >= entry for x in aft) or rows[-1]["c"] >= entry)): return      # already tapped
+        cands.append(dict(kind=kind, lo=lo, hi=hi, t=rows[fi]["t"], entry=entry, sl=sl, rr=round(room / risk, 2), tf=tf_, last_t=rows[-1]["t"], sl_pips=round(rp, 1)))
+    for j in range(si + 2, n):                                                                                     # a) a new Fair Value Gap
+        if bull and c[j - 2]["h"] < c[j]["l"]: lo, hi = c[j - 2]["h"], c[j]["l"]; accept(c, "fvg", lo, hi, j, near(lo, hi), lo - buf, tf)
+        if not bull and c[j - 2]["l"] > c[j]["h"]: lo, hi = c[j]["h"], c[j - 2]["l"]; accept(c, "fvg", lo, hi, j, near(lo, hi), hi + buf, tf)
+    for k in range(si, n - 1):                                                                                     # b) a new order block: an opposing candle that the next candle closes beyond
+        x, nx = c[k], c[k + 1]
+        if bull and x["c"] < x["o"] and nx["c"] > x["h"]: accept(c, "order_block", x["l"], x["h"], k + 1, near(x["l"], x["h"]), x["l"] - buf, tf)
+        if not bull and x["c"] > x["o"] and nx["c"] < x["l"]: accept(c, "order_block", x["l"], x["h"], k + 1, near(x["l"], x["h"]), x["h"] + buf, tf)
+    m = next((i for i in range(si, n) if ((c[i]["c"] > o["ob_hi"]) if bull else (c[i]["c"] < o["ob_lo"]))), None)   # c) a breaker block: the swept block, once price closes back through it
+    if m is not None:
+        ext = min(x["l"] for x in c[si:m + 1]) if bull else max(x["h"] for x in c[si:m + 1])
+        accept(c, "breaker", o["ob_lo"], o["ob_hi"], m, near(o["ob_lo"], o["ob_hi"]), (min(o["ob_lo"], ext) - buf) if bull else (max(o["ob_hi"], ext) + buf), tf)
+    try: c5 = get5()                                                                                               # d) a 5 minute market structure shift back in our direction
+    except Exception: c5 = None
+    if c5 and len(c5) >= 40:
+        g = find_setup(c5, dict(s, swing_n=2, min_leg_atr=0, min_bos=1), "5m", None, sym, o["tp"])
+        if g and g["side"] == o["side"] and g["bos_t"] > c[si]["t"] and inside_frac(g["ob_lo"], g["ob_hi"], zlo, zhi) >= pct:
+            cands.append(dict(kind="mss_5m", lo=g["ob_lo"], hi=g["ob_hi"], t=g["bos_t"], entry=g["entry"], sl=g["sl"], rr=g["rr"], tf="5m", last_t=g["last_t"], sl_pips=g.get("sl_pips")))
+    if not cands: return "wait", None
+    d = max(cands, key=lambda x: x["t"])                                                                           # the newest valid one
+    h = datetime.datetime.utcnow().hour
+    sig = {k: o[k] for k in ("grade", "bias", "tp_limit") if k in o}
+    sig.update(side=o["side"], entry=d["entry"], sl=d["sl"], tp=o["tp"], rr=d["rr"], liquidity="reentry_" + d["kind"], session="Asia" if h < 7 else "London" if h < 13 else "NY" if h < 21 else "Late",
+               bos_run=1, key=f"{o['key']}-re", tf=d["tf"], mitigated_pct=0, last_t=d["last_t"], bos_t=d["t"], ob_hi=d["hi"], ob_lo=d["lo"], ob_t=d["t"], prot=prot,
+               swing_n=(2 if d["tf"] == "5m" else int(o.get("swing_n") or s["swing_n"])), sl_pips=d.get("sl_pips"), re_of=o["key"], score=0)
+    return "found", sig
+
+def try_reentry(o, s, candles):
+    """One stopped-out signal: make its single re-entry signal if one is ready. Returns 1 if a signal was made."""
+    sym, tf, k = o["symbol"], o.get("tf") or s["timeframe"], o.get("key")
+    mk = f"red-{sym}-{k}"
+    if db.one("SELECT 1 AS x FROM seen WHERE k=:k", k=mk): return 0                                                  # already re-entered, or decided it is dead
+    if db.one("SELECT 1 AS x FROM orders WHERE platform='SIGNAL' AND symbol=:s AND outcome IN ('PENDING','OPEN')", s=sym): return 0     # one live signal per market
+    c = candles(sym, tf)
+    st, sig = find_reentry(o, c, lambda: candles(sym, "5m"), s)
+    if st == "dead": seen_new(mk); return 0
+    if st != "found": return 0
+    rows = c if sig["tf"] == tf else candles(sym, sig["tf"])
+    if not setup_fresh(sig, rows, s, strict=True)[0]: return 0
+    if not seen_new(mk): return 0
+    skey = uuid.uuid4().hex[:16]
+    db.x("INSERT INTO sigs (skey, data, created) VALUES (:k, :d, :c)", k=skey, d=json.dumps({"sym": sym, "sig": sig}), c=now_s())
+    so = {"id": uuid.uuid4().hex[:12], "time": now_s(), "account": 0, "platform": "SIGNAL", "symbol": sym, "size": 0, "risk_amount": 0, "outcome": "PENDING", "bars": 0, "status": "LIVE: signal", **sig}
+    insert_order(so)
+    el, ep = elig_sql(s)
+    db.x(f"INSERT INTO jobs (kind, account_id, payload, status, tries, created) SELECT 'place', a.id, :skey, 'new', 0, :now FROM accounts a LEFT JOIN users u ON u.id = a.user_id "
+         f"WHERE a.platform != 'EA' AND {el} AND a.id IN (SELECT o2.account_id FROM orders o2 WHERE o2.symbol = :sym AND o2.sig_key IN (:k1, :k2) AND o2.platform NOT IN ('SIGNAL', 'SYSTEM', 'EA'))",
+         skey=skey, now=now_s(), sym=sym, k1=str(k), k2=str(k) + "|rr", **ep)                                          # only the accounts that took the original trade get the second chance
+    try: snap_save(so, rows)
+    except Exception: pass
+    return 1
+
 _SCAN_BUSY = threading.Lock()
 def run_scan():
     if not _SCAN_BUSY.acquire(blocking=False): return 0
@@ -1149,7 +1403,7 @@ def run_scan():
                 if o["outcome"] == "PENDING":                       # price has not tapped the zone yet
                     ok_, why_ = setup_fresh(o, cs_, s)
                     if not ok_: expire_stale(o, why_); changed = True
-                if changed: save_order_state(o); finish_signal(o)
+                if changed: save_order_state(o); finish_signal(o); snap_save(o, cs_)
             except Exception: pass
         for r in db.q("SELECT * FROM orders WHERE platform='PAPER' AND sig_key LIKE '%|rr' AND outcome IN ('PENDING','OPEN')"):    # 1b) paper orders with their own bigger reward are resolved one by one
             o = row_to_order(r)
@@ -1160,10 +1414,16 @@ def run_scan():
                     if not ok_: expire_stale(o, why_); changed = True
                 if changed: save_order_state(o)
             except Exception: pass
+        if s.get("reentry", True):                                                                                # 1c) second chance after a sweep (protected level still unbroken)
+            for r in db.q("SELECT * FROM orders WHERE platform='SIGNAL' AND outcome='LOSS' AND created > :c ORDER BY created DESC LIMIT 40", c=str(datetime.datetime.utcnow() - datetime.timedelta(days=3))):
+                o = row_to_order(r)
+                if o.get("re_of") or "prot" not in o: continue                                                       # a re-entry never gets another re-entry
+                try: made += try_reentry(o, s, candles)
+                except Exception as e: record_data_error(o["symbol"], "re-entry", e)
         for sym in s["symbols"]:                                                                                  # 2) new setups: read every chart, keep the better one
             found = []
             for tf in s["timeframes"]:
-                try: sg_ = find_setup(candles(sym, tf), s, tf)
+                try: sg_ = find_setup(candles(sym, tf), s, tf, None, sym)
                 except Exception as e: record_data_error(sym, tf, e); continue
                 if not sg_: continue
                 try: ok_, gr_, b_ = grade_setup(sg_, s, sym)
@@ -1179,8 +1439,11 @@ def run_scan():
             if any(str(sig[f]) in s["filters"].get(f, []) for f in s["filters"] if f in sig): continue            # learned filters
             skey = uuid.uuid4().hex[:16]
             db.x("INSERT INTO sigs (skey, data, created) VALUES (:k, :d, :c)", k=skey, d=json.dumps({"sym": sym, "sig": sig}), c=now_s())
-            insert_order({"id": uuid.uuid4().hex[:12], "time": now_s(), "account": 0, "platform": "SIGNAL", "symbol": sym, "size": 0, "risk_amount": 0, "outcome": "PENDING", "bars": 0,
-                          "status": "LIVE: signal", **sig})
+            so = {"id": uuid.uuid4().hex[:12], "time": now_s(), "account": 0, "platform": "SIGNAL", "symbol": sym, "size": 0, "risk_amount": 0, "outcome": "PENDING", "bars": 0,
+                  "status": "LIVE: signal", **sig}
+            insert_order(so)
+            try: snap_save(so, candles(sym, sig["tf"]))                                                            # the picture of this trade
+            except Exception: pass
             el, ep = elig_sql(s)
             plat = "a.platform IN ('MT4','MT5','PAPER')" if is_fx(sym) else "a.platform NOT IN ('MT4','MT5','EA')"
             db.x(f"INSERT INTO jobs (kind, account_id, payload, status, tries, created) SELECT 'place', a.id, :skey, 'new', 0, :now FROM accounts a "
@@ -1236,6 +1499,8 @@ def take_lease(name, owner, ttl):
 def maintenance():
     c = lambda days: str(datetime.datetime.utcnow() - datetime.timedelta(days=days))
     db.x("UPDATE jobs SET status='new' WHERE status='run' AND started < :t", t=c(0.01))        # a worker died mid-job: give it back
+    try: db.x("DELETE FROM snaps WHERE updated < :t", t=c(max(0.0, float(load_settings(fresh=True).get("snapshot_days") or 0))))        # 0 days = nothing is kept
+    except Exception as ex: print("picture clean-up failed:", str(ex)[:100])
     db.x("DELETE FROM seen WHERE t < :t", t=c(30)); db.x("DELETE FROM sigs WHERE created < :t", t=c(7)); db.x("DELETE FROM jobs WHERE status='failed' AND created < :t", t=c(3))
 
 def worker_main():
@@ -1363,7 +1628,7 @@ CONNECT_GUIDE = """
 .plathint{grid-column:1/-1;background:#eff6ff;border:1px solid #bfdbfe;color:#1e3a8a;border-radius:12px;padding:10px 12px;font-size:13px;line-height:1.6}
 </style>
 <div class='card cg' style='max-width:1100px'>
-<h2>How to connect your account</h2>
+<h2>Connect your real account</h2>
 <p class='muted'>Pick ONE way to connect. Tap an option below to see the exact steps and what to type in each box. Not ready to connect anything? <a href='/paper'>Try paper trading</a> first: it is free.</p>
 <div style='overflow-x:auto'><table>
 <tr><th>Option</th><th>What it costs to connect</th><th>Computer must stay on?</th></tr>
@@ -1428,7 +1693,7 @@ sel.addEventListener('change',upd);upd()});
 
 def _connect_guide(s):
     if s.get("paid_mode"):
-        cost = f"Connected accounts need the monthly plan after a {int(s['trial_days'])}-day free trial. {escape(price_line(s))}"
+        cost = ("Connected accounts need the monthly plan" + (f" after a {int(s['trial_days'])}-day free trial" if int(s.get('trial_days') or 0) > 0 else "") + ". " + str(escape(price_line(s))))
     else:
         cost = "Connected accounts are free for now. A monthly plan may be introduced later (paper trading always stays free)."
     return CONNECT_GUIDE.replace("@@COST@@", str(cost))
@@ -1476,12 +1741,12 @@ WELCOME_TPL = """
 <div class='wl-step'><div class='wl-n'>3</div><div><b>Connect your own account when you are ready</b><span>Connecting an account is a paid step, and it is always your choice and your timing.</span></div></div>
 <div class='wl-risk'><b>Important:</b> trading involves risk. You can lose some or all of the money you trade with, so only use money you can afford to lose. Past results do not guarantee future results, and nothing here is financial advice. Use exchange keys with trading permission only and withdrawals switched off.</div>
 <label class='wl-ck'><input type='checkbox' id='wlck'><span>I have read this and I understand the risks of trading.</span></label>
-<button type='button' class='btn wl-off' id='wlgo'>Start paper trading</button>
+<button type='button' class='btn wl-off' id='wlgo'>Start paper trading</button><button type='button' class='btn wl-off' id='wlgo2' style='margin-top:8px;background:#0f172a'>Connect my real account</button>
 </div></div></div>
 <script>
 (function(){var o=document.getElementById('wlc'),c=document.getElementById('wlck'),b=document.getElementById('wlgo');
 document.body.style.overflow='hidden';
-c.onchange=function(){b.className=c.checked?'btn':'btn wl-off'};
+var b2=document.getElementById('wlgo2');c.onchange=function(){b.className=c.checked?'btn':'btn wl-off';b2.className=c.checked?'btn':'btn wl-off';if(c.checked)b2.style.background='#0f172a'};b2.onclick=function(){if(!c.checked)return;o.style.display='none';document.body.style.overflow='';location.href='/setup'};
 b.onclick=function(){if(!c.checked)return;o.style.display='none';document.body.style.overflow='';
 location.href='/paper'};})();
 </script>
@@ -1505,10 +1770,10 @@ def _pay_notice(where, val):
 def layout(title, body):
     name = escape(S()["site_name"]); u = cur_user(); welcome = _welcome_html(name) if session.pop("welcome", None) else ""
     if u: body = _pay_notice("p.user_id=:v", u["id"]) + body
-    nav = [("/", "HOME"), ("/paper", "PAPER TRADING"), ("/setup", "SETUP"), ("/performance", "PERFORMANCE"), ("/orders", "SIGNALS"), ("/status", "MY ACCOUNT")]
+    nav = [("/", "HOME"), ("/setup", "CONNECT REAL ACCOUNT"), ("/paper", "PAPER TRADING"), ("/performance", "PERFORMANCE"), ("/orders", "SIGNALS"), ("/status", "MY ACCOUNT")]
     nav += [("/logout", "LOG OUT")] if u else [("/signup", "SIGN UP / LOG IN")]
     nav += [("/admin", "ADMIN")]
-    links = "".join(f"<a href='{h}'{' class=\"hot\"' if h == '/paper' else ''}>{t}</a>" for h, t in nav)
+    links = "".join(f"<a href='{h}'{' class=\"hot\"' if h in ('/paper', '/setup') else ''}>{t}</a>" for h, t in nav)
     return (f"<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>{escape(title)} · {name}</title>"
             f"<link rel='preconnect' href='https://fonts.googleapis.com'><link href='https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap' rel='stylesheet'>"
             f"<link rel='manifest' href='/manifest.webmanifest'><meta name='theme-color' content='#2563eb'><meta name='mobile-web-app-capable' content='yes'><meta name='apple-mobile-web-app-capable' content='yes'><meta name='apple-mobile-web-app-title' content='{name}'><link rel='apple-touch-icon' href='/icon-192.png'><style>{CSS}</style></head><body><div class='nav'><a class='logo' href='/'><span class='mark'>{LOGO_SVG}</span>{name}</a><div class='links'>{links}</div></div>{body}"
@@ -1596,6 +1861,14 @@ def admin_only(f):
         if not admin_ok(): return redirect("/admin")
         return f(*a, **k)
     w.__name__ = f.__name__; return w
+
+@app.route("/admin/snap", methods=["POST"])
+@admin_only
+def admin_snap():
+    op = request.form.get("op", "")
+    if op == "all": db.x("DELETE FROM snaps"); _flash("All trade pictures deleted.")
+    elif op == "delete": db.x("DELETE FROM snaps WHERE skey=:k", k=request.form.get("id", "")); _flash("Picture deleted.")
+    return redirect("/admin#charts")
 
 def _warnings(s):
     w = []
@@ -1706,7 +1979,7 @@ def _hero_chart(rr=2.0):
     SL = protected low (bottom of the leg) -> liquidity = last order block before the BOS ->
     ENTRY = top of the order block BELOW the liquidity (so entry sits between liquidity and SL) -> TP = 1:RR."""
     T, X0, DX, W = 16.0, 20, 26, 14
-    SL_Y, EN_Y = 250, 200
+    SL_Y, EN_Y = 234, 200
     TP_Y = max(EN_Y - rr * (SL_Y - EN_Y), 22)
     # candles as (open_y, close_y, high_y, low_y); smaller y = higher price
     C = [(238, 228, 224, 250), (202, 222, 200, 226), (222, 186, 182, 226), (188, 166, 162, 192), (166, 178, 162, 182), (176, 146, 142, 180),
@@ -1810,10 +2083,10 @@ HOME_TPL = """
 <section class='hero'><div class='orb o1'></div><div class='orb o2'></div>
 <div class='in'>
  <div>
-  <span class='badge'><span class='dot'></span>SCANNING THE MARKET · PAPER OR LIVE</span>
+  <span class='badge'><span class='dot'></span>TRADES YOUR REAL ACCOUNT · OR PRACTICE FOR FREE</span>
   <h1><span class='grad'>@@NAME@@</span><br>@@TAGLINE@@</h1>
   <p class='lead'>@@LEAD@@</p>
-  <div class='cta'><a class='btn' href='/paper'>TRY PAPER TRADING FREE →</a><a class='btn ghost' href='/setup'>CONNECT ACCOUNT</a><a class='btn ghost' href='/performance'>VIEW PERFORMANCE</a></div>
+  <div class='cta'><a class='btn' href='@@CONNECT@@'>CONNECT YOUR REAL ACCOUNT →</a><a class='btn ghost' href='/paper'>TRY PAPER TRADING FREE</a><a class='btn ghost' href='/performance'>VIEW PERFORMANCE</a></div>
   <div class='kpis'>
    <div class='kpi'><b data-to='@@TRADES@@'>0</b><span>Closed trades · @@TFK@@</span></div>
    <div class='kpi'><b data-to='@@WIN@@' data-dec='1' data-suf='%'>0</b><span>Win rate · @@TFK@@</span></div>
@@ -1833,10 +2106,15 @@ HOME_TPL = """
  <div class='step' style='animation-delay:.05s'><div class='n'>01</div><h3>Break of Structure</h3><p>Reads the @@TF@@ and confirms the trend from consecutive major breaks of structure.</p></div>
  <div class='step' style='animation-delay:.15s'><div class='n'>02</div><h3>Finds the liquidity</h3><p>Marks the last order block or wick inside the latest break, where the big money sits.</p></div>
  <div class='step' style='animation-delay:.25s'><div class='n'>03</div><h3>Precise entry</h3><p>Places a limit order at the order block below (or above) that liquidity zone.</p></div>
- <div class='step' style='animation-delay:.35s'><div class='n'>04</div><h3>Risk managed</h3><p>Stop loss at the protected low or high, take profit at 1:@@RR@@, sized to risk only @@RISK@@% per trade.</p></div>
+ <div class='step' style='animation-delay:.35s'><div class='n'>04</div><h3>Risk managed</h3><p>Stop loss just beyond the entry order block, take profit at the next swing point (at least 1:1.5), sized to risk only @@RISK@@% per trade.</p></div>
+</div></div>
+<div class='sec' style='margin-top:30px'><h2>Two ways to use the robot</h2><p class='sub'>Trade your own money with the robot, or learn with practice money first.</p>
+<div class='steps'>
+ <div class='step' style='border:2px solid #2563eb'><div class='n'>💼</div><h3>Connect your real account</h3><p>Link your Binance, Bybit, OKX or Bitget account, your MT4 / MT5 broker account, or MT5 on your own computer (EA). The robot then places the trades for you, with the entry, stop loss and take profit set by its rules.</p><p style='margin-top:12px'><a class='btn' href='@@CONNECT@@'>CONNECT YOUR REAL ACCOUNT →</a></p></div>
+ <div class='step'><div class='n'>🧪</div><h3>Practice with paper trading</h3><p>Free. The robot trades the real market with practice money so you can watch every trade and judge the results before you risk anything.</p><p style='margin-top:12px'><a class='btn' style='background:#0f172a' href='/paper'>START PAPER TRADING</a></p></div>
 </div></div>
 <div class='card'><h3>Strategy rules</h3><pre>@@STRAT@@</pre></div>
-<div class='band'><h2>Start with paper trading, connect your account when you trust it</h2><p>Paper trading is free: watch the robot trade the real market with practice money and judge the results yourself.</p><a class='btn' href='/paper'>START PAPER TRADING →</a></div>
+<div class='band'><h2>Ready to let the robot trade your real account?</h2><p>Connect your exchange or MT4 / MT5 account and the robot follows its rules for you, 24/7. Not sure yet? Paper trading is free.</p><a class='btn' href='@@CONNECT@@'>CONNECT YOUR REAL ACCOUNT →</a> <a class='btn' style='background:transparent;color:#fff;border:1px solid rgba(255,255,255,.6)' href='/paper'>TRY PAPER TRADING</a></div>
 <script>
 (function(){var reduce=window.matchMedia&&matchMedia('(prefers-reduced-motion: reduce)').matches;
 document.querySelectorAll('[data-to]').forEach(function(el){var to=parseFloat(el.dataset.to)||0,dec=+(el.dataset.dec||0),suf=el.dataset.suf||'',pre=el.dataset.pre||'';
@@ -1857,7 +2135,7 @@ def home():
            "@@TRADES@@": str(p["trades"]), "@@WIN@@": str(p["win_rate"]), "@@TOTALR@@": str(p["total_r"]),
            "@@PRE@@": "+" if p["total_r"] >= 0 else "", "@@NPLAT@@": str(len(s["platforms"])), "@@CHART@@": _hero_chart(s["rr"]),
            "@@META@@": str(escape(f"{' / '.join(s['timeframes'])} · {', '.join(s['symbols'])}")), "@@PLATS@@": "".join(f"<span>{escape(x)}</span>" for x in s["platforms"]) * 3,
-           "@@STRAT@@": str(escape(s["strategy_text"])), "@@TAGLINE@@": str(escape(s["tagline"])), "@@LEAD@@": str(escape(s["lead"]))}
+           "@@CONNECT@@": "/setup" if cur_user() else "/signup?next=/setup", "@@STRAT@@": str(escape(s["strategy_text"])), "@@TAGLINE@@": str(escape(s["tagline"])), "@@LEAD@@": str(escape(s["lead"]))}
     html = HOME_TPL
     for k, v in rep.items(): html = html.replace(k, v)
     return layout("Home", html)
@@ -1957,8 +2235,8 @@ def setup():
     who = (f"<p class='muted'>Signed in as <b>{escape(u['email'])}</b>. <a href='/status'>See my accounts</a></p>" if u else
            ("<p class='muted'><a href='/signup?next=/setup'>Sign up</a> or <a href='/login?next=/setup'>log in</a> to link accounts to your profile (recommended).</p>"))
     money = ("<p class='muted' style='margin:6px 0'><b>Pricing:</b> <a href='/paper'>paper trading</a> is free forever. Connecting your own account "
-             + (f"needs a monthly plan after a {int(s['trial_days'])}-day free trial. {escape(price_line(s))}" if s["paid_mode"] else "is free for now; a monthly plan may be introduced later (paper trading stays free).") + "</p>")
-    return layout("Setup", f"""{_connect_guide(s)}<div class='card'><h2>Connect an account</h2>{who}{money}
+             + (("needs a monthly plan" + (f" after a {int(s['trial_days'])}-day free trial" if int(s.get('trial_days') or 0) > 0 else "") + ". " + str(escape(price_line(s)))) if s["paid_mode"] else "is free for now; a monthly plan may be introduced later (paper trading stays free).") + "</p>")
+    return layout("Setup", f"""{_connect_guide(s)}<div class='card'><h2>Connect your real account</h2>{who}{money}
 <form action='/save_account' method='post' class='grid'>
 <div><label>Platform</label><select class='input' name='platform'>{plats}</select></div>
 <div><label>Chart (only the EA option needs a fixed chart; every other platform uses both charts automatically)</label><select class='input' name='tf' required>{tfopts}</select></div>
@@ -2173,8 +2451,13 @@ def render_account(a, key="", note=""):
     mine = [row_to_order(r) for r in db.q("SELECT * FROM orders WHERE account_id=:a ORDER BY created DESC LIMIT 200", a=a["id"])]
     p = perf(mine); tr = f"{p['total_r']:+}R"
     box = lambda l, v: f"<div style='border:1px solid #e2e8f0;border-radius:12px;padding:12px'><div class='muted'>{l}</div><div style='font-size:22px;font-weight:800'>{v}</div></div>"
-    rows = "".join(f"<div style='padding:8px;border-bottom:1px solid #f1f5f9;font-size:12px'>{escape(o.get('time', '')[:16])} · {escape(o.get('symbol', ''))} {escape(o.get('side', ''))} · E {o['entry']:.6g} SL {o['sl']:.6g} TP {o['tp']:.6g} · <b>{escape(o.get('outcome', ''))}</b> {escape(str(o.get('status', '')))}</div>"
-                   for o in mine[:10] if "entry" in o) or "<p class='muted'>No trades yet. The robot only trades when its pattern appears.</p>"
+    have = snap_have()
+    rows = "".join(f"<div style='padding:8px;border-bottom:1px solid #f1f5f9;font-size:12px'>{escape(o.get('time', '')[:16])} · {escape(o.get('symbol', ''))} {escape(o.get('side', ''))} · E {o['entry']:.6g} SL {o['sl']:.6g} TP {o['tp']:.6g} · <b>{escape(o.get('outcome', ''))}</b> {escape(str(o.get('status', '')))}{snap_link(o, have)}</div>"
+                   for o in mine[:10] if "entry" in o)
+    lv_ = next((o for o in mine if o.get("outcome") in ("PENDING", "OPEN") and "entry" in o), None)
+    live_b = (f"<div style='border:2px solid #16a34a;background:#f0fdf4;border-radius:14px;padding:12px;margin:10px 0'><b style='color:#15803d'>🤖 The robot is trading for you now</b>"
+              f"<p style='margin:6px 0;font-size:13px'>{escape(lv_['side'])} {escape(lv_['symbol'])} · entry {lv_['entry']:.6g} · stop loss {lv_['sl']:.6g} · take profit {lv_['tp']:.6g} · "
+              f"{'the trade is open' if lv_.get('outcome') == 'OPEN' else 'waiting for price to reach the entry'}{snap_link(lv_, have)}</p></div>") if lv_ else "" or "<p class='muted'>No trades yet. The robot only trades when its pattern appears.</p>"
     pay = f"<p style='margin:8px 0'>{tier_badge(a)}</p><p style='margin:8px 0'><b style='color:{'#16a34a' if ok else '#dc2626'}'>Plan: {escape(txt)}</b></p>"
     if a["tier"] == "real" and s["paid_mode"] and not (ok and txt.startswith("Free access")):
         hid_ = f"<input type='hidden' name='key' value='{escape(key)}'>" if key else ""
@@ -2225,7 +2508,7 @@ def render_account(a, key="", note=""):
              "<li>Install MetaTrader 5 and log in to your broker account (the account you want the robot to trade).</li><li>Use <b>New EA key + code</b> above to get the code. In MT5 press F4 (MetaEditor), File, New, Expert Advisor (template), name it ISIG_EA, select all, paste, press F7: 0 errors.</li>"
              f"<li>In MT5: Tools, Options, Expert Advisors. Tick Allow WebRequest and add <b>{escape(request.host_url.rstrip('/'))}</b></li>"
              "<li>Open a chart of your pair on the timeframe you chose, drag ISIG_EA onto it, tick Allow Algo Trading, press OK, and turn on the Algo Trading button.</li></ol></details>") if ee else ""
-    body = (f"<div class='card' style='max-width:760px'><h2>Account #{a['id']} · {escape(a['platform'])}</h2><p style='margin:8px 0'>{badge}</p>{pn_}{notebar}"
+    body = (f"<div class='card' style='max-width:760px'><h2>Account #{a['id']} · {escape(a['platform'])}</h2><p style='margin:8px 0'>{badge}</p>{pn_}{notebar}{live_b}"
             f"<p class='muted'>Balance: {a['balance']:,.2f} · risk per trade {eff}% · target 1:{s['rr']} · {('chart ' + escape(a['tf'])) if a['platform'] == 'EA' else 'reads 30m + 1h, takes the better setup'}{(' · max ' + str(s['max_trades_per_day']) + ' trades per day') if s.get('max_trades_per_day') else ''}</p><p class='muted' style='margin:6px 0 12px'>Mode: {escape(mode)}</p>{trade}{pay}{tfform if a['platform'] == 'EA' else ''}{pairsform}{riskform}{sizeform}{btns}{guide}</div>"
             f"<div class='card' style='max-width:760px'><h3>My results</h3><div class='grid'>{box('Closed trades', p['trades'])}{box('Win rate', str(p['win_rate']) + '%')}{box('Total result', tr)}</div>"
             f"{profile_tables(mine, *((lambda c_: (c_[1], c_[0]))(acc_cur(a))) if pp else (1.0, ''))}<h3 style='margin-top:14px'>My latest trades</h3>{rows}</div>")
@@ -2400,12 +2683,12 @@ def _ea_sync(s, head, rows, placed, failed, sym):
             if o["outcome"] == "PENDING" and "entry" in o:        # not tapped yet: cancel it if the setup is no longer fresh
                 ok_, why_ = setup_fresh(o, rows, s)
                 if not ok_: expire_stale(o, why_); save_order_state(o)
-        sig = cached_setup(rows, s, tf)
+        sig = cached_setup(rows, s, tf, None, sym)
         if sig and okk and not paused and seen_new(f"ea:{a['id']}:{sym}-{sig['key']}"):                                  # a setup missed while the plan was inactive is not marked as seen
             skip = any(str(sig[f]) in s["filters"].get(f, []) for f in s["filters"] if f in sig)
             busy = db.one("SELECT 1 AS x FROM orders WHERE account_id=:a AND symbol=:s AND tf=:t AND outcome IN ('PENDING','OPEN')", a=a["id"], s=sym, t=tf)
             if not skip and not busy and not daily_cap_reached(a["id"], s):
-                o_ = place_order(a, sig, sym, s); insert_order(o_)
+                o_ = place_order(a, sig, sym, s); insert_order(o_); snap_save(o_, rows)
                 if over_cap_after_insert(o_, s): cancel_order_now(o_, "daily trade limit reached")
     poll = max(10, int(s["ea_poll_seconds"])); poll += int(kh[:4], 16) % max(5, poll // 4)                 # spread the EAs out so they do not all call at once
     out = [f"OK live", f"NEXT|{poll}", f"TIER|{a['tier']}|{a['tier_note']}"]
@@ -2546,7 +2829,7 @@ def live_market(symbol, tf):
             nowms, w = time.time() * 1000, TF_MS(tf)
             closed = [c for c in rows if c["t"] + w <= nowms]; forming = next((c for c in rows if c["t"] + w > nowms), None)
         if not closed: raise RuntimeError("no price data received")
-        w_ = []; sig = cached_setup(closed, S(), tf, w_) if len(closed) >= 30 else None
+        w_ = []; sig = cached_setup(closed, S(), tf, w_, symbol) if len(closed) >= 30 else None
         if len(closed) < 30: w_.append("not enough candles loaded yet")
         return {"closed": closed[-120:], "forming": forming, "setup": sig, "why": (w_[0] if w_ else ""), "cv": int(time.time() * 1000)}
     return _shared(_MK, (symbol, tf), MK_TTL, build)
@@ -2869,7 +3152,7 @@ PAPER_TPL = """
     <div style='margin-top:10px'>@@PAIRS@@</div>
     <label style='display:block;margin-top:10px'>Risk per trade, in percent (maximum @@CAP@@%)</label><input class='input' id='prisk' name='risk' type='number' step='0.1' min='0.1' max='@@CAP@@' value='@@RISK@@' required>
     <label style='display:block;margin-top:10px'>Reward on A+ setups: 1 : (from @@RRMIN@@ to @@RRMAX@@)</label><input class='input' name='rr' type='number' step='0.1' min='@@RRMIN@@' max='@@RRMAX@@' value='@@RRV@@' required>
-    <p class='muted'>A+ means the setup goes the same way as the present Daily and Weekly leg. On those you can ask for more than 1:@@RRMIN@@. The take profit is never allowed to reach the Daily level that would form a new BOS, so a setup may give less than you ask for. Every setup puts its take profit at the present low (sells) or present high (buys) of the move, and never less than 1:@@RRMIN@@.</p>
+    <p class='muted'>A+ means the setup goes the same way as the present Daily and Weekly leg. On those you can ask for more than 1:@@RRMIN@@. The take profit is never allowed to reach the Daily level that would form a new BOS, so a setup may give less than you ask for. Every setup puts its take profit at the present low (sells) or present high (buys) of the move, and the robot only takes the setup when that gives at least 1:@@MINRR@@.</p>
     <p class='muted'>The robot reads the 30 minute and the 1 hour chart on every pair and takes the clearer setup. It takes at most @@MAXT@@ trades a day on your account and uses the same rules for everybody.</p>
     <button class='btn'>@@BTN@@</button></form>@@STOP@@
    <div id='rbox' style='display:none;margin-top:12px'><p style='color:#dc2626;font-weight:700;margin-bottom:8px'>Your practice money has run out.</p>
@@ -3140,7 +3423,7 @@ def paper_page():
                       "<p class='muted'>Your balance is shown in this currency, converted at today's exchange rate.</p>" % (curopts(cur_), escape(cur_), format(mn_ * fx_, ",.0f"), mn_ * fx_, bal))
     cfg = json.dumps({"symbol": sym, "tf": tf, "tfms": TF_MS(tf), "logged": bool(u), "cur": cur_, "rates": rates, "min_usd": mn_, "def_usd": df_, "newacc": not acc}).replace("</", "<\\/")
     rep = {"@@BANNER@@": banner, "@@SYMOPTS@@": opt(syms, sym), "@@TFPILLS@@": pills, 
-           "@@RRMIN@@": ("%g" % float(s["rr"])), "@@RRMAX@@": ("%g" % float(s["max_rr"])), "@@RRV@@": ("%g" % float((acc.get("rr_aplus") if acc and acc.get("rr_aplus") else s["rr"]))),
+           "@@MINRR@@": ("%g" % float(s.get("min_rr") or 1.5)), "@@RRMIN@@": ("%g" % float(s["rr"])), "@@RRMAX@@": ("%g" % float(s["max_rr"])), "@@RRV@@": ("%g" % float((acc.get("rr_aplus") if acc and acc.get("rr_aplus") else s["rr"]))),
            "@@STATE@@": state, "@@BALFIELD@@": balfield, "@@PAIRS@@": pairs_form(acc or {"pairs": sym, "platform": "PAPER"}, s, "/paper/start"), "@@DEF@@": format(df_ * fx_, ",.0f"), "@@CUR@@": str(escape(cur_)), "@@RCUR@@": curopts(cur_), "@@RISK@@": str(rp), "@@CAP@@": str(cap), "@@MAXT@@": str(int(s.get("max_trades_per_day") or 0) or "any number of"),
            "@@BTN@@": "SAVE AND START" if acc else "START PAPER TRADING", "@@STOP@@": stop, "@@RESULTS@@": results, "@@CFG@@": cfg}
     html = PAPER_TPL
@@ -3151,7 +3434,8 @@ def paper_page():
 def orders():
     rows = [row_to_order(r) for r in db.q("SELECT * FROM orders WHERE platform='SIGNAL' ORDER BY created DESC LIMIT 40")]
     n = db.one("SELECT COUNT(*) AS n FROM track")["n"]
-    def row(r): return f"<div style='padding:8px;border-bottom:1px solid #f1f5f9;font-size:12px'>{escape(r.get('time', '')[:16])} · {escape(r.get('symbol', ''))} {escape(r.get('side', ''))} {escape(r.get('tf', ''))} · E {r['entry']:.6g} SL {r['sl']:.6g} TP {r['tp']:.6g} · <b>{escape(r.get('outcome', ''))}</b></div>"
+    have = snap_have()
+    def row(r): return f"<div style='padding:8px;border-bottom:1px solid #f1f5f9;font-size:12px'>{escape(r.get('time', '')[:16])} · {escape(r.get('symbol', ''))} {escape(r.get('side', ''))} {escape(r.get('tf', ''))} · E {r['entry']:.6g} SL {r['sl']:.6g} TP {r['tp']:.6g} · <b>{escape(r.get('outcome', ''))}</b>{snap_link(r, have)}</div>"
     return layout("Signals", f"<div class='card'><h2>Latest signals</h2><p class='muted'>{n} resolved signals</p>{''.join(row(r) for r in rows) or '<p class=muted>No signals yet.</p>'}</div>")
 
 # ======================================================================================================================
@@ -3352,7 +3636,7 @@ def _admin_page(s):
 <div style='grid-column:1/-1'><label>Homepage description</label><textarea class='input' name='lead' rows='3' maxlength='400'>{escape(s['lead'])}</textarea></div>
 <div><button class='btn'>Save branding</button></div></form></div>"""
     access = ("<div class='card'><h2>Sign-up &amp; monetization</h2><p class='muted' style='margin-bottom:10px'>Switch these on when you are ready. They apply to every account straight away. <b>Paper trading is always free.</b> "
-              "Switching on \"Charge for connected accounts\" gives everyone with a connected account a fresh free trial first, so nobody is cut off without notice.</p><form action='/admin/save' method='post' class='grid'>"
+              "If you also set a free trial (days above 0), switching on \"Charge for connected accounts\" gives everyone with a connected account a fresh free trial first. With 0 days there is no trial and no trial wording anywhere.</p><form action='/admin/save' method='post' class='grid'>"
               f"<div><label>Require sign-up (no account can be added without logging in)</label>{_onoff(s, 'require_signup')}</div><div><label>Gmail addresses only</label>{_onoff(s, 'gmail_only')}</div>"
               f"<div><label>Block old accounts that were never linked to a sign-up</label>{_onoff(s, 'block_unlinked')}</div><div><label>Max users (0 = no limit)</label>{_inp(s, 'max_users', 'number')}</div>"
               f"<div><label>Max accounts per user (0 = no limit)</label>{_inp(s, 'max_accounts_per_user', 'number')}</div>"
@@ -3382,7 +3666,7 @@ def _admin_page(s):
     def urow(u):
         return (f"<div style='border-top:1px solid #e2e8f0;padding:8px 0;font-size:13px'><b>#{u['id']}</b> {escape(u['email'])} · {u['n']} accounts · joined {escape(str(u['created'])[:10])}"
                 f"{' · <b style=color:#dc2626>BANNED</b>' if u['blocked'] else ''} · <a href='/admin?user={u['id']}'>accounts</a><br>"
-                + (ubtn(u["id"], "unban", "Unban") if u["blocked"] else ubtn(u["id"], "ban", "Ban", "background:#dc2626")) + ubtn(u["id"], "resetpw", "Reset password") + ubtn(u["id"], "free", "Free access (all)") + ubtn(u["id"], "trial", "Restart trial")
+                + (ubtn(u["id"], "unban", "Unban") if u["blocked"] else ubtn(u["id"], "ban", "Ban", "background:#dc2626")) + ubtn(u["id"], "resetpw", "Reset password") + ubtn(u["id"], "free", "Free access (all)") + (ubtn(u["id"], "trial", "Restart trial") if int(s.get("trial_days") or 0) > 0 else "")
                 + ubtn(u["id"], "delete", "Delete user", "background:#dc2626", " onsubmit='return confirm(&quot;Delete this user and all their accounts?&quot;)'") + "</div>")
     nav = (f"<p style='margin-top:10px'>" + (f"<a href='{ids}&page={page - 1}'>← newer</a> " if page else "") + (f"<a href='{ids}&page={page + 1}'>older →</a>" if len(urows) > per else "") + "</p>")
     users = (f"<div class='card'><h2>Users</h2><form method='get' action='/admin' style='display:flex;gap:8px;margin:8px 0'><input class='input' name='q' value='{escape(q)}' placeholder='Search by email'><button class='btn'>Search</button></form>"
@@ -3419,7 +3703,7 @@ def _admin_page(s):
                  f"<form action='/admin/lesson_delete/{escape(j['id'])}' method='post' onsubmit='return confirm(&quot;Delete this lesson?&quot;)'><button class='btn' style='padding:4px 10px;font-size:11px;background:#dc2626'>Delete lesson</button></form></div>"
                  for j in (json.loads(r["data"]) for r in db.q("SELECT data FROM journal ORDER BY created DESC LIMIT 30")))
     errs = "".join(f"<div class='muted'>{escape(r['created'][:16])} · {escape(r['symbol'])} · {escape(r['status'])}</div>" for r in db.q("SELECT created, symbol, status FROM orders WHERE platform='SYSTEM' ORDER BY created DESC LIMIT 5"))
-    return layout("Admin", f"""{msg}{_warnings(s)}{dash}{_pay_card(s)}{brand}{access}{scale}{users}{accts}<div class='card'><h2>1. Settings</h2><form action='/admin/save' method='post' class='grid'>{fields}
+    return layout("Admin", f"""{msg}{_warnings(s)}{dash}{_snap_card(s)}{_pay_card(s)}{brand}{access}{scale}{users}{accts}<div class='card'><h2>1. Settings</h2><form action='/admin/save' method='post' class='grid'>{fields}
 <div><button class='btn'>Save settings</button></div></form>
 <p class='muted' style='margin-top:8px'>Lists/filters are JSON. Example filter: {{"session": ["Asia"]}}</p>{errs}
 <form action='/admin/scan' method='post' style='margin-top:10px'><button class='btn' style='background:#0f172a'>Run scan now</button></form></div>
@@ -3464,6 +3748,12 @@ def admin_save():
             if k == "ea_poll_seconds": new = min(600, max(10, new))
             if k == "max_inflight": new = min(5000, max(10, new))
             if k == "max_trades_per_day": new = min(100, max(0, new))
+            if k == "snapshot_days": new = min(30.0, max(0.0, new))
+            if k in ("sl_buffer_pips", "min_sl_pips"): new = min(100.0, max(0.0, new))
+            if k == "max_sl_pips": new = min(1000.0, max(0.0, new))
+            if k == "min_rr": new = min(10.0, max(0.5, new))
+            if k in ("liq_inside_pct", "ob_gap_pct"): new = min(100.0, max(0.0, new))
+            if k == "reentry_bars": new = min(500, max(1, new))
             if k == "symbols":
                 new = [(str(x).strip().upper() if str(x).strip().upper().endswith("USDT") else str(x).strip()) for x in new if re.fullmatch(r"[A-Za-z0-9._#]{3,14}", str(x).strip())][:40]
                 new = list(dict.fromkeys(new))
@@ -3479,7 +3769,7 @@ def admin_save():
         except Exception: pass
     s["paper_default_balance"] = max(float(s["paper_default_balance"]), float(s["paper_min_balance"]))      # a reset must always give at least the minimum
     save_settings(s)
-    if s["paid_mode"] and not was_paid:                                               # monetisation just switched on: everyone gets a fresh trial first
+    if s["paid_mode"] and not was_paid and int(s.get("trial_days") or 0) > 0:         # monetisation just switched on AND a trial is set: everyone gets a fresh trial first
         d = str(today() + datetime.timedelta(days=int(s["trial_days"])))
         db.x("UPDATE users SET trial_end=:d", d=d); db.x("UPDATE accounts SET trial_end=:d WHERE user_id IS NULL", d=d)
         _flash(f"Saved. Charging for connected accounts is ON: every connected account has a free trial until {d}. Paper trading stays free.")
