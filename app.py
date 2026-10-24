@@ -49,7 +49,10 @@ DEFAULTS = {
     "sl_buffer_pips": 2.5,          # stop loss = entry order block high/low plus this many pips (2-3)
     "max_sl_pips": 40.0,            # skip the trade when the stop loss would be bigger than this (0 = no limit). Gold / crypto: a "pip" is the same % of price as a forex pip
     "min_sl_pips": 3.0,             # skip the trade when the stop loss would be smaller than this (0 = no limit)
-    "min_rr": 2.0,                  # the reward is never smaller than this (1:x): when the present low / high gives less, the take profit is extended to this
+    "min_rr": 1.0,                  # the reward is never smaller than this (1:x): when the present low / high gives less, the take profit is extended to this
+    "bos_supersede_pct": 50,        # a NEWER break of structure replaces the waiting order when its leg is at least this % as wide as the older one (smaller ones are just the move continuing)
+    "min_leg_bars": 8,              # a MAJOR break of structure must also be WIDE: at least this many candles from the start of its leg to the breaking candle
+    "bos_max_age_bars": 120,        # ... and recent: the breaking candle must be no older than this many candles (0 = no limit)
     "reentry_min_rr": 1.5,          # a re-entry keeps the original target, so it only needs this reward (1:x)
     "bot_max_rr": 3.0,              # ... and never bigger than this: when the present low / high gives more, the take profit is cut to this
     "bos_body_pct": 50.0,           # the candle that breaks the structure must have a body of at least this % of its range; a weaker (wick-like) break needs one more candle closing beyond, and then pays exactly the minimum reward
@@ -79,7 +82,7 @@ DEFAULTS = {
     "strategy_text": "Trade only in the direction of the Daily present leg (bullish = buys only, bearish = sells only); the other way only on the second break of structure on the 30m / 1h chart. "
                      "Only a major break of structure counts (a big, clear leg). Liquidity = the last order block (or, if there is none, the last pullback wick) right before the breakout; it must be at least 70% inside the break of structure. "
                      "Entry = the nearest valid order block further back than the liquidity: above it for sells, below it for buys, also at least 70% inside the break. The liquidity may touch the block a little; a block is skipped only when the liquidity or price has covered 50% or more of it, and then the next block is used. "
-                     "SL = just beyond the entry order block (2-3 pips); the protected high/low only says the idea is dead if price closes beyond it. Skip if the stop is over 40 pips. TP = the present low for sells / present high for buys (the level that would form a new break of structure), with the reward kept between 1:2 and 1:3 (extended to 1:2 if smaller, cut to 1:3 if bigger). A break whose candle is mostly a wick needs one more candle closing beyond and pays 1:2. When the 30m and 1h both have a setup the 1h is traded, entering and placing the stop from the 30m order block. "
+                     "SL = just beyond the entry order block (2-3 pips); the protected high/low only says the idea is dead if price closes beyond it. Skip if the stop is over 40 pips. TP = the present low for sells / present high for buys (the level that would form a new break of structure), with the reward kept between 1:1 and 1:3 (extended to 1:1 if smaller, cut to 1:3 if bigger). A break only counts when a candle CLOSES beyond the level; if that candle is mostly a wick, one more candle must close beyond too, and then the trade pays only 1:1. The major break must be wide as well as tall (the widest valid break of the current move). When the 30m and 1h both have a setup the 1h is traded, entering and placing the stop from the 30m order block. "
                      "If the stop is hit but the protected level is NOT broken, the robot looks for ONE re-entry in the same zone (new FVG, new order block, breaker block, or a 5 minute market structure shift) with a new stop at that new block. If the protected level breaks, the idea is dead.",
 }
 BRAND_KEYS = ("site_name", "tagline", "lead")
@@ -286,6 +289,12 @@ def init_db():
             st_ = json.loads(kv_get("settings", "{}") or "{}")
             st_["min_leg_atr"] = 1.2; st_["min_sl_pips"] = 3.0; kv_set("settings", json.dumps(st_)); kv_set("mig_strategy_v11", "1")
     except Exception: pass
+    try:
+        if not kv_get("mig_strategy_v12"):                            # one time: reward 1:1 to 1:3, the major break must also be wide
+            st_ = json.loads(kv_get("settings", "{}") or "{}")
+            st_.update({"min_rr": 1.0, "bot_max_rr": 3.0, "min_leg_bars": 8, "bos_max_age_bars": 120}); st_.pop("strategy_text", None)
+            kv_set("settings", json.dumps(st_)); kv_set("mig_strategy_v12", "1")
+    except Exception: pass
     try: db.x("ALTER TABLE accounts ADD COLUMN " + ("IF NOT EXISTS " if db.pg else "") + "resets INTEGER NOT NULL DEFAULT 0")          # how many times a paper account was reset (shown for honesty)
     except Exception: pass
     try: db.x("ALTER TABLE accounts ADD COLUMN " + ("IF NOT EXISTS " if db.pg else "") + "rr_aplus DOUBLE PRECISION")                 # reward the person asks for on A+ setups (empty = the normal 1:2)
@@ -465,6 +474,20 @@ def mit_since_leave(c, k, bull):
     L = next((j for j in range(k + 1, len(c)) if ((c[j]["c"] > ob["h"]) if bull else (c[j]["c"] < ob["l"]))), None)
     return 0.0 if L is None else mitigation(c, k, bull, L + 1)
 
+def bos_leg(c, e, n):
+    """The leg of one break of structure: where it started, the protected extreme, its height, the normal candle size before it and how WIDE it is (candles)."""
+    bull = e["dir"] == "bull"
+    bi_, brk = e["i"], e["broken"][0]
+    prior = [j for j in range(n, brk) if _swing(c, j, n, "low" if bull else "high")]
+    st = prior[-1] if prior else max(0, brk - 10)
+    lg = range(st, bi_ + 1)
+    og = min(lg, key=lambda k: c[k]["l"]) if bull else max(lg, key=lambda k: c[k]["h"])
+    pr = c[og]["l"] if bull else c[og]["h"]
+    rg = [x["h"] - x["l"] for x in c[max(0, st - 14):st]]
+    lh = (max(c[k]["h"] for k in lg) - pr) if bull else (pr - min(c[k]["l"] for k in lg))
+    av = (sum(rg) / len(rg)) if len(rg) >= 5 else 0.0
+    return {"e": e, "start": st, "origin": og, "prot": pr, "leg_h": lh, "avg": av, "width": bi_ - st}
+
 def find_setup(c, s, tf=None, why=None, sym=None, tp_fixed=None):
     """The strategy: a break of structure (BOS) -> liquidity = the last order block before the breakout -> entry = the order block BELOW that liquidity (bullish; above it when bearish) -> SL at the protected low/high.
     Returns the setup, or None. If a list is passed as `why`, the reason for saying no is appended to it."""
@@ -477,22 +500,43 @@ def find_setup(c, s, tf=None, why=None, sym=None, tp_fixed=None):
     if len(ev) < min_bos: return no("not enough breaks of structure yet")
     last = ev[-1]
     if any(e["dir"] != last["dir"] for e in ev[-min_bos:]): return no("the last breaks of structure point in different directions")      # no clear trend
-    run = 0
+    bull = last["dir"] == "bull"
+    runev = []
     for e in reversed(ev):
         if e["dir"] != last["dir"]: break
-        run += 1
-    bull, bos_i, broken_i = last["dir"] == "bull", last["i"], last["broken"][0]
+        runev.append(e)
+    runev.reverse(); run = len(runev)
+    # MAJOR break of structure: size is not only the height of the leg but also how WIDE it is (how many candles it took). Among the breaks of the current run (that are recent enough),
+    # every one that is tall enough and wide enough is a candidate and the WIDEST one is the major break; the later breaks are just the move continuing.
+    leg_of = lambda e: bos_leg(c, e, n)
+    max_age, min_w, why_c = int(s.get("bos_max_age_bars") or 0), int(s.get("min_leg_bars") or 0), "the last break of structure is too small to trust"
+    cands = []
+    for e in runev:
+        if max_age and len(c) - 1 - e["i"] > max_age: why_c = "the major break of structure is too old"; continue
+        L = leg_of(e)
+        if s.get("min_leg_atr", 0) and L["avg"] and L["leg_h"] < s["min_leg_atr"] * L["avg"]: why_c = "the break of structure is too small to trust"; continue      # not tall enough
+        if min_w and L["width"] < min_w: why_c = f"the break of structure is too narrow (only {L['width']} candles wide, needs {min_w})"; continue                     # not wide enough
+        cands.append(L)
+    if not cands: return no(why_c)
+    reasons = []
+    wmax = max(x["width"] for x in cands); sup = float(s.get("bos_supersede_pct", 50)) / 100
+    order = sorted([x for x in cands if x["width"] >= sup * wmax], key=lambda x: x["e"]["i"], reverse=True) + sorted([x for x in cands if x["width"] < sup * wmax], key=lambda x: x["width"], reverse=True)
+    for L in order:                                                                                                  # the NEWEST break that is big enough (a new break replaces the old idea); if it gives no trade, the next one is tried
+        w_ = []
+        r_ = _setup_core(c, s, tf, w_.append, sym, tp_fixed, n, bull, run, L)
+        if r_:
+            ok_f, why_f = setup_fresh(r_, c, s, strict=True)                                                           # an idea that a newer break already replaced is not offered again
+            if ok_f or tp_fixed is not None: return r_
+            reasons.append(why_f); continue
+        reasons.append(w_[0] if w_ else why_c)
+    return no(reasons[0] if reasons else why_c)
 
-    prior = [j for j in range(n, broken_i) if _swing(c, j, n, "low" if bull else "high")]
-    start = prior[-1] if prior else max(0, broken_i - 10)
-    leg = range(start, bos_i + 1)                                              # the BOS leg
-    origin = min(leg, key=lambda k: c[k]["l"]) if bull else max(leg, key=lambda k: c[k]["h"])
-    protected = c[origin]["l"] if bull else c[origin]["h"]
-    ranges = [x["h"] - x["l"] for x in c[max(0, start - 14):start]]
-    leg_h = (max(c[k]["h"] for k in leg) - protected) if bull else (protected - min(c[k]["l"] for k in leg))
-    avg_rng = (sum(ranges) / len(ranges)) if len(ranges) >= 5 else 0.0
-    leg_atr = (leg_h / avg_rng) if avg_rng else 0.0                              # how big the BOS leg is compared with the normal candle size
-    if s.get("min_leg_atr", 0) and len(ranges) >= 5 and leg_h < s["min_leg_atr"] * avg_rng: return no("the last break of structure is too small to trust")    # the BOS must be a big, clear move
+def _setup_core(c, s, tf, no_msg, sym, tp_fixed, n, bull, run, L):
+    def no(msg):
+        no_msg(msg); return None
+    last = L["e"]; start, origin, protected, leg_h, avg_rng = L["start"], L["origin"], L["prot"], L["leg_h"], L["avg"]
+    bos_i, broken_i = last["i"], last["broken"][0]
+    leg_atr = (leg_h / avg_rng) if avg_rng else 0.0
 
     bc = c[bos_i]; brng = bc["h"] - bc["l"]
     strong = brng > 0 and abs(bc["c"] - bc["o"]) / brng * 100 >= float(s.get("bos_body_pct", 50)) - 1e-9          # a real body close, not just a wick poking through
@@ -544,7 +588,7 @@ def find_setup(c, s, tf=None, why=None, sym=None, tp_fixed=None):
     # Price has not broken it yet: when it does, that is the new break of structure in the trend's direction. Only taken when the reward is at least min_rr (default 1:1.5).
     ext = tp_fixed if tp_fixed is not None else (max(c[k]["h"] for k in range(start, len(c))) if bull else min(c[k]["l"] for k in range(start, len(c))))
     room = (ext - entry) if bull else (entry - ext)
-    min_rr, max_rr = float(s.get("min_rr") or 2.0), max(float(s.get("min_rr") or 2.0), float(s.get("bot_max_rr") or 3.0))
+    min_rr, max_rr = float(s.get("min_rr") or 1.0), max(float(s.get("min_rr") or 1.0), float(s.get("bot_max_rr") or 3.0))
     if tp_fixed is not None:                                                    # a re-entry keeps the original target; it only needs its own (smaller) minimum reward
         re_min = float(s.get("reentry_min_rr") or 1.5)
         if room <= 0 or room / risk < re_min - 1e-9: return no(f"the target gives only 1:{max(0.0, room / risk):.1f}, less than the minimum 1:{re_min:g}")
@@ -559,7 +603,7 @@ def find_setup(c, s, tf=None, why=None, sym=None, tp_fixed=None):
     if not bull and (any(x["h"] >= entry for x in after) or price >= entry): return no("price already tapped the entry, so that setup is gone")
     h = datetime.datetime.utcnow().hour
     sess = "Asia" if h < 7 else "London" if h < 13 else "NY" if h < 21 else "Late"
-    return {"side": "BUY" if bull else "SELL", "entry": entry, "sl": sl, "tp": tp, "rr": rr, "liquidity": kind,
+    return {"found_t": c[-1]["t"], "leg_w": L["width"], "side": "BUY" if bull else "SELL", "entry": entry, "sl": sl, "tp": tp, "rr": rr, "liquidity": kind,
             "session": sess, "bos_run": min(run, 5), "key": (f"{tf}-" if tf and tf != s["timeframe"] else "") + f"{last['dir']}-{c[bos_i]['t']}", "tf": tf or s["timeframe"], "mitigated_pct": round(100 * mit), "last_t": c[-1]["t"],
             "bos_t": c[bos_i]["t"], "ob_hi": ob["h"], "ob_lo": ob["l"], "ob_t": ob["t"], "liq_t": c[liq]["t"], "leg_t": c[start]["t"], "prot": protected, "ext": ext, "strong": strong, "swing_n": n, "sl_pips": round(rp, 1), "leg_atr": round(leg_atr, 2),
             "score": round(min(leg_atr, 12) + 1.5 * min(run, 5) - mit * 4 + (0.5 if tf == "1h" else 0), 2)}
@@ -890,7 +934,7 @@ def seen_new(k):
 
 # ---------------- setup detection, cached: many users on the same broker send identical candles ----------------
 _SETUP, _SETUP_LOCK = collections.OrderedDict(), threading.Lock()
-SETUP_KEYS = ("swing_n", "min_bos", "rr", "ob_entry", "max_mitigation_pct", "min_leg_atr", "timeframe", "sl_buffer_pips", "max_sl_pips", "min_sl_pips", "min_rr", "liq_inside_pct", "liq_overlap_pct", "bot_max_rr", "bos_body_pct", "reentry_min_rr")
+SETUP_KEYS = ("swing_n", "min_bos", "rr", "ob_entry", "max_mitigation_pct", "min_leg_atr", "timeframe", "sl_buffer_pips", "max_sl_pips", "min_sl_pips", "min_rr", "liq_inside_pct", "liq_overlap_pct", "bot_max_rr", "bos_body_pct", "reentry_min_rr", "min_leg_bars", "bos_max_age_bars", "bos_supersede_pct")
 def cached_setup(rows, s, tf, why=None, sym=None):
     h = hashlib.sha1((str(sym) + tf + json.dumps([s[k] for k in SETUP_KEYS]) + ";".join(f"{x['t']},{x['o']},{x['h']},{x['l']},{x['c']}" for x in rows)).encode()).hexdigest()
     with _SETUP_LOCK:
@@ -1142,14 +1186,14 @@ def bos_time(sig):
     try: return int(str(sig.get("key", "")).rsplit("-", 1)[1])
     except Exception: return 0
 
-def _event_times(c, n):
+def _event_times(c, n, with_dir=False):
     k = (c[0]["t"], c[0]["o"], c[-1]["t"], c[-1]["c"], len(c), n)
     v = _EVC.get(k)
     if v is None:
-        v = [c[e["i"]]["t"] for e in bos_events(c, n)]
+        v = [(c[e["i"]]["t"], "BUY" if e["dir"] == "bull" else "SELL") for e in bos_events(c, n)]
         if len(_EVC) > 200: _EVC.clear()
         _EVC[k] = v
-    return v
+    return v if with_dir else [t for t, _ in v]
 
 def setup_fresh(sig, c, s, strict=False):
     """(True, '') while the setup is still good, otherwise (False, reason).
@@ -1159,7 +1203,14 @@ def setup_fresh(sig, c, s, strict=False):
     if not bt or "entry" not in sig: return (not strict), "setup has no BOS time to check"
     if not c: return (not strict), "no candle data to check the setup"
     if bt < c[0]["t"]: return (not strict), "setup is older than the candle history available"
-    if any(t > bt for t in _event_times(c, int(sig.get("swing_n") or s["swing_n"]))): return False, "a newer break of structure has formed"
+    n_ = int(sig.get("swing_n") or s["swing_n"])
+    for e_ in bos_events(c, n_):                                                                                       # a NEWER break of structure cancels the waiting order (it never got tapped)
+        if c[e_["i"]]["t"] <= bt: continue
+        if ("BUY" if e_["dir"] == "bull" else "SELL") != sig["side"]: return False, "a break of structure the other way has formed, so this idea is replaced"
+        Lq = bos_leg(c, e_, n_)
+        big = (not s.get("min_leg_atr") or not Lq["avg"] or Lq["leg_h"] >= s["min_leg_atr"] * Lq["avg"]) and Lq["width"] >= int(s.get("min_leg_bars") or 0) \
+              and Lq["width"] >= float(s.get("bos_supersede_pct", 50)) / 100 * float(sig.get("leg_w") or 0)
+        if big: return False, "a newer break of structure has formed, so this idea is replaced"
     bull, entry, tp = sig["side"] == "BUY", sig["entry"], sig["tp"]
     after = [x for x in c if x["t"] > bt]
     pr_ = sig.get("prot")
@@ -1167,7 +1218,9 @@ def setup_fresh(sig, c, s, strict=False):
     if after:
         lo_, hi_ = min(x["l"] for x in after), max(x["h"] for x in after)
         if (lo_ <= entry) if bull else (hi_ >= entry): return False, "price already traded into the entry zone (mitigated)"
-        if (hi_ >= tp) if bull else (lo_ <= tp): return False, "price already reached the target without tapping the entry"
+        ft = float(sig.get("found_t") or sig.get("last_t") or 0)                                                      # only candles AFTER the setup was found count: the target is the present low/high, which price had already reached when the setup formed
+        post = [x for x in after if x["t"] > ft]
+        if post and ((max(x["h"] for x in post) >= tp) if bull else (min(x["l"] for x in post) <= tp)): return False, "price already reached the target without tapping the entry"
         zh, zl = sig.get("ob_hi"), sig.get("ob_lo")
         if zh is not None and zl is not None and zh > zl:
             frac = max(0.0, min(1.0, ((zh - lo_) if bull else (hi_ - zl)) / (zh - zl)))
@@ -1488,7 +1541,7 @@ def merge_htf(h, l, s):
     risk = abs(l["entry"] - l["sl"])
     if risk <= 0: return h
     ext = h.get("ext", h["tp"]); room = (ext - l["entry"]) if bull else (l["entry"] - ext)
-    min_rr, max_rr = float(s.get("min_rr") or 2.0), max(float(s.get("min_rr") or 2.0), float(s.get("bot_max_rr") or 3.0))
+    min_rr, max_rr = float(s.get("min_rr") or 1.0), max(float(s.get("min_rr") or 1.0), float(s.get("bot_max_rr") or 3.0))
     strong = bool(h.get("strong", True)) and bool(l.get("strong", True))
     raw = max(0.0, room / risk)
     rrf = min_rr if not strong else min(max_rr, max(min_rr, raw))
@@ -2129,12 +2182,8 @@ HOME_TPL = """
   <h1><span class='grad'>@@NAME@@</span><br>@@TAGLINE@@</h1>
   <p class='lead'>@@LEAD@@</p>
   <div class='cta'><a class='btn' href='@@CONNECT@@'>CONNECT YOUR REAL ACCOUNT →</a><a class='btn ghost' href='/paper'>TRY PAPER TRADING FREE</a><a class='btn ghost' href='/performance'>VIEW PERFORMANCE</a></div>
-  <div class='kpis'>
-   <div class='kpi'><b data-to='@@TRADES@@'>0</b><span>Closed trades · @@TFK@@</span></div>
-   <div class='kpi'><b data-to='@@WIN@@' data-dec='1' data-suf='%'>0</b><span>Win rate · @@TFK@@</span></div>
-   <div class='kpi'><b data-to='@@TOTALR@@' data-dec='2' data-pre='@@PRE@@' data-suf='R'>0</b><span>Total result · @@TFK@@</span></div>
-   <div class='kpi'><b data-to='@@NPLAT@@'>0</b><span>Platforms supported</span></div>
-  </div>
+  @@RESULTS@@
+  <div class='kpis' style='grid-template-columns:repeat(2,1fr);margin-top:12px'><div class='kpi'><b data-to='@@NPLAT@@'>0</b><span>Platforms supported</span></div><div class='kpi'><b>@@MODE@@</b><span>Mode</span></div></div>
  </div>
  <div class='chartbox'>
   <div class='chart-top'><span>@@META@@</span><span style='color:#22c55e'>● LIVE SETUP</span></div>
@@ -2172,10 +2221,19 @@ if(reduce){show(to);return}var t0=null;function f(t){if(!t0)t0=t;var k=Math.min(
 @app.route("/")
 def home():
     s = S(); p = perf(track_rows(s["timeframe"]), "all", s["timeframe"])
+    rows_ = track_rows(None, 20000) if True else []
+    def _cell(lab, q, bold=False):
+        w = "font-weight:800;" if bold else ""
+        return (f"<tr style='{w}border-top:1px solid rgba(255,255,255,.14)'><td style='padding:8px 6px;text-align:left'>{lab}</td><td>{q['trades']}</td><td>{q['win_rate']}%</td>"
+                f"<td style='color:{'#22c55e' if q['total_r'] >= 0 else '#f87171'}'>{'+' if q['total_r'] >= 0 else ''}{q['total_r']}R</td><td>{'+' if q['avg_r'] >= 0 else ''}{q['avg_r']}R</td></tr>")
+    try: pa, pb, pc = perf(rows_, "all", "30m"), perf(rows_, "all", "1h"), perf(rows_, "all", None)
+    except Exception: pa = pb = pc = perf([], "all", None)
+    results = ("<div class='kpi' style='margin-top:32px;padding:10px 12px'><div style='font-size:11px;color:#94a3b8;margin-bottom:6px'>RESULTS OF THE ROBOT, BY CHART</div>"
+               "<table style='width:100%;border-collapse:collapse;font-size:13px;text-align:right'><tr style='color:#94a3b8;font-size:11px'><th style='text-align:left;padding:4px 6px'>Chart</th><th>Trades</th><th>Win rate</th><th>Total</th><th>Avg / trade</th></tr>"
+               + _cell("30 minutes", pa) + _cell("1 hour", pb) + _cell("Both charts (average)", pc, True) + "</table></div>")
     rep = {"@@TFK@@": str(escape(s["timeframe"])), "@@NAME@@": str(escape(s["site_name"])), "@@MODE@@": str(escape(s["mode"])).upper(), "@@RR@@": str(s["rr"]), "@@RISK@@": str(s["risk_pct"]),
            "@@TF@@": str(escape(("chart you choose (" + " or ".join({"30m": "30-minute", "1h": "1-hour"}.get(t, t) for t in s["timeframes"]) + ")") if len(s["timeframes"]) > 1 else ({"30m": "30-minute", "1h": "1-hour"}.get(s["timeframes"][0], s["timeframes"][0]) + " chart"))),
-           "@@TRADES@@": str(p["trades"]), "@@WIN@@": str(p["win_rate"]), "@@TOTALR@@": str(p["total_r"]),
-           "@@PRE@@": "+" if p["total_r"] >= 0 else "", "@@NPLAT@@": str(len(s["platforms"])), "@@CHART@@": _hero_chart(s["rr"]),
+           "@@RESULTS@@": results, "@@NPLAT@@": str(len(s["platforms"])), "@@CHART@@": _hero_chart(s["rr"]),
            "@@META@@": str(escape(f"{' / '.join(s['timeframes'])} · {', '.join(s['symbols'])}")), "@@PLATS@@": "".join(f"<span>{escape(x)}</span>" for x in s["platforms"]) * 3,
            "@@CONNECT@@": "/setup" if cur_user() else "/signup?next=/setup", "@@STRAT@@": str(escape(s["strategy_text"])), "@@TAGLINE@@": str(escape(s["tagline"])), "@@LEAD@@": str(escape(s["lead"]))}
     html = HOME_TPL
@@ -3465,7 +3523,7 @@ def paper_page():
                       "<p class='muted'>Your balance is shown in this currency, converted at today's exchange rate.</p>" % (curopts(cur_), escape(cur_), format(mn_ * fx_, ",.0f"), mn_ * fx_, bal))
     cfg = json.dumps({"symbol": sym, "tf": tf, "tfms": TF_MS(tf), "logged": bool(u), "cur": cur_, "rates": rates, "min_usd": mn_, "def_usd": df_, "newacc": not acc}).replace("</", "<\\/")
     rep = {"@@BANNER@@": banner, "@@SYMOPTS@@": opt(syms, sym), "@@TFPILLS@@": pills, 
-           "@@MINRR@@": ("%g" % float(s.get("min_rr") or 2.0)), "@@RRMIN@@": ("%g" % float(s["rr"])), "@@RRMAX@@": ("%g" % float(s["max_rr"])), "@@RRV@@": ("%g" % float((acc.get("rr_aplus") if acc and acc.get("rr_aplus") else s["rr"]))),
+           "@@MINRR@@": ("%g" % float(s.get("min_rr") or 1.0)), "@@RRMIN@@": ("%g" % float(s["rr"])), "@@RRMAX@@": ("%g" % float(s["max_rr"])), "@@RRV@@": ("%g" % float((acc.get("rr_aplus") if acc and acc.get("rr_aplus") else s["rr"]))),
            "@@STATE@@": state, "@@BALFIELD@@": balfield, "@@PAIRS@@": pairs_form(acc or {"pairs": sym, "platform": "PAPER"}, s, "/paper/start"), "@@DEF@@": format(df_ * fx_, ",.0f"), "@@CUR@@": str(escape(cur_)), "@@RCUR@@": curopts(cur_), "@@RISK@@": str(rp), "@@CAP@@": str(cap), "@@MAXT@@": str(int(s.get("max_trades_per_day") or 0) or "any number of"),
            "@@BTN@@": "SAVE AND START" if acc else "START PAPER TRADING", "@@STOP@@": stop, "@@RESULTS@@": results, "@@CFG@@": cfg}
     html = PAPER_TPL
@@ -3794,7 +3852,9 @@ def admin_save():
             if k in ("sl_buffer_pips", "min_sl_pips"): new = min(100.0, max(0.0, new))
             if k == "max_sl_pips": new = min(1000.0, max(0.0, new))
             if k == "min_rr": new = min(10.0, max(0.5, new))
-            if k == "bot_max_rr": new = min(10.0, max(float(s.get("min_rr") or 2.0), new))
+            if k == "bos_supersede_pct": new = min(100.0, max(0.0, new))
+            if k in ("min_leg_bars", "bos_max_age_bars"): new = int(min(1000, max(0, new)))
+            if k == "bot_max_rr": new = min(10.0, max(float(s.get("min_rr") or 1.0), new))
             if k in ("liq_inside_pct", "liq_overlap_pct", "bos_body_pct"): new = min(100.0, max(0.0, new))
             if k == "reentry_bars": new = min(500, max(1, new))
             if k == "symbols":
