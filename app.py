@@ -56,6 +56,9 @@ DEFAULTS = {
     "reentry_min_rr": 1.5,          # a re-entry keeps the original target, so it only needs this reward (1:x)
     "bot_max_rr": 3.0,              # ... and never bigger than this: when the present low / high gives more, the take profit is cut to this
     "bos_body_pct": 50.0,           # the candle that breaks the structure must have a body of at least this % of its range; a weaker (wick-like) break needs one more candle closing beyond, and then pays exactly the minimum reward
+    "crypto_pattern": True,         # crypto/futures only: with no liquidity, enter a tap of an order block only if the last 2-3 breaks in the trend all did exactly that
+    "crypto_pattern_legs": 3, "crypto_pattern_min": 2,
+    "liq_inside_ob_pct": 50.0,      # an ORDER BLOCK (liquidity or entry) only needs this % inside the break of structure (it often straddles the broken level)
     "liq_inside_pct": 70.0,         # the liquidity and the entry block must be at least this % inside the break of structure
     "liq_overlap_pct": 50.0,        # the liquidity may touch the entry block; only when it has covered this % of the block (or more) is the block skipped
     "reentry": True,                # after a stop loss with the protected level still unbroken, look for ONE re-entry (FVG / new order block / breaker / 5m MSS)
@@ -474,19 +477,51 @@ def mit_since_leave(c, k, bull):
     L = next((j for j in range(k + 1, len(c)) if ((c[j]["c"] > ob["h"]) if bull else (c[j]["c"] < ob["l"]))), None)
     return 0.0 if L is None else mitigation(c, k, bull, L + 1)
 
-def bos_leg(c, e, n):
-    """The leg of one break of structure: where it started, the protected extreme, its height, the normal candle size before it and how WIDE it is (candles)."""
+def bos_leg(c, e, n, floor=0):
+    """The break of structure as a BOX. The candle that closed beyond the level is c[e['i']]. Going back, price was CONTAINED (never traded beyond that close) since the candle after the last time it was:
+    that stretch is the structure. Its extreme (highest high for buys / lowest low for sells) is the BROKEN LEVEL, the opposite extreme is the PROTECTED level, and the number of candles is how WIDE the break is."""
     bull = e["dir"] == "bull"
-    bi_, brk = e["i"], e["broken"][0]
-    prior = [j for j in range(n, brk) if _swing(c, j, n, "low" if bull else "high")]
-    st = prior[-1] if prior else max(0, brk - 10)
+    bi_ = e["i"]; cl = c[bi_]["c"]
+    a = bi_ - 1
+    while a >= 0 and ((c[a]["h"] < cl) if bull else (c[a]["l"] > cl)): a -= 1
+    st = min(max(0, a + 1, floor), max(0, bi_ - 1))                                              # a break that continues an earlier one in the same move starts after that earlier break
+    span = range(st, bi_)
+    brk_i = max(span, key=lambda k: c[k]["h"]) if bull else min(span, key=lambda k: c[k]["l"])      # leftmost extreme
+    brk = c[brk_i]["h"] if bull else c[brk_i]["l"]
     lg = range(st, bi_ + 1)
     og = min(lg, key=lambda k: c[k]["l"]) if bull else max(lg, key=lambda k: c[k]["h"])
     pr = c[og]["l"] if bull else c[og]["h"]
     rg = [x["h"] - x["l"] for x in c[max(0, st - 14):st]]
     lh = (max(c[k]["h"] for k in lg) - pr) if bull else (pr - min(c[k]["l"] for k in lg))
     av = (sum(rg) / len(rg)) if len(rg) >= 5 else 0.0
-    return {"e": e, "start": st, "origin": og, "prot": pr, "leg_h": lh, "avg": av, "width": bi_ - st}
+    return {"e": e, "start": st, "origin": og, "prot": pr, "leg_h": lh, "avg": av, "width": bi_ - st, "brk": brk, "kb": brk_i}
+
+def _is_crypto(sym): return bool(sym) and sym.endswith("USDT")
+
+def crypto_pattern(c, s, n, bull, bos_i):
+    """CRYPTO / futures only. Used when the normal picture (liquidity + an entry block further back) is NOT there.
+    Looks at the last 2-3 earlier breaks of structure in the SAME direction. Each one must show the same habit: no liquidity sweep, price just pulled back and TAPPED an order block inside that break's box,
+    then carried on in the trend. Only when every one of them (at least 2) did that may the robot enter the same way. -> (ok, message)"""
+    nmax, nmin = int(s.get("crypto_pattern_legs") or 3), int(s.get("crypto_pattern_min") or 2)
+    evs = [e for e in bos_events(c, n) if e["dir"] == ("bull" if bull else "bear") and e["i"] < bos_i]
+    allev = [e for e in bos_events(c, n) if e["dir"] == ("bull" if bull else "bear")]
+    prev = evs[-nmax:]
+    if len(prev) < nmin: return False, f"only {len(prev)} earlier break(s) of structure in this direction, need {nmin} to learn this pair's habit"
+    done = 0
+    for e in prev:
+        ix = allev.index(e); nxt = allev[ix + 1]["i"] if ix + 1 < len(allev) else bos_i
+        fl = (allev[ix - 1]["i"] + 1) if ix > 0 else 0
+        L2 = bos_leg(c, e, n, floor=fl)
+        zlo, zhi = (L2["prot"], L2["brk"]) if bull else (L2["brk"], L2["prot"])
+        isob = (lambda x: x["c"] < x["o"]) if bull else (lambda x: x["c"] > x["o"])
+        obs2 = [k for k in range(L2["origin"], e["i"]) if isob(c[k]) and inside_frac(c[k]["l"], c[k]["h"], zlo, zhi) >= 0.5 - 1e-9]
+        win = c[e["i"] + 1:nxt]
+        if not obs2 or not win: return False, "an earlier break of structure had no order block to tap or no continuation"
+        pb = min(x["l"] for x in win) if bull else max(x["h"] for x in win)                                 # how deep the pullback went
+        tapped = [k for k in obs2 if ((pb <= c[k]["h"] and pb >= c[k]["l"] - 0.25 * (c[k]["h"] - c[k]["l"])) if bull else (pb >= c[k]["l"] and pb <= c[k]["h"] + 0.25 * (c[k]["h"] - c[k]["l"])))]
+        if not tapped: return False, "an earlier break of structure did not follow the 'tap an order block and continue' habit"
+        done += 1
+    return True, f"the last {done} breaks of structure in this direction all did the same: no liquidity sweep, just a tap of an order block and then the trend continued"
 
 def find_setup(c, s, tf=None, why=None, sym=None, tp_fixed=None):
     """The strategy: a break of structure (BOS) -> liquidity = the last order block before the breakout -> entry = the order block BELOW that liquidity (bullish; above it when bearish) -> SL at the protected low/high.
@@ -508,7 +543,7 @@ def find_setup(c, s, tf=None, why=None, sym=None, tp_fixed=None):
     runev.reverse(); run = len(runev)
     # MAJOR break of structure: size is not only the height of the leg but also how WIDE it is (how many candles it took). Among the breaks of the current run (that are recent enough),
     # every one that is tall enough and wide enough is a candidate and the WIDEST one is the major break; the later breaks are just the move continuing.
-    leg_of = lambda e: bos_leg(c, e, n)
+    leg_of = lambda e: bos_leg(c, e, n, floor=(runev[runev.index(e) - 1]["i"] + 1) if runev.index(e) > 0 else 0)
     max_age, min_w, why_c = int(s.get("bos_max_age_bars") or 0), int(s.get("min_leg_bars") or 0), "the last break of structure is too small to trust"
     cands = []
     for e in runev:
@@ -535,18 +570,17 @@ def _setup_core(c, s, tf, no_msg, sym, tp_fixed, n, bull, run, L):
     def no(msg):
         no_msg(msg); return None
     last = L["e"]; start, origin, protected, leg_h, avg_rng = L["start"], L["origin"], L["prot"], L["leg_h"], L["avg"]
-    bos_i, broken_i = last["i"], last["broken"][0]
+    bos_i, broken_i, broken_p = last["i"], L["kb"], L["brk"]
     leg_atr = (leg_h / avg_rng) if avg_rng else 0.0
 
     bc = c[bos_i]; brng = bc["h"] - bc["l"]
     strong = brng > 0 and abs(bc["c"] - bc["o"]) / brng * 100 >= float(s.get("bos_body_pct", 50)) - 1e-9          # a real body close, not just a wick poking through
-    if not strong and not any(((x["c"] > last["broken"][1]) if bull else (x["c"] < last["broken"][1])) for x in c[bos_i + 1:]):
+    if not strong and not any(((x["c"] > broken_p) if bull else (x["c"] < broken_p)) for x in c[bos_i + 1:]):
         return no("the break of structure candle is mostly a wick; waiting for one more candle to close beyond the level")
     is_ob = (lambda x: x["c"] < x["o"]) if bull else (lambda x: x["c"] > x["o"])
     after, price = c[bos_i + 1:], c[-1]["c"]
     if any(((x["c"] < protected) if bull else (x["c"] > protected)) for x in after): return no("the protected " + ("low" if bull else "high") + " was broken, so this idea is dead")      # final invalidation
     # The BOS zone = from the protected level to the level the break went through. Liquidity and the entry block must be (at least 70%) inside it.
-    broken_p = last["broken"][1]
     zlo, zhi = (protected, broken_p) if bull else (broken_p, protected)
     inpct = float(s.get("liq_inside_pct", 70)) / 100
     inside = lambda k: inside_frac(c[k]["l"], c[k]["h"], zlo, zhi) >= inpct - 1e-9
@@ -554,17 +588,20 @@ def _setup_core(c, s, tf, no_msg, sym, tp_fixed, n, bull, run, L):
     obs = [k for k in range(origin, bos_i) if is_ob(c[k])]                     # real opposing candles inside the leg only
     if bull: pivs = [k for k in range(origin + 1, bos_i) if c[k]["l"] <= c[k - 1]["l"] and c[k]["l"] <= c[k + 1]["l"]]       # last pullback low (a wick)
     else:    pivs = [k for k in range(origin + 1, bos_i) if c[k]["h"] >= c[k - 1]["h"] and c[k]["h"] >= c[k + 1]["h"]]       # last pullback high (a wick)
-    ob_in, pv_in = [k for k in obs if inside(k)], [k for k in pivs if inside(k)]
+    obpct = min(inpct, float(s.get("liq_inside_ob_pct", 50)) / 100)
+    inside_ob = lambda k: inside_frac(c[k]["l"], c[k]["h"], zlo, zhi) >= obpct - 1e-9
+    ob_in, pv_in = [k for k in obs if inside_ob(k)], [k for k in pivs if inside(k)]
     options = ([(ob_in[-1], "order_block")] if ob_in else []) + ([(pv_in[-1], "wick")] if pv_in else [])
-    if not options: return no(f"no order block or wick that is at least {round(inpct * 100)}% inside the break of structure, so there is no liquidity to trade from")
+    fail_msg = None
+    if not options: fail_msg = f"no order block or wick that is at least {round(inpct * 100)}% inside the break of structure, so there is no liquidity to trade from"
     # ENTRY = the nearest valid ORDER BLOCK further back than the liquidity (above it for sells, below it for buys), inside the zone.
     maxm = float(s.get("max_mitigation_pct", 50)) / 100                         # price came back into the block by more than this = block is used up
     ovl_max = float(s.get("liq_overlap_pct", 50)) / 100                         # the liquidity may touch the block; only when it covered this part of it (or more) is the block skipped
     pip = pip_size(sym, c[-1]["c"]); buf = float(s.get("sl_buffer_pips") or 0) * pip
     chosen, why_last = None, "no order block found"
-    for lq, kd in options:
+    for lq, kd in (options if not fail_msg else []):
         if (c[lq]["h"] > c[bos_i]["h"]) if bull else (c[lq]["l"] < c[bos_i]["l"]): why_last = "the break did not clear the liquidity"; continue      # the BOS must reach at least the liquidity line
-        cands = [k for k in reversed(obs) if k < lq and inside(k) and (c[k]["l"] < c[lq]["l"] if bull else c[k]["h"] > c[lq]["h"])]       # nearest block to the liquidity first
+        cands = [k for k in reversed(obs) if k < lq and inside_ob(k) and (c[k]["l"] < c[lq]["l"] if bull else c[k]["h"] > c[lq]["h"])]       # nearest block to the liquidity first
         if not cands: why_last = "no order block " + ("below" if bull else "above") + " the liquidity inside the break of structure to enter from"; continue
         lz = c[lq]                                                              # the liquidity zone
         for k in cands:
@@ -575,7 +612,15 @@ def _setup_core(c, s, tf, no_msg, sym, tp_fixed, n, bull, run, L):
             if m_ > maxm + 1e-9: why_last = "price already came back into the entry order block"; continue
             chosen = (lq, kd, k, m_); break
         if chosen: break
-    if not chosen: return no(why_last)
+    if not chosen:
+        fail_msg = fail_msg or why_last
+        if not (_is_crypto(sym) and s.get("crypto_pattern", True)): return no(fail_msg)
+        okp, pmsg = crypto_pattern(c, s, n, bull, bos_i)
+        if not okp: return no(fail_msg + "; crypto habit check: " + pmsg)
+        pc = [(k, mit_since_leave(c, k, bull)) for k in reversed(obs) if inside_ob(k)]
+        pc = [x for x in pc if x[1] <= maxm + 1e-9]
+        if not pc: return no(fail_msg + "; no unused order block inside the break of structure to enter from")
+        chosen = (None, "pattern", pc[0][0], pc[0][1])
     liq, kind, ent, mit = chosen; ob = c[ent]
     if bull: entry, sl = (ob["h"] if s["ob_entry"] == "top" else (ob["h"] + ob["l"]) / 2), ob["l"] - buf         # STOP LOSS = just beyond the entry order block (the protected level is only the "idea is dead" line)
     else:    entry, sl = (ob["l"] if s["ob_entry"] == "top" else (ob["h"] + ob["l"]) / 2), ob["h"] + buf
@@ -605,7 +650,7 @@ def _setup_core(c, s, tf, no_msg, sym, tp_fixed, n, bull, run, L):
     sess = "Asia" if h < 7 else "London" if h < 13 else "NY" if h < 21 else "Late"
     return {"brk": broken_p, "brk_t": c[broken_i]["t"], "found_t": c[-1]["t"], "leg_w": L["width"], "side": "BUY" if bull else "SELL", "entry": entry, "sl": sl, "tp": tp, "rr": rr, "liquidity": kind,
             "session": sess, "bos_run": min(run, 5), "key": (f"{tf}-" if tf and tf != s["timeframe"] else "") + f"{last['dir']}-{c[bos_i]['t']}", "tf": tf or s["timeframe"], "mitigated_pct": round(100 * mit), "last_t": c[-1]["t"],
-            "bos_t": c[bos_i]["t"], "ob_hi": ob["h"], "ob_lo": ob["l"], "ob_t": ob["t"], "liq_t": c[liq]["t"], "leg_t": c[start]["t"], "prot": protected, "ext": ext, "strong": strong, "swing_n": n, "sl_pips": round(rp, 1), "leg_atr": round(leg_atr, 2),
+            "bos_t": c[bos_i]["t"], "ob_hi": ob["h"], "ob_lo": ob["l"], "ob_t": ob["t"], "liq_t": (c[liq]["t"] if liq is not None else None), "leg_t": c[start]["t"], "prot": protected, "ext": ext, "strong": strong, "swing_n": n, "sl_pips": round(rp, 1), "leg_atr": round(leg_atr, 2),
             "score": round(min(leg_atr, 12) + 1.5 * min(run, 5) - mit * 4 + (0.5 if tf == "1h" else 0), 2)}
 
 def resolve(o, candles):
@@ -934,7 +979,7 @@ def seen_new(k):
 
 # ---------------- setup detection, cached: many users on the same broker send identical candles ----------------
 _SETUP, _SETUP_LOCK = collections.OrderedDict(), threading.Lock()
-SETUP_KEYS = ("swing_n", "min_bos", "rr", "ob_entry", "max_mitigation_pct", "min_leg_atr", "timeframe", "sl_buffer_pips", "max_sl_pips", "min_sl_pips", "min_rr", "liq_inside_pct", "liq_overlap_pct", "bot_max_rr", "bos_body_pct", "reentry_min_rr", "min_leg_bars", "bos_max_age_bars", "bos_supersede_pct")
+SETUP_KEYS = ("swing_n", "min_bos", "rr", "ob_entry", "max_mitigation_pct", "min_leg_atr", "timeframe", "sl_buffer_pips", "max_sl_pips", "min_sl_pips", "min_rr", "liq_inside_pct", "liq_inside_ob_pct", "liq_overlap_pct", "crypto_pattern", "crypto_pattern_legs", "crypto_pattern_min", "bot_max_rr", "bos_body_pct", "reentry_min_rr", "min_leg_bars", "bos_max_age_bars", "bos_supersede_pct")
 def cached_setup(rows, s, tf, why=None, sym=None):
     h = hashlib.sha1((str(sym) + tf + json.dumps([s[k] for k in SETUP_KEYS]) + ";".join(f"{x['t']},{x['o']},{x['h']},{x['l']},{x['c']}" for x in rows)).encode()).hexdigest()
     with _SETUP_LOCK:
@@ -1204,10 +1249,12 @@ def setup_fresh(sig, c, s, strict=False):
     if not c: return (not strict), "no candle data to check the setup"
     if bt < c[0]["t"]: return (not strict), "setup is older than the candle history available"
     n_ = int(sig.get("swing_n") or s["swing_n"])
-    for e_ in bos_events(c, n_):                                                                                       # a NEWER break of structure cancels the waiting order (it never got tapped)
+    evs_, prev_i = bos_events(c, n_), None
+    for e_ in evs_:                                                                                                    # a NEWER break of structure cancels the waiting order (it never got tapped)
+        d_ = "BUY" if e_["dir"] == "bull" else "SELL"; fl_ = (prev_i + 1) if prev_i is not None else 0; prev_i = e_["i"] if d_ == sig["side"] else None
         if c[e_["i"]]["t"] <= bt: continue
-        if ("BUY" if e_["dir"] == "bull" else "SELL") != sig["side"]: return False, "a break of structure the other way has formed, so this idea is replaced"
-        Lq = bos_leg(c, e_, n_)
+        if d_ != sig["side"]: return False, "a break of structure the other way has formed, so this idea is replaced"
+        Lq = bos_leg(c, e_, n_, floor=fl_)
         big = (not s.get("min_leg_atr") or not Lq["avg"] or Lq["leg_h"] >= s["min_leg_atr"] * Lq["avg"]) and Lq["width"] >= int(s.get("min_leg_bars") or 0) \
               and Lq["width"] >= float(s.get("bos_supersede_pct", 50)) / 100 * float(sig.get("leg_w") or 0)
         if big: return False, "a newer break of structure has formed, so this idea is replaced"
@@ -1303,10 +1350,10 @@ def snap_svg(o, candles):
     e = [f"<rect width='{W}' height='{H}' fill='#131722'/>"]
     for g in range(6):
         v = lo + (hi - lo) * g / 5; y = Y(v)
-        e.append(f"<line x1='0' x2='{pw}' y1='{y:.1f}' y2='{y:.1f}' stroke='#1e222d'/><text x='{pw + 6}' y='{y + 4:.1f}' font-size='10' fill='#787b86'>{_fp(v)}</text>")
+        e.append(f"<text x='{pw + 6}' y='{y + 4:.1f}' font-size='10' fill='#787b86'>{_fp(v)}</text>")
     for g in range(5):
         i = int((len(w) - 1) * g / 4); x = X(i)
-        e.append(f"<line y1='{PT}' y2='{PT + ph}' x1='{x:.1f}' x2='{x:.1f}' stroke='#1e222d'/><text x='{x:.1f}' y='{H - 28}' font-size='10' fill='#787b86' text-anchor='middle'>{datetime.datetime.utcfromtimestamp(w[i]['t'] / 1000).strftime('%d %b %H:%M')}</text>")
+        e.append(f"<text x='{x:.1f}' y='{H - 28}' font-size='10' fill='#787b86' text-anchor='middle'>{datetime.datetime.utcfromtimestamp(w[i]['t'] / 1000).strftime('%d %b %H:%M')}</text>")
     bi, li, oi, ci = idx(o.get("bos_t")), idx(o.get("leg_t")), idx(o.get("ob_t")), idx(o.get("liq_t"))
     def tag(x, y, txt, col, anchor="start", fs=10):                                             # a label on a dark pill so it can always be read
         wd = len(txt) * fs * 0.62 + 10; x0 = x if anchor == "start" else (x - wd if anchor == "end" else x - wd / 2)
@@ -1411,7 +1458,7 @@ TCHART_JS = r"""(function(){
 if(window.TChart)return;
 var GREEN='#26a69a',RED='#ef5350',BLUE='#2962ff',AMB='#fbbf24',YEL='#eab308',PUR='#a855f7',BG='#000000',GRID='#303030',TXT='#c8c8c8',DARKRED='#b91c1c';
 function clamp(v,a,b){return Math.max(a,Math.min(b,v))}
-function dec(p){var a=Math.abs(p);return a>=1000?2:a>=10?3:a>=0.01?5:6}
+function dec(p){var a=Math.abs(p);return a>=100?2:a>=10?3:a>=0.01?5:6}
 function fmt(p){if(p===null||p===undefined||isNaN(p))return '-';var d=dec(p);return Number(p).toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d})}
 function idxAt(A,t){if(t===null||t===undefined)return -1;var lo=0,hi=A.length-1,r=-1;while(lo<=hi){var m=(lo+hi)>>1;if(A[m][0]<=t){r=m;lo=m+1}else hi=m-1}return r}
 function hm(t){var d=new Date(t);return d.toLocaleDateString(undefined,{day:'2-digit',month:'short'})+' '+d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}
@@ -1420,7 +1467,9 @@ window.TChart=function(box,opt){
  var bar=document.createElement('div');bar.className='tcbar';
  bar.innerHTML='<button type="button" data-a="in" title="Zoom in">+</button><button type="button" data-a="out" title="Zoom out">&minus;</button><button type="button" data-a="left" title="Move back">&#9664;</button><button type="button" data-a="right" title="Move forward">&#9654;</button><button type="button" data-a="reset" title="Back to the trade">Reset</button><span class="tcbadge" style="margin-left:auto;border-radius:999px;padding:4px 12px;font-size:12px;font-weight:800;color:#0b0e14;display:none"></span><span class="tcinfo" style="flex-basis:100%;margin:2px 0 0">Loading chart...</span>';
  var cnv=document.createElement('canvas');cnv.style.display='block';cnv.style.width='100%';cnv.style.touchAction='none';cnv.style.cursor='crosshair';cnv.style.borderRadius='10px';
- box.appendChild(bar);box.appendChild(cnv);var ctx=cnv.getContext('2d');
+ var leg=document.createElement('div');leg.className='tclegend';leg.innerHTML='<span><i style="background:#b91c1c"></i>Major break of structure (box)</span><span><i style="background:#fbbf24"></i>BOS line (broken level)</span><span><i style="background:#eab308"></i>Liquidity (boxed candle + dot)</span><span><i style="background:#a855f7"></i>Entry order block</span><span><i style="background:#2962ff"></i>Entry</span><span><i style="background:#ef5350"></i>Stop loss</span><span><i style="background:#26a69a"></i>Take profit</span><span><i style="background:#a1a1aa"></i>Protected level</span>';
+ var why=document.createElement('div');why.className='tcwhy';
+ box.appendChild(bar);box.appendChild(cnv);box.appendChild(leg);box.appendChild(why);var ctx=cnv.getContext('2d');
  var S={C:[],F:null,D:null,vis:80,off:0,hov:null,dpr:1,raf:0,err:'',busy:false,shown:false,seen:false,cur:null};
  function all(){return S.F?S.C.concat([S.F]):S.C}
  function fit(){var w=box.clientWidth||600,h=Math.round(w<620?clamp(w*1.05,360,520):clamp(w*0.6,320,480));S.dpr=window.devicePixelRatio||1;cnv.style.height=h+'px';cnv.width=Math.round(w*S.dpr);cnv.height=Math.round(h*S.dpr);kick()}
@@ -1441,20 +1490,28 @@ window.TChart=function(box,opt){
   function Y(q){return padT+(hi-q)/(hi-lo)*ph}
   function P(y){return hi-(y-padT)/ph*(hi-lo)}
   ctx.lineWidth=1;ctx.textBaseline='alphabetic';ctx.font='11px system-ui,sans-serif';
-  // MT5 style dotted grid + price scale
-  var step=(function(r){var e=Math.pow(10,Math.floor(Math.log10(r))),f=r/e;return (f<1.5?1:f<3?2:f<7?5:10)*e})((hi-lo)/9),cnt=0;
-  ctx.setLineDash([2,4]);
-  for(p=Math.ceil(lo/step)*step;p<=hi&&cnt<40;p+=step,cnt++){var gy=Math.round(Y(p))+0.5;ctx.strokeStyle='#6a6a6a';ctx.beginPath();ctx.moveTo(0,gy);ctx.lineTo(pw,gy);ctx.stroke();ctx.setLineDash([]);ctx.fillStyle=TXT;ctx.fillText(fmt(p),pw+8,gy+4);ctx.setLineDash([2,4])}
+  // price scale and time scale: labels and small ticks only (no grid lines)
+  var step=(function(r){var e=Math.pow(10,Math.floor(Math.log10(r))),f=r/e;return (f<1.5?1:f<3?2:f<7?5:10)*e})((hi-lo)/7),cnt=0;
+  ctx.strokeStyle='#666';
+  for(p=Math.ceil(lo/step)*step;p<=hi&&cnt<40;p+=step,cnt++){var gy=Math.round(Y(p))+0.5;ctx.beginPath();ctx.moveTo(pw,gy);ctx.lineTo(pw+4,gy);ctx.stroke();ctx.fillStyle=TXT;ctx.fillText(fmt(p),pw+8,gy+4)}
   var tk=Math.max(1,Math.ceil(110/slot));
-  for(j=j0;j<=j1;j++){if(j%tk!==0)continue;var tx=Math.round(X(j))+0.5,d=new Date(A[j][0]);ctx.strokeStyle='#6a6a6a';ctx.beginPath();ctx.moveTo(tx,padT);ctx.lineTo(tx,h-padB);ctx.stroke();
+  for(j=j0;j<=j1;j++){if(j%tk!==0)continue;var tx=Math.round(X(j))+0.5,d=new Date(A[j][0]);ctx.beginPath();ctx.moveTo(tx,h-padB);ctx.lineTo(tx,h-padB+4);ctx.stroke();
    var day=(d.getHours()===0&&d.getMinutes()===0),lab=day?d.toLocaleDateString(undefined,{day:'2-digit',month:'short'}):d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
-   ctx.setLineDash([]);ctx.fillStyle=day?'#ffffff':TXT;ctx.textAlign='center';ctx.fillText(lab,clamp(tx,24,pw-24),h-8);ctx.textAlign='left';ctx.setLineDash([2,4])}
+   ctx.fillStyle=day?'#ffffff':TXT;ctx.textAlign='center';ctx.fillText(lab,clamp(tx,24,pw-24),h-8);ctx.textAlign='left'}
   ctx.setLineDash([]);ctx.strokeStyle='#555';ctx.beginPath();ctx.moveTo(pw+0.5,0);ctx.lineTo(pw+0.5,h);ctx.moveTo(0,h-padB+0.5);ctx.lineTo(w,h-padB+0.5);ctx.stroke();
   ctx.save();ctx.beginPath();ctx.rect(0,0,pw,h-padB);ctx.clip();
-  var pills=[];
-  function pill(x,y,txt,col,anchor,fs){pills.push([x,y,txt,col,anchor||'start',fs||10])}
-  function drawPills(){pills.forEach(function(a){var x=a[0],y=a[1],t=a[2],col=a[3],an=a[4],fs=a[5];ctx.font='bold '+fs+'px system-ui,sans-serif';var tw=ctx.measureText(t).width+10,x0=an==='end'?x-tw:an==='middle'?x-tw/2:x;x0=clamp(x0,3,pw-tw-3);y=clamp(y,padT+fs+3,h-padB-6);
-   ctx.fillStyle='rgba(0,0,0,.86)';ctx.fillRect(x0,y-fs-1,tw,fs+7);ctx.strokeStyle=col;ctx.lineWidth=1;ctx.strokeRect(x0+0.5,y-fs-0.5,tw-1,fs+6);ctx.fillStyle=col;ctx.fillText(t,x0+5,y+2)})}
+  var pills=[],compact=w<560;
+  function pill(x,y,txt,col,anchor,fs,prio,short){pills.push({x:x,y:y,t:(compact&&short)?short:txt,col:col,an:anchor||'start',fs:compact?9:(fs||10),pr:prio||5})}
+  function drawPills(){
+   var boxes=[[0,0,320,padT+32]];
+   function free(r){for(var i=0;i<boxes.length;i++){var b=boxes[i];if(r[0]<b[0]+b[2]+2&&r[0]+r[2]+2>b[0]&&r[1]<b[1]+b[3]+2&&r[1]+r[3]+2>b[1])return false}return true}
+   pills.sort(function(a,b){return a.pr-b.pr});
+   pills.forEach(function(a){ctx.font='bold '+a.fs+'px system-ui,sans-serif';var tw=ctx.measureText(a.t).width+10,hh=a.fs+7,d=a.fs+9,ds=[0,-1,1,-2,2,-3,3,-4,4],ans=[a.an,a.an==='end'?'start':'end'],placed=null,i,k;
+    for(k=0;k<ans.length&&!placed;k++)for(i=0;i<ds.length&&!placed;i++){
+     var x0=ans[k]==='end'?(k===0?a.x-tw:pw-tw-4):ans[k]==='middle'?a.x-tw/2:(k===0?a.x:4);x0=clamp(x0,3,pw-tw-3);var yy=a.y+ds[i]*d,r=[x0,yy-a.fs-1,tw,hh];
+     if(r[1]<padT+2||r[1]+hh>h-padB-2)continue;if(free(r))placed=[r,yy]}
+    if(!placed)return;var r=placed[0],yy=placed[1];boxes.push(r);
+    ctx.fillStyle='rgba(0,0,0,.9)';ctx.fillRect(r[0],r[1],r[2],r[3]);ctx.strokeStyle=a.col;ctx.lineWidth=1;ctx.strokeRect(r[0]+0.5,r[1]+0.5,r[2]-1,r[3]-1);ctx.fillStyle=a.col;ctx.fillText(a.t,r[0]+5,yy+2)})}
   var pip=D.pip||1e-4,badge=null;
   if(o){
    var bull=o.side==='BUY',oc=o.outcome;
@@ -1470,12 +1527,12 @@ window.TChart=function(box,opt){
    if(o.prot!==null&&o.prot!==undefined&&brk!==null&&brk!==undefined&&isFinite(brk)){
     var yt=Y(Math.max(o.prot,brk)),yb=Y(Math.min(o.prot,brk));
     ctx.fillStyle='rgba(185,28,28,.07)';ctx.fillRect(xl,yt,pw-xl+2,yb-yt);ctx.strokeStyle=DARKRED;ctx.lineWidth=2;ctx.strokeRect(xl,yt,pw-xl+2,yb-yt);ctx.lineWidth=1;
-    pill(xl+6,yt+16,'MAJOR BREAK OF STRUCTURE','#ef4444','start',11);
+    pill(xl+6,yt+16,'MAJOR BREAK OF STRUCTURE','#ef4444','start',11,5,'MAJOR BOS');
    }
    // entry order block
-   if(oi>=0&&o.ob_hi!==null&&o.ob_hi!==undefined){var xo=X(oi)-slot/2,y1=Y(o.ob_hi),y2=Y(o.ob_lo);ctx.fillStyle='rgba(168,85,247,.24)';ctx.fillRect(xo,y1,pw-xo,Math.max(2,y2-y1));ctx.strokeStyle=PUR;ctx.strokeRect(xo+0.5,y1+0.5,pw-xo,Math.max(2,y2-y1));pill(xo+4,bull?y2+16:y1-5,'ENTRY ORDER BLOCK',PUR,'start',10)}
+   if(oi>=0&&o.ob_hi!==null&&o.ob_hi!==undefined){var xo=X(oi)-slot/2,y1=Y(o.ob_hi),y2=Y(o.ob_lo);ctx.fillStyle='rgba(168,85,247,.24)';ctx.fillRect(xo,y1,pw-xo,Math.max(2,y2-y1));ctx.strokeStyle=PUR;ctx.strokeRect(xo+0.5,y1+0.5,pw-xo,Math.max(2,y2-y1));pill(xo+4,bull?y2+16:y1-5,'ENTRY ORDER BLOCK',PUR,'start',10,4,'ENTRY OB')}
    // protected level
-   if(o.prot!==null&&o.prot!==undefined){var yp=Y(o.prot);ctx.strokeStyle='#a1a1aa';ctx.setLineDash([6,5]);ctx.beginPath();ctx.moveTo(0,yp);ctx.lineTo(pw,yp);ctx.stroke();ctx.setLineDash([]);pill(pw-4,bull?yp+16:yp-5,'PROTECTED '+(bull?'LOW ':'HIGH ')+fmt(o.prot),'#a1a1aa','end',9)}
+   if(o.prot!==null&&o.prot!==undefined){var yp=Y(o.prot);ctx.strokeStyle='#a1a1aa';ctx.setLineDash([6,5]);ctx.beginPath();ctx.moveTo(0,yp);ctx.lineTo(pw,yp);ctx.stroke();ctx.setLineDash([]);pill(pw-4,bull?yp+16:yp-5,'PROTECTED '+(bull?'LOW ':'HIGH ')+fmt(o.prot),'#a1a1aa','end',9,6,'PROTECTED')}
   }
   // candles
   var bw=Math.max(1,Math.min(slot*0.7,18));
@@ -1487,17 +1544,17 @@ window.TChart=function(box,opt){
    // BOS line + dots
    if(brk!==null&&brk!==undefined&&isFinite(brk)&&bi>=0){var xb0=kb>=0?X(kb):(li>=0?X(li):0),yb2=Y(brk);ctx.strokeStyle=AMB;ctx.lineWidth=3;ctx.beginPath();ctx.moveTo(xb0,yb2);ctx.lineTo(X(bi),yb2);ctx.stroke();ctx.lineWidth=1;
     ctx.fillStyle=AMB;ctx.beginPath();ctx.arc(xb0,yb2,4,0,6.3);ctx.fill();ctx.beginPath();ctx.arc(X(bi),yb2,6,0,6.3);ctx.fill();ctx.strokeStyle='#fff';ctx.lineWidth=1.5;ctx.stroke();ctx.lineWidth=1;
-    pill(xb0+6,bull2?yb2+16:yb2-6,'BOS LINE '+fmt(brk),AMB,'start',10);
-    var ybc=bull2?Y(A[bi][2])-10:Y(A[bi][3])+22;pill(X(bi),ybc,'BOS: closed beyond',AMB,'middle',10)}
+    pill(xb0+6,bull2?yb2+16:yb2-6,'BOS LINE '+fmt(brk),AMB,'start',10,7,'BOS LINE');
+    var ybc=bull2?Y(A[bi][2])-10:Y(A[bi][3])+22;pill(X(bi),ybc,'BOS: closed beyond',AMB,'middle',10,3,'BOS')}
    // liquidity: boxed candle + dot on the exact point
    if(ci>=0){var cx=X(ci),ytc=Y(A[ci][2]),ybc2=Y(A[ci][3]),bwx=Math.max(slot,9);ctx.fillStyle='rgba(234,179,8,.18)';ctx.fillRect(cx-bwx/2-2,ytc-3,bwx+4,ybc2-ytc+6);ctx.strokeStyle=YEL;ctx.lineWidth=2;ctx.strokeRect(cx-bwx/2-2,ytc-3,bwx+4,ybc2-ytc+6);ctx.lineWidth=1;
     var ly=bull2?A[ci][3]:A[ci][2];ctx.fillStyle=YEL;ctx.beginPath();ctx.arc(cx,Y(ly),6,0,6.3);ctx.fill();ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.stroke();ctx.lineWidth=1;
-    pill(cx,bull2?ytc-14:ybc2+24,o.liquidity==='order_block'?'LIQUIDITY (order block)':'LIQUIDITY (wick)',YEL,'middle',10)}
+    pill(cx,bull2?ytc-14:ybc2+24,o.liquidity==='order_block'?'LIQUIDITY (order block)':'LIQUIDITY (wick)',YEL,'middle',10,2,'LIQUIDITY')}
    // taken dot / result dot
-   if(D.taken_t){var ti=idxAt(A,D.taken_t);if(ti>=0){ctx.fillStyle=BLUE;ctx.beginPath();ctx.arc(X(ti),Y(o.entry),7,0,6.3);ctx.fill();ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.stroke();ctx.lineWidth=1;pill(X(ti),Y(o.entry)+(bull2?22:-12),'TRADE TAKEN HERE','#6c9bff','middle',10)}}
+   if(D.taken_t){var ti=idxAt(A,D.taken_t);if(ti>=0){ctx.fillStyle=BLUE;ctx.beginPath();ctx.arc(X(ti),Y(o.entry),7,0,6.3);ctx.fill();ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.stroke();ctx.lineWidth=1;pill(X(ti),Y(o.entry)+(bull2?22:-12),'TRADE TAKEN HERE','#6c9bff','middle',10,3,'TAKEN')}}
    if((o.outcome==='WIN'||o.outcome==='LOSS')&&o.last_t){var ei=idxAt(A,o.last_t);if(ei>=0){var ye=o.outcome==='WIN'?o.tp:o.sl,cc=o.outcome==='WIN'?GREEN:RED;ctx.fillStyle=cc;ctx.beginPath();ctx.arc(X(ei),Y(ye),6,0,6.3);ctx.fill();ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.stroke();ctx.lineWidth=1}}
    // entry / sl / tp lines
-   [[o.tp,GREEN,'TAKE PROFIT · '+(Math.abs(o.tp-o.entry)/pip).toFixed(1)+' pips · 1:'+o.rr,-6],[o.entry,'#6c9bff','ENTRY ('+o.side.toLowerCase()+' limit)',-6],[o.sl,RED,'STOP LOSS · '+(Math.abs(o.sl-o.entry)/pip).toFixed(1)+' pips',16]].forEach(function(l){var y=Math.round(Y(l[0]))+0.5;ctx.strokeStyle=l[1]===('#6c9bff')?BLUE:l[1];ctx.lineWidth=1.6;ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(pw,y);ctx.stroke();ctx.lineWidth=1;pill(6,y+l[3],l[2],l[1],'start',10)});
+   [[o.tp,GREEN,'TAKE PROFIT · '+(Math.abs(o.tp-o.entry)/pip).toFixed(1)+' pips · 1:'+o.rr,-6,'TP '+(Math.abs(o.tp-o.entry)/pip).toFixed(0)+'p · 1:'+o.rr],[o.entry,'#6c9bff','ENTRY ('+o.side.toLowerCase()+' limit)',-6,'ENTRY'],[o.sl,RED,'STOP LOSS · '+(Math.abs(o.sl-o.entry)/pip).toFixed(1)+' pips',16,'SL '+(Math.abs(o.sl-o.entry)/pip).toFixed(0)+'p']].forEach(function(l){var y=Math.round(Y(l[0]))+0.5;ctx.strokeStyle=l[1]===('#6c9bff')?BLUE:l[1];ctx.lineWidth=1.6;ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(pw,y);ctx.stroke();ctx.lineWidth=1;pill(6,y+l[3],l[2],l[1],'start',10,1,l[4])});
    var pc=S.cur!==null?S.cur:A[n-1][4];
    var oc2=o.outcome;
    if(oc2==='PENDING'){badge=['PENDING · NOT TAKEN YET','#9aa4b2'];var dist=Math.abs(pc-o.entry)/pip;S.info='PENDING: trade not taken yet · price is '+dist.toFixed(1)+' pips from the entry'}
@@ -1529,7 +1586,8 @@ window.TChart=function(box,opt){
    S.busy=false;
    if(!a[0]){S.err=a[1].error||'The chart is not available.';var inf=bar.querySelector('.tcinfo');inf.textContent=S.err;kick();return}
    var d=a[1],first=!S.D;S.D=d;S.C=d.candles;S.F=d.forming||null;S.cur=(d.bid!==null&&d.bid!==undefined)?d.bid:null;S.err='';
-   if(first)defView();kick();
+   if(first)defView();
+   var wl=d.why||[];why.innerHTML=wl.length?('<b>Why the robot took this trade</b><ul>'+wl.map(function(x){return '<li>'+String(x).replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</li>'}).join('')+'</ul>'):'';kick();
   }).catch(function(){S.busy=false;S.err=S.C.length?'':'Connection problem. Retrying...';kick()})
  }
  var ptrs={},drag=null,pinch=null;
@@ -1569,6 +1627,8 @@ TCHART_CSS = """<style>
 .tcchips{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0}
 .tcchips button{border:1px solid #cbd5e1;background:#fff;border-radius:999px;padding:5px 12px;font-weight:700;font-size:12px;cursor:pointer}
 .tcchips button.on{background:#0f172a;color:#fff;border-color:#0f172a}
+.tclegend{display:flex;flex-wrap:wrap;gap:4px 12px;margin-top:8px;font-size:11px;color:#cbd5e1}.tclegend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+.tcwhy{margin-top:8px;font-size:12px;color:#e5e7eb;border-top:1px solid #2b2b2b;padding-top:8px}.tcwhy ul{margin:6px 0 0 16px;padding:0}.tcwhy li{margin:3px 0}
 .tcpill{display:inline-block;border-radius:999px;padding:2px 10px;font-size:11px;font-weight:800;color:#0b0e14}
 </style>"""
 
@@ -1640,6 +1700,12 @@ def find_reentry(o, c, get5, s):
     if m is not None:
         ext = min(x["l"] for x in c[si:m + 1]) if bull else max(x["h"] for x in c[si:m + 1])
         accept(c, "breaker", o["ob_lo"], o["ob_hi"], m, near(o["ob_lo"], o["ob_hi"]), (min(o["ob_lo"], ext) - buf) if bull else (max(o["ob_hi"], ext) + buf), tf)
+    lt_, bt_ = int(o.get("leg_t") or 0), int(o.get("bos_t") or 0)                                                  # e) an EXISTING untapped order block further back, between the stopped block and the protected level
+    for k in range(len(c) - 1, -1, -1):
+        x = c[k]
+        if x["t"] < lt_ or x["t"] >= bt_ or k >= si: continue
+        if bull and x["c"] < x["o"] and x["l"] < o["ob_lo"] and x["h"] <= o["ob_hi"] and x["l"] >= prot - 1e-12: accept(c, "old_order_block", x["l"], x["h"], si, near(x["l"], x["h"]), x["l"] - buf, tf); break
+        if not bull and x["c"] > x["o"] and x["h"] > o["ob_hi"] and x["l"] >= o["ob_lo"] and x["h"] <= prot + 1e-12: accept(c, "old_order_block", x["l"], x["h"], si, near(x["l"], x["h"]), x["h"] + buf, tf); break
     try: c5 = get5()                                                                                               # d) a 5 minute market structure shift back in our direction
     except Exception: c5 = None
     if c5 and len(c5) >= 40:
@@ -2206,8 +2272,20 @@ def admin_chartdata(skey):
             if x["t"] > ft and ((x["l"] <= o["entry"]) if bull else (x["h"] >= o["entry"])): taken = x["t"]; break
     keys = ("symbol", "tf", "side", "entry", "sl", "tp", "rr", "outcome", "status", "prot", "brk", "brk_t", "bos_t", "leg_t", "ob_t", "ob_hi", "ob_lo", "liq_t", "liquidity", "found_t", "last_t", "r", "sl_pips", "htf", "re_of", "grade", "time")
     ov = {k: o.get(k) for k in keys}; ov["tf"] = tf
+    pp_ = pip_size(sym, o.get("entry") or 1); bull_ = o.get("side") == "BUY"; why = []
+    if o.get("brk") is not None and o.get("prot") is not None:
+        why.append(f"Major break of structure: a {'bullish' if bull_ else 'bearish'} candle CLOSED {'above' if bull_ else 'below'} {_fp(o['brk'])}" + (f", and the break is {o['leg_w']} candles wide" if o.get("leg_w") else "") + (", with a full body" if o.get("strong") else (" (the first candle was mostly a wick, a later candle also closed beyond, so the reward is only 1:%s)" % o.get("rr") if o.get("strong") is False else "")) + ". The protected " + ("low" if bull_ else "high") + f" is {_fp(o['prot'])} (the idea is dead if price closes beyond it).")
+    else: why.append("This trade was taken by an older version of the robot that did not save every detail of the setup.")
+    if o.get("liquidity") == "pattern": why.append("No liquidity here. This is a crypto pair, and the last 2-3 breaks of structure in this trend all did the same thing: price tapped an order block and carried on without sweeping liquidity. The robot followed that habit and entered the order block.")
+    elif o.get("liq_t"): why.append("Liquidity: the " + ("last order block (opposing candle)" if o.get("liquidity") == "order_block" else "last pullback wick") + " right before the break, inside the break of structure. It is boxed on the chart.")
+    else: why.append("No liquidity was saved with this trade: it was taken before the robot started recording it (older version).")
+    if o.get("ob_hi") is not None: why.append(f"Entry: the next order block {'below' if bull_ else 'above'} the liquidity, inside the box. Entry {_fp(o['entry'])}, stop loss {_fp(o['sl'])} just beyond the block ({abs(o['sl'] - o['entry']) / pp_:.1f} pips).")
+    why.append(f"Target: the present {'high' if bull_ else 'low'} kept between 1:1 and 1:3. Reward 1:{o.get('rr')} ({abs(o['tp'] - o['entry']) / pp_:.1f} pips).")
+    if o.get("grade") or o.get("bias"): why.append(f"Bigger picture: {bias_text(o['bias']) if isinstance(o.get('bias'), dict) else (o.get('bias') or '')}" + (f" · grade {o['grade']}" if o.get("grade") else "") + (f" · {o['session']} session" if o.get("session") else ""))
+    if o.get("htf"): why.append("The 1 hour chart had the idea; the entry and stop were taken from the 30 minute order block.")
+    if o.get("re_of"): why.append("This is the ONE re-entry after the first stop loss: the protected level was never broken.")
     row_ = lambda x: [x["t"], x["o"], x["h"], x["l"], x["c"]]
-    return jsonify(candles=[row_(x) for x in closed], forming=row_(forming) if forming else None, bid=bid, o=ov, taken_t=taken, pip=pip_size(sym, o.get("entry") or 1), tfms=TF_MS(tf), ts=int(time.time())), 200, hdr
+    return jsonify(candles=[row_(x) for x in closed], forming=row_(forming) if forming else None, bid=bid, o=ov, taken_t=taken, pip=pip_size(sym, o.get("entry") or 1), tfms=TF_MS(tf), why=why, ts=int(time.time())), 200, hdr
 
 def _warnings(s):
     w = []
@@ -3553,9 +3631,9 @@ function draw(){
  function P(y){return hi-(y-padT)/ph*(hi-lo)}
  ctx.lineWidth=1;ctx.font='11px system-ui,sans-serif';ctx.textBaseline='alphabetic';
  var step=(function(r){var e=Math.pow(10,Math.floor(Math.log10(r))),f=r/e;return (f<1.5?1:f<3?2:f<7?5:10)*e})((hi-lo)/9),cnt=0;
- for(p=Math.ceil(lo/step)*step;p<=hi&&cnt<40;p+=step,cnt++){var gy=Math.round(Y(p))+0.5;ctx.strokeStyle=GRID;ctx.setLineDash([2,4]);ctx.beginPath();ctx.moveTo(0,gy);ctx.lineTo(pw,gy);ctx.stroke();ctx.setLineDash([]);ctx.fillStyle=TXT;ctx.fillText(fmt(p),pw+8,gy+4)}
+ for(p=Math.ceil(lo/step)*step;p<=hi&&cnt<40;p+=step,cnt++){var gy=Math.round(Y(p))+0.5;ctx.strokeStyle='#666';ctx.beginPath();ctx.moveTo(pw,gy);ctx.lineTo(pw+4,gy);ctx.stroke();ctx.fillStyle=TXT;ctx.fillText(fmt(p),pw+8,gy+4)}
  var tk=Math.max(1,Math.ceil(100/slot));
- for(j=j0;j<=j1;j++){if(j%tk!==0)continue;var tx=Math.round(X(j))+0.5,d=new Date(A[j][0]);ctx.strokeStyle=GRID;ctx.setLineDash([2,4]);ctx.beginPath();ctx.moveTo(tx,padT);ctx.lineTo(tx,h-padB);ctx.stroke();ctx.setLineDash([]);
+ for(j=j0;j<=j1;j++){if(j%tk!==0)continue;var tx=Math.round(X(j))+0.5,d=new Date(A[j][0]);ctx.strokeStyle='#666';ctx.beginPath();ctx.moveTo(tx,h-padB);ctx.lineTo(tx,h-padB+4);ctx.stroke();
   var day=(d.getHours()===0&&d.getMinutes()===0),lab=CFG.tfms>=86400000?d.toLocaleDateString(undefined,{day:'2-digit',month:'short'}):(day?d.toLocaleDateString(undefined,{day:'2-digit',month:'short'}):d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}));
   ctx.fillStyle=day?'#d1d4dc':TXT;ctx.textAlign='center';ctx.fillText(lab,clamp(tx,24,pw-24),h-8);ctx.textAlign='left'}
  ctx.strokeStyle='#555';ctx.beginPath();ctx.moveTo(pw+0.5,0);ctx.lineTo(pw+0.5,h);ctx.moveTo(0,h-padB+0.5);ctx.lineTo(w,h-padB+0.5);ctx.stroke();
@@ -4103,7 +4181,7 @@ def admin_save():
             if k == "bos_supersede_pct": new = min(100.0, max(0.0, new))
             if k in ("min_leg_bars", "bos_max_age_bars"): new = int(min(1000, max(0, new)))
             if k == "bot_max_rr": new = min(10.0, max(float(s.get("min_rr") or 1.0), new))
-            if k in ("liq_inside_pct", "liq_overlap_pct", "bos_body_pct"): new = min(100.0, max(0.0, new))
+            if k in ("liq_inside_pct", "liq_inside_ob_pct", "liq_overlap_pct", "bos_body_pct"): new = min(100.0, max(0.0, new))
             if k == "reentry_bars": new = min(500, max(1, new))
             if k == "symbols":
                 new = [(str(x).strip().upper() if str(x).strip().upper().endswith("USDT") else str(x).strip()) for x in new if re.fullmatch(r"[A-Za-z0-9._#]{3,14}", str(x).strip())][:40]
