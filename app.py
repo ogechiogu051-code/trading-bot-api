@@ -603,7 +603,7 @@ def _setup_core(c, s, tf, no_msg, sym, tp_fixed, n, bull, run, L):
     if not bull and (any(x["h"] >= entry for x in after) or price >= entry): return no("price already tapped the entry, so that setup is gone")
     h = datetime.datetime.utcnow().hour
     sess = "Asia" if h < 7 else "London" if h < 13 else "NY" if h < 21 else "Late"
-    return {"found_t": c[-1]["t"], "leg_w": L["width"], "side": "BUY" if bull else "SELL", "entry": entry, "sl": sl, "tp": tp, "rr": rr, "liquidity": kind,
+    return {"brk": broken_p, "brk_t": c[broken_i]["t"], "found_t": c[-1]["t"], "leg_w": L["width"], "side": "BUY" if bull else "SELL", "entry": entry, "sl": sl, "tp": tp, "rr": rr, "liquidity": kind,
             "session": sess, "bos_run": min(run, 5), "key": (f"{tf}-" if tf and tf != s["timeframe"] else "") + f"{last['dir']}-{c[bos_i]['t']}", "tf": tf or s["timeframe"], "mitigated_pct": round(100 * mit), "last_t": c[-1]["t"],
             "bos_t": c[bos_i]["t"], "ob_hi": ob["h"], "ob_lo": ob["l"], "ob_t": ob["t"], "liq_t": c[liq]["t"], "leg_t": c[start]["t"], "prot": protected, "ext": ext, "strong": strong, "swing_n": n, "sl_pips": round(rp, 1), "leg_atr": round(leg_atr, 2),
             "score": round(min(leg_atr, 12) + 1.5 * min(run, 5) - mit * 4 + (0.5 if tf == "1h" else 0), 2)}
@@ -1289,7 +1289,11 @@ def snap_svg(o, candles):
     if len(w) < 10: return None
     W, H, PR, PT, PB = 720, 440, 92, 46, 48
     pw, ph = W - PR, H - PT - PB
-    lv = [o["entry"], o["sl"], o["tp"]] + ([o["prot"]] if o.get("prot") is not None else [])
+    brk = o.get("brk")
+    if brk is None and o.get("leg_t") and o.get("bos_t"):                                       # older orders: the level that was broken = the extreme of the leg just before the breaking candle
+        _l = next((i for i, x in enumerate(cs) if x["t"] >= int(o["leg_t"])), None); _b = next((i for i, x in enumerate(cs) if x["t"] >= int(o["bos_t"])), None)
+        if _l is not None and _b and _b > _l: brk = max(x["h"] for x in cs[_l:_b]) if bull else min(x["l"] for x in cs[_l:_b])
+    lv = [o["entry"], o["sl"], o["tp"]] + ([o["prot"]] if o.get("prot") is not None else []) + ([brk] if brk is not None else [])
     lo, hi = min([x["l"] for x in w] + lv), max([x["h"] for x in w] + lv)
     pad = (hi - lo) * 0.07 or abs(hi) * 0.001; lo -= pad; hi += pad
     slot = pw / len(w)
@@ -1304,9 +1308,18 @@ def snap_svg(o, candles):
         i = int((len(w) - 1) * g / 4); x = X(i)
         e.append(f"<line y1='{PT}' y2='{PT + ph}' x1='{x:.1f}' x2='{x:.1f}' stroke='#1e222d'/><text x='{x:.1f}' y='{H - 28}' font-size='10' fill='#787b86' text-anchor='middle'>{datetime.datetime.utcfromtimestamp(w[i]['t'] / 1000).strftime('%d %b %H:%M')}</text>")
     bi, li, oi, ci = idx(o.get("bos_t")), idx(o.get("leg_t")), idx(o.get("ob_t")), idx(o.get("liq_t"))
-    if li is not None and bi is not None and bi >= li:                                         # the break of structure leg (dark red box, like on your own chart)
-        seg = w[li:bi + 1]; y1, y2 = Y(max(x["h"] for x in seg)), Y(min(x["l"] for x in seg))
-        e.append(f"<rect x='{X(li) - slot / 2:.1f}' y='{y1:.1f}' width='{X(bi) - X(li) + slot:.1f}' height='{y2 - y1:.1f}' fill='rgba(127,29,29,.10)' stroke='#7f1d1d' stroke-width='1.5'/>")
+    def tag(x, y, txt, col, anchor="start", fs=10):                                             # a label on a dark pill so it can always be read
+        wd = len(txt) * fs * 0.62 + 10; x0 = x if anchor == "start" else (x - wd if anchor == "end" else x - wd / 2)
+        return f"<rect x='{x0:.1f}' y='{y - fs - 1:.1f}' width='{wd:.1f}' height='{fs + 6}' rx='4' fill='#0b0e14' fill-opacity='.88' stroke='{col}' stroke-width='1'/><text x='{x0 + 5:.1f}' y='{y + 1:.1f}' font-size='{fs}' font-weight='800' fill='{col}'>{txt}</text>"
+    labels = []
+    if o.get("prot") is not None and brk is not None:                                           # THE MAJOR BREAK OF STRUCTURE BOX: from the start of its leg to now, from the protected level to the level that was broken
+        x0b = X(li) - slot / 2 if li is not None else 0
+        y1, y2 = Y(max(o["prot"], brk)), Y(min(o["prot"], brk))
+        e.append(f"<rect x='{x0b:.1f}' y='{y1:.1f}' width='{pw - x0b:.1f}' height='{y2 - y1:.1f}' fill='rgba(220,38,38,.07)' stroke='#dc2626' stroke-width='2'/>")
+        yb = Y(brk)
+        e.append(f"<line x1='{x0b:.1f}' x2='{pw}' y1='{yb:.1f}' y2='{yb:.1f}' stroke='#f59e0b' stroke-width='1.4' stroke-dasharray='3 4'/>")
+        labels.append(tag(x0b + 6, y1 + 16, "MAJOR BREAK OF STRUCTURE (box)", "#ef4444", fs=11))
+        labels.append(tag(x0b + 6, (yb - 5) if not bull else (yb + 16), f"BOS LINE = broken level {_fp(brk)}", "#f59e0b"))
     sx = X(bi if bi is not None else max(0, len(w) - 8))
     ye, ys, yt = Y(o["entry"]), Y(o["sl"]), Y(o["tp"])
     e.append(f"<rect x='{sx:.1f}' y='{min(ye, yt):.1f}' width='{pw - sx:.1f}' height='{abs(yt - ye):.1f}' fill='rgba(38,166,154,.13)'/><rect x='{sx:.1f}' y='{min(ye, ys):.1f}' width='{pw - sx:.1f}' height='{abs(ys - ye):.1f}' fill='rgba(239,83,80,.13)'/>")
@@ -1319,26 +1332,53 @@ def snap_svg(o, candles):
         e.append(f"<line x1='{x:.1f}' x2='{x:.1f}' y1='{Y(c['h']):.1f}' y2='{Y(c['l']):.1f}' stroke='{col}'/><rect x='{x - bw / 2:.1f}' y='{min(Y(c['o']), Y(c['c'])):.1f}' width='{bw:.1f}' height='{max(1.0, abs(Y(c['o']) - Y(c['c']))):.1f}' fill='{col}'/>")
     for lab, v, col, y in (("TP", o["tp"], "#26a69a", yt), ("ENTRY", o["entry"], "#2962ff", ye), ("SL", o["sl"], "#ef5350", ys)):
         e.append(f"<line x1='0' x2='{pw}' y1='{y:.1f}' y2='{y:.1f}' stroke='{col}' stroke-width='1.6'/><rect x='{pw}' y='{y - 9:.1f}' width='{PR}' height='18' fill='{col}'/><text x='{pw + 5}' y='{y + 4:.1f}' font-size='10' font-weight='700' fill='#fff'>{lab} {_fp(v)}</text>")
-    e.append(f"<text x='6' y='{yt - 5:.1f}' font-size='11' font-weight='700' fill='#26a69a'>TAKE PROFIT (1:{o.get('rr', '')})</text><text x='6' y='{ye - 5:.1f}' font-size='11' font-weight='700' fill='#6c9bff'>ENTRY ({o['side'].lower()} limit)</text><text x='6' y='{ys + (13 if not bull else 13):.1f}' font-size='11' font-weight='700' fill='#ef5350'>STOP LOSS (beyond the entry block)</text>")
+    pp = pip_size(o.get("symbol"), o["entry"]) or 1e-4
+    labels.append(tag(6, yt - 6, f"TAKE PROFIT · {abs(o['tp'] - o['entry']) / pp:.1f} pips · 1:{o.get('rr', '')}", "#26a69a", fs=10))
+    labels.append(tag(6, ye - 6, f"ENTRY ({o['side'].lower()} limit)", "#6c9bff", fs=10))
+    labels.append(tag(6, ys + 16, f"STOP LOSS · {abs(o['sl'] - o['entry']) / pp:.1f} pips (just beyond the entry block)", "#ef5350", fs=10))
     if o.get("prot") is not None:                                                              # the protected high/low: if price CLOSES beyond it the idea is dead (it is not the stop loss)
         yp = Y(o["prot"])
-        e.append(f"<line x1='0' x2='{pw}' y1='{yp:.1f}' y2='{yp:.1f}' stroke='#a1a1aa' stroke-width='1.2' stroke-dasharray='6 5'/><text x='6' y='{(yp + 12) if bull else (yp - 4):.1f}' font-size='10' font-weight='700' fill='#a1a1aa'>PROTECTED {'LOW' if bull else 'HIGH'} (idea is dead if price closes beyond)</text>")
-    if ci is not None:                                                                         # the liquidity candle
-        cx = X(ci); yy = Y(w[ci]["l"] if bull else w[ci]["h"]); sgn = 1 if bull else -1
-        e.append(f"<circle cx='{cx:.1f}' cy='{yy + sgn * 6:.1f}' r='4' fill='none' stroke='#eab308' stroke-width='2'/><text x='{cx:.1f}' y='{yy + sgn * 20:.1f}' font-size='10' font-weight='700' fill='#eab308' text-anchor='middle'>LIQUIDITY</text>")
+        e.append(f"<line x1='0' x2='{pw}' y1='{yp:.1f}' y2='{yp:.1f}' stroke='#a1a1aa' stroke-width='1.2' stroke-dasharray='6 5'/>")
+        labels.append(tag(pw - 4, (yp + 15) if bull else (yp - 5), f"PROTECTED {'LOW' if bull else 'HIGH'} {_fp(o['prot'])} (idea dead if price closes beyond)", "#a1a1aa", "end", 9))
+    if ci is not None:                                                                         # the LIQUIDITY candle: boxed and labelled
+        cx = X(ci); yt_, yb_ = Y(w[ci]["h"]), Y(w[ci]["l"]); bwx = max(slot, 9.0)
+        e.append(f"<rect x='{cx - bwx / 2 - 2:.1f}' y='{yt_ - 3:.1f}' width='{bwx + 4:.1f}' height='{yb_ - yt_ + 6:.1f}' fill='rgba(234,179,8,.18)' stroke='#eab308' stroke-width='2.2'/>")
+        ly = (yb_ + 22) if not bull else (yt_ - 14)
+        e.append(f"<line x1='{cx:.1f}' x2='{cx:.1f}' y1='{(yb_ + 3) if not bull else (yt_ - 3):.1f}' y2='{(ly - 11) if not bull else (ly + 5):.1f}' stroke='#eab308' stroke-width='1.4'/>")
+        labels.append(tag(min(max(cx, 70), pw - 70), ly, "LIQUIDITY (last order block)" if o.get("liquidity") == "order_block" else "LIQUIDITY (wick)", "#eab308", "middle", 10))
     if bi is not None:                                                                         # the candle that broke structure
         cx = X(bi); yy = Y(w[bi]["l"] if not bull else w[bi]["h"]); sgn = 1 if not bull else -1
-        e.append(f"<text x='{cx:.1f}' y='{yy + sgn * 14:.1f}' font-size='11' font-weight='800' fill='#f59e0b' text-anchor='middle'>BOS</text>")
+        e.append(f"<line x1='{cx:.1f}' x2='{cx:.1f}' y1='{PT}' y2='{PT + ph}' stroke='#f59e0b' stroke-width='1' stroke-dasharray='2 4' opacity='.7'/>")
+        labels.append(tag(min(max(cx, 60), pw - 60), (yy + sgn * 16) if not bull else (yy - 8), "BOS: candle closed beyond", "#f59e0b", "middle", 10))
+    if brk is not None and bi is not None:                                                     # THE BOS LINE: the broken level from the candle that made it to the candle that closed beyond it
+        bk = idx(o.get("brk_t")); xs0 = X(bk if bk is not None else (li if li is not None else 0)); yb = Y(brk)
+        e.append(f"<line x1='{xs0:.1f}' x2='{X(bi):.1f}' y1='{yb:.1f}' y2='{yb:.1f}' stroke='#fbbf24' stroke-width='3'/><circle cx='{xs0:.1f}' cy='{yb:.1f}' r='4' fill='#fbbf24'/><circle cx='{X(bi):.1f}' cy='{yb:.1f}' r='5.5' fill='#fbbf24' stroke='#fff' stroke-width='1.5'/>")
+    if ci is not None:                                                                         # a DOT on the exact liquidity point (the high of the opposing candle for sells, the low for buys)
+        lx, ly_ = X(ci), Y(w[ci]["l"] if bull else w[ci]["h"])
+        e.append(f"<circle cx='{lx:.1f}' cy='{ly_:.1f}' r='6' fill='#eab308' stroke='#fff' stroke-width='2'/>")
+    ft_ = int(o.get("found_t") or o.get("bos_t") or 0); pend_dist = None
+    if o.get("outcome") in ("OPEN", "WIN", "LOSS"):                                            # the trade WAS taken: a dot where price touched the entry
+        ti = next((i for i, x in enumerate(w) if x["t"] > ft_ and ((x["l"] <= o["entry"]) if bull else (x["h"] >= o["entry"]))), None)
+        if ti is not None:
+            e.append(f"<circle cx='{X(ti):.1f}' cy='{ye:.1f}' r='6.5' fill='#2962ff' stroke='#fff' stroke-width='2'/>")
+            labels.append(tag(min(max(X(ti), 70), pw - 70), ye + (-12 if not bull else 20), "TRADE TAKEN HERE (entry touched)", "#6c9bff", "middle", 10))
+    elif o.get("outcome") == "PENDING":                                                        # not taken yet: how far price still has to travel to reach the entry
+        lc = w[-1]["c"]; dist = abs(lc - o["entry"]) / pp; yl = Y(lc)
+        e.append(f"<line x1='{pw - 14:.1f}' x2='{pw - 14:.1f}' y1='{yl:.1f}' y2='{ye:.1f}' stroke='#9aa4b2' stroke-width='1.5' stroke-dasharray='4 3'/><circle cx='{pw - 14:.1f}' cy='{yl:.1f}' r='3.5' fill='#fff'/>")
+        pend_dist = dist
+    e.extend(labels)
     oc = o.get("outcome")
     if oc in ("WIN", "LOSS"):
         ei = idx(o.get("last_t"))
         if ei is not None:
             e.append(f"<circle cx='{X(ei):.1f}' cy='{(yt if oc == 'WIN' else ys):.1f}' r='5' fill='{'#26a69a' if oc == 'WIN' else '#ef5350'}' stroke='#fff'/>")
-    status = {"PENDING": ("WAITING: price has not reached the entry yet", "#9598a1"), "OPEN": ("OPEN: price touched the entry", "#2962ff"),
-              "WIN": (f"WIN +{o.get('r')}R: take profit hit", "#26a69a"), "LOSS": ("LOSS -1R: stop loss hit", "#ef5350")}.get(oc, ("CANCELLED: " + str(o.get("status", ""))[:90], "#f59e0b"))
+    st_txt = str(o.get("status", ""))
+    status = {"PENDING": ("PENDING: trade NOT taken yet" + (f" · price is {pend_dist:.1f} pips from the entry" if pend_dist is not None else " (price has not reached the entry)"), "#9aa4b2", "PENDING · NOT TAKEN YET"), "OPEN": ("TRADE TAKEN: price touched the entry, the trade is running", "#2962ff", "TRADE TAKEN · RUNNING"),
+              "WIN": (f"TRADE TAKEN · WIN +{o.get('r')}R: take profit hit", "#26a69a", f"WIN +{o.get('r')}R"), "LOSS": ("TRADE TAKEN · LOSS -1R: stop loss hit", "#ef5350", "LOSS -1R")}.get(oc, ("EXPIRED / CANCELLED, trade was NOT taken: " + (st_txt.split(",", 1)[-1].strip() if "," in st_txt else st_txt)[:80], "#f59e0b", "EXPIRED · NOT TAKEN"))
+    e.append(f"<rect x='{W - 214}' y='6' width='208' height='24' rx='12' fill='{status[1]}'/><text x='{W - 110}' y='22' font-size='12' font-weight='800' fill='#0b0e14' text-anchor='middle'>{escape(status[2])}</text>")
     head = f"{o.get('symbol', '')} · {o.get('tf', '')} · {o['side']}" + (f" · {o['grade']} setup" if o.get("grade") else "") + (" · 1H IDEA, 30M ENTRY" if o.get("htf") else "") + (" · RE-ENTRY" if o.get("re_of") else "")
     e.append(f"<text x='8' y='18' font-size='14' font-weight='800' fill='#fff'>{escape(head)}</text><text x='8' y='34' font-size='10' fill='#787b86'>Robot trade picture · placed {escape(str(o.get('time', ''))[:16])} UTC · liquidity: {escape(str(o.get('liquidity', '')).replace('_', ' '))}</text>")
-    e.append(f"<text x='8' y='{H - 8}' font-size='12' font-weight='800' fill='{status[1]}'>{escape(status[0])}</text><text x='{W - 8}' y='{H - 8}' font-size='10' fill='#787b86' text-anchor='end'>risk to reward 1:{o.get('rr', '')}</text>")
+    e.append(f"<text x='8' y='{H - 8}' font-size='12' font-weight='800' fill='{status[1]}'>{escape(status[0][:92])}</text><text x='{W - 8}' y='{H - 8}' font-size='10' fill='#787b86' text-anchor='end'>risk to reward 1:{o.get('rr', '')}</text>")
     return f"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 {W} {H}' width='100%' style='max-width:100%;height:auto;display:block;border-radius:12px;background:#131722'>{''.join(e)}</svg>"
 
 def snap_save(o, candles):
@@ -1367,18 +1407,194 @@ def snap_view(symbol, tf, key):
     if not r: return layout("Trade chart", "<div class='card' style='max-width:560px'><h2>Chart not available</h2><p class='muted'>Trade pictures are kept for a short time only, then removed to save space.</p></div>"), 404
     return layout("Trade chart", f"<div class='card' style='max-width:780px'><h2>Robot trade chart</h2>{r['svg']}<p class='muted' style='margin-top:10px'>Blue = entry, red = stop loss, green = take profit, purple = entry order block, yellow circle = liquidity, dark red box = the break of structure.</p></div>")
 
+TCHART_JS = r"""(function(){
+if(window.TChart)return;
+var GREEN='#26a69a',RED='#ef5350',BLUE='#2962ff',AMB='#fbbf24',YEL='#eab308',PUR='#a855f7',BG='#000000',GRID='#303030',TXT='#c8c8c8',DARKRED='#b91c1c';
+function clamp(v,a,b){return Math.max(a,Math.min(b,v))}
+function dec(p){var a=Math.abs(p);return a>=1000?2:a>=10?3:a>=0.01?5:6}
+function fmt(p){if(p===null||p===undefined||isNaN(p))return '-';var d=dec(p);return Number(p).toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d})}
+function idxAt(A,t){if(t===null||t===undefined)return -1;var lo=0,hi=A.length-1,r=-1;while(lo<=hi){var m=(lo+hi)>>1;if(A[m][0]<=t){r=m;lo=m+1}else hi=m-1}return r}
+function hm(t){var d=new Date(t);return d.toLocaleDateString(undefined,{day:'2-digit',month:'short'})+' '+d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}
+function tfName(t){return {'30m':'M30','1h':'H1','15m':'M15','5m':'M5','4h':'H4','1d':'D1'}[t]||t}
+window.TChart=function(box,opt){
+ var bar=document.createElement('div');bar.className='tcbar';
+ bar.innerHTML='<button type="button" data-a="in" title="Zoom in">+</button><button type="button" data-a="out" title="Zoom out">&minus;</button><button type="button" data-a="left" title="Move back">&#9664;</button><button type="button" data-a="right" title="Move forward">&#9654;</button><button type="button" data-a="reset" title="Back to the trade">Reset</button><span class="tcbadge" style="margin-left:auto;border-radius:999px;padding:4px 12px;font-size:12px;font-weight:800;color:#0b0e14;display:none"></span><span class="tcinfo" style="flex-basis:100%;margin:2px 0 0">Loading chart...</span>';
+ var cnv=document.createElement('canvas');cnv.style.display='block';cnv.style.width='100%';cnv.style.touchAction='none';cnv.style.cursor='crosshair';cnv.style.borderRadius='10px';
+ box.appendChild(bar);box.appendChild(cnv);var ctx=cnv.getContext('2d');
+ var S={C:[],F:null,D:null,vis:80,off:0,hov:null,dpr:1,raf:0,err:'',busy:false,shown:false,seen:false,cur:null};
+ function all(){return S.F?S.C.concat([S.F]):S.C}
+ function fit(){var w=box.clientWidth||600,h=Math.round(w<620?clamp(w*1.05,360,520):clamp(w*0.6,320,480));S.dpr=window.devicePixelRatio||1;cnv.style.height=h+'px';cnv.width=Math.round(w*S.dpr);cnv.height=Math.round(h*S.dpr);kick()}
+ function kick(){if(!S.raf)S.raf=requestAnimationFrame(function(){S.raf=0;draw()})}
+ function defView(){var A=all(),o=S.D&&S.D.o,n=A.length;if(!n)return;var li=o?idxAt(A,o.leg_t):-1;var span=li>=0?(n-1-li+16):80;S.vis=clamp(span,40,200);S.off=0}
+ function levelsOf(o){var L=[o.entry,o.sl,o.tp];if(o.prot!==null&&o.prot!==undefined)L.push(o.prot);if(o.brk!==null&&o.brk!==undefined)L.push(o.brk);return L}
+ function draw(){
+  var w=cnv.clientWidth,h=cnv.clientHeight,padR=82,padT=14,padB=26,pw=w-padR,ph=h-padT-padB,A=all(),n=A.length,j,p,o=S.D&&S.D.o,D=S.D||{};
+  ctx.setTransform(S.dpr,0,0,S.dpr,0,0);ctx.fillStyle=BG;ctx.fillRect(0,0,w,h);
+  if(!n){ctx.fillStyle=TXT;ctx.font='14px system-ui,sans-serif';ctx.fillText(S.err||'Loading chart...',16,30);return}
+  var R=8,slot=pw/(S.vis+R),last=n-1-S.off;
+  function X(k){return pw-(R+(last-k)+0.5)*slot}
+  var j0=Math.max(0,Math.floor(last-(pw/slot-R))-1),j1=Math.min(n-1,last+R+1),lo=Infinity,hi=-Infinity;
+  for(j=j0;j<=j1;j++){var c=A[j];if(c[3]<lo)lo=c[3];if(c[2]>hi)hi=c[2]}
+  if(!isFinite(lo))return;
+  if(o)levelsOf(o).forEach(function(q){if(q<lo)lo=q;if(q>hi)hi=q});
+  var pad=(hi-lo)*0.08||hi*0.0005;lo-=pad;hi+=pad;
+  function Y(q){return padT+(hi-q)/(hi-lo)*ph}
+  function P(y){return hi-(y-padT)/ph*(hi-lo)}
+  ctx.lineWidth=1;ctx.textBaseline='alphabetic';ctx.font='11px system-ui,sans-serif';
+  // MT5 style dotted grid + price scale
+  var step=(function(r){var e=Math.pow(10,Math.floor(Math.log10(r))),f=r/e;return (f<1.5?1:f<3?2:f<7?5:10)*e})((hi-lo)/9),cnt=0;
+  ctx.setLineDash([2,4]);
+  for(p=Math.ceil(lo/step)*step;p<=hi&&cnt<40;p+=step,cnt++){var gy=Math.round(Y(p))+0.5;ctx.strokeStyle='#6a6a6a';ctx.beginPath();ctx.moveTo(0,gy);ctx.lineTo(pw,gy);ctx.stroke();ctx.setLineDash([]);ctx.fillStyle=TXT;ctx.fillText(fmt(p),pw+8,gy+4);ctx.setLineDash([2,4])}
+  var tk=Math.max(1,Math.ceil(110/slot));
+  for(j=j0;j<=j1;j++){if(j%tk!==0)continue;var tx=Math.round(X(j))+0.5,d=new Date(A[j][0]);ctx.strokeStyle='#6a6a6a';ctx.beginPath();ctx.moveTo(tx,padT);ctx.lineTo(tx,h-padB);ctx.stroke();
+   var day=(d.getHours()===0&&d.getMinutes()===0),lab=day?d.toLocaleDateString(undefined,{day:'2-digit',month:'short'}):d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+   ctx.setLineDash([]);ctx.fillStyle=day?'#ffffff':TXT;ctx.textAlign='center';ctx.fillText(lab,clamp(tx,24,pw-24),h-8);ctx.textAlign='left';ctx.setLineDash([2,4])}
+  ctx.setLineDash([]);ctx.strokeStyle='#555';ctx.beginPath();ctx.moveTo(pw+0.5,0);ctx.lineTo(pw+0.5,h);ctx.moveTo(0,h-padB+0.5);ctx.lineTo(w,h-padB+0.5);ctx.stroke();
+  ctx.save();ctx.beginPath();ctx.rect(0,0,pw,h-padB);ctx.clip();
+  var pills=[];
+  function pill(x,y,txt,col,anchor,fs){pills.push([x,y,txt,col,anchor||'start',fs||10])}
+  function drawPills(){pills.forEach(function(a){var x=a[0],y=a[1],t=a[2],col=a[3],an=a[4],fs=a[5];ctx.font='bold '+fs+'px system-ui,sans-serif';var tw=ctx.measureText(t).width+10,x0=an==='end'?x-tw:an==='middle'?x-tw/2:x;x0=clamp(x0,3,pw-tw-3);y=clamp(y,padT+fs+3,h-padB-6);
+   ctx.fillStyle='rgba(0,0,0,.86)';ctx.fillRect(x0,y-fs-1,tw,fs+7);ctx.strokeStyle=col;ctx.lineWidth=1;ctx.strokeRect(x0+0.5,y-fs-0.5,tw-1,fs+6);ctx.fillStyle=col;ctx.fillText(t,x0+5,y+2)})}
+  var pip=D.pip||1e-4,badge=null;
+  if(o){
+   var bull=o.side==='BUY',oc=o.outcome;
+   var li=idxAt(A,o.leg_t),bi=idxAt(A,o.bos_t),kb=idxAt(A,o.brk_t),oi=idxAt(A,o.ob_t),ci=idxAt(A,o.liq_t),fi=idxAt(A,o.found_t);
+   var brk=o.brk;
+   if((brk===null||brk===undefined)&&li>=0&&bi>li){var q;brk=bull?-Infinity:Infinity;for(q=li;q<bi;q++){brk=bull?Math.max(brk,A[q][2]):Math.min(brk,A[q][3])}}
+   var xl=li>=0?X(li)-slot/2:0;
+   // profit / loss zones
+   var xs=fi>=0?X(fi):(bi>=0?X(bi):0);
+   ctx.fillStyle='rgba(38,166,154,.13)';ctx.fillRect(xs,Math.min(Y(o.entry),Y(o.tp)),pw-xs,Math.abs(Y(o.tp)-Y(o.entry)));
+   ctx.fillStyle='rgba(239,83,80,.13)';ctx.fillRect(xs,Math.min(Y(o.entry),Y(o.sl)),pw-xs,Math.abs(Y(o.sl)-Y(o.entry)));
+   // the MAJOR BREAK OF STRUCTURE box
+   if(o.prot!==null&&o.prot!==undefined&&brk!==null&&brk!==undefined&&isFinite(brk)){
+    var yt=Y(Math.max(o.prot,brk)),yb=Y(Math.min(o.prot,brk));
+    ctx.fillStyle='rgba(185,28,28,.07)';ctx.fillRect(xl,yt,pw-xl+2,yb-yt);ctx.strokeStyle=DARKRED;ctx.lineWidth=2;ctx.strokeRect(xl,yt,pw-xl+2,yb-yt);ctx.lineWidth=1;
+    pill(xl+6,yt+16,'MAJOR BREAK OF STRUCTURE','#ef4444','start',11);
+   }
+   // entry order block
+   if(oi>=0&&o.ob_hi!==null&&o.ob_hi!==undefined){var xo=X(oi)-slot/2,y1=Y(o.ob_hi),y2=Y(o.ob_lo);ctx.fillStyle='rgba(168,85,247,.24)';ctx.fillRect(xo,y1,pw-xo,Math.max(2,y2-y1));ctx.strokeStyle=PUR;ctx.strokeRect(xo+0.5,y1+0.5,pw-xo,Math.max(2,y2-y1));pill(xo+4,bull?y2+16:y1-5,'ENTRY ORDER BLOCK',PUR,'start',10)}
+   // protected level
+   if(o.prot!==null&&o.prot!==undefined){var yp=Y(o.prot);ctx.strokeStyle='#a1a1aa';ctx.setLineDash([6,5]);ctx.beginPath();ctx.moveTo(0,yp);ctx.lineTo(pw,yp);ctx.stroke();ctx.setLineDash([]);pill(pw-4,bull?yp+16:yp-5,'PROTECTED '+(bull?'LOW ':'HIGH ')+fmt(o.prot),'#a1a1aa','end',9)}
+  }
+  // candles
+  var bw=Math.max(1,Math.min(slot*0.7,18));
+  for(j=j0;j<=j1;j++){var k=A[j],x=Math.round(X(j))+0.5,col=k[4]>=k[1]?GREEN:RED,yo=Y(k[1]),yc=Y(k[4]);
+   ctx.strokeStyle=col;ctx.fillStyle=col;ctx.beginPath();ctx.moveTo(x,Y(k[2]));ctx.lineTo(x,Y(k[3]));ctx.stroke();
+   ctx.fillRect(Math.round(x-bw/2),Math.round(Math.min(yo,yc)),Math.max(1,Math.round(bw)),Math.max(1,Math.round(Math.abs(yc-yo))))}
+  if(o){
+   var bull2=o.side==='BUY';
+   // BOS line + dots
+   if(brk!==null&&brk!==undefined&&isFinite(brk)&&bi>=0){var xb0=kb>=0?X(kb):(li>=0?X(li):0),yb2=Y(brk);ctx.strokeStyle=AMB;ctx.lineWidth=3;ctx.beginPath();ctx.moveTo(xb0,yb2);ctx.lineTo(X(bi),yb2);ctx.stroke();ctx.lineWidth=1;
+    ctx.fillStyle=AMB;ctx.beginPath();ctx.arc(xb0,yb2,4,0,6.3);ctx.fill();ctx.beginPath();ctx.arc(X(bi),yb2,6,0,6.3);ctx.fill();ctx.strokeStyle='#fff';ctx.lineWidth=1.5;ctx.stroke();ctx.lineWidth=1;
+    pill(xb0+6,bull2?yb2+16:yb2-6,'BOS LINE '+fmt(brk),AMB,'start',10);
+    var ybc=bull2?Y(A[bi][2])-10:Y(A[bi][3])+22;pill(X(bi),ybc,'BOS: closed beyond',AMB,'middle',10)}
+   // liquidity: boxed candle + dot on the exact point
+   if(ci>=0){var cx=X(ci),ytc=Y(A[ci][2]),ybc2=Y(A[ci][3]),bwx=Math.max(slot,9);ctx.fillStyle='rgba(234,179,8,.18)';ctx.fillRect(cx-bwx/2-2,ytc-3,bwx+4,ybc2-ytc+6);ctx.strokeStyle=YEL;ctx.lineWidth=2;ctx.strokeRect(cx-bwx/2-2,ytc-3,bwx+4,ybc2-ytc+6);ctx.lineWidth=1;
+    var ly=bull2?A[ci][3]:A[ci][2];ctx.fillStyle=YEL;ctx.beginPath();ctx.arc(cx,Y(ly),6,0,6.3);ctx.fill();ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.stroke();ctx.lineWidth=1;
+    pill(cx,bull2?ytc-14:ybc2+24,o.liquidity==='order_block'?'LIQUIDITY (order block)':'LIQUIDITY (wick)',YEL,'middle',10)}
+   // taken dot / result dot
+   if(D.taken_t){var ti=idxAt(A,D.taken_t);if(ti>=0){ctx.fillStyle=BLUE;ctx.beginPath();ctx.arc(X(ti),Y(o.entry),7,0,6.3);ctx.fill();ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.stroke();ctx.lineWidth=1;pill(X(ti),Y(o.entry)+(bull2?22:-12),'TRADE TAKEN HERE','#6c9bff','middle',10)}}
+   if((o.outcome==='WIN'||o.outcome==='LOSS')&&o.last_t){var ei=idxAt(A,o.last_t);if(ei>=0){var ye=o.outcome==='WIN'?o.tp:o.sl,cc=o.outcome==='WIN'?GREEN:RED;ctx.fillStyle=cc;ctx.beginPath();ctx.arc(X(ei),Y(ye),6,0,6.3);ctx.fill();ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.stroke();ctx.lineWidth=1}}
+   // entry / sl / tp lines
+   [[o.tp,GREEN,'TAKE PROFIT · '+(Math.abs(o.tp-o.entry)/pip).toFixed(1)+' pips · 1:'+o.rr,-6],[o.entry,'#6c9bff','ENTRY ('+o.side.toLowerCase()+' limit)',-6],[o.sl,RED,'STOP LOSS · '+(Math.abs(o.sl-o.entry)/pip).toFixed(1)+' pips',16]].forEach(function(l){var y=Math.round(Y(l[0]))+0.5;ctx.strokeStyle=l[1]===('#6c9bff')?BLUE:l[1];ctx.lineWidth=1.6;ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(pw,y);ctx.stroke();ctx.lineWidth=1;pill(6,y+l[3],l[2],l[1],'start',10)});
+   var pc=S.cur!==null?S.cur:A[n-1][4];
+   var oc2=o.outcome;
+   if(oc2==='PENDING'){badge=['PENDING · NOT TAKEN YET','#9aa4b2'];var dist=Math.abs(pc-o.entry)/pip;S.info='PENDING: trade not taken yet · price is '+dist.toFixed(1)+' pips from the entry'}
+   else if(oc2==='OPEN'){badge=['TRADE TAKEN · RUNNING',BLUE];S.info='TRADE TAKEN: price touched the entry, the trade is running'}
+   else if(oc2==='WIN'){badge=['WIN +'+o.r+'R',GREEN];S.info='TRADE TAKEN · WIN +'+o.r+'R: take profit hit'}
+   else if(oc2==='LOSS'){badge=['LOSS -1R',RED];S.info='TRADE TAKEN · LOSS -1R: stop loss hit'}
+   else{badge=['EXPIRED · NOT TAKEN','#f59e0b'];var stt=String(o.status||'');S.info='EXPIRED / CANCELLED, trade was NOT taken: '+(stt.indexOf(',')>=0?stt.split(',').slice(1).join(',').trim():stt)}
+  }
+  // current price
+  var lastC=A[n-1],pcur=S.cur!==null?S.cur:lastC[4],up=lastC[4]>=lastC[1],yp2=Math.round(Y(pcur))+0.5;
+  ctx.strokeStyle=up?GREEN:RED;ctx.setLineDash([2,3]);ctx.beginPath();ctx.moveTo(0,yp2);ctx.lineTo(pw,yp2);ctx.stroke();ctx.setLineDash([]);
+  drawPills();ctx.restore();
+  if(o){[[o.tp,GREEN],[o.entry,BLUE],[o.sl,RED]].forEach(function(l){var y=Y(l[0]);ctx.fillStyle=l[1];ctx.fillRect(pw,y-8,padR,16);ctx.fillStyle='#fff';ctx.font='bold 10px system-ui,sans-serif';ctx.fillText(fmt(l[0]),pw+6,y+4)})}
+  ctx.fillStyle=up?GREEN:RED;ctx.fillRect(pw,yp2-9,padR,18);ctx.fillStyle='#fff';ctx.font='bold 11px system-ui,sans-serif';ctx.fillText(fmt(pcur),pw+6,yp2+4);
+  if(S.F&&D.tfms){var left=Math.max(0,Math.floor((S.F[0]+D.tfms-Date.now())/1000)),mm=Math.floor(left/60),ss=left%60;ctx.fillStyle=up?GREEN:RED;ctx.fillRect(pw,yp2+9,padR,15);ctx.fillStyle='#fff';ctx.font='10px system-ui,sans-serif';ctx.fillText((mm<10?'0':'')+mm+':'+(ss<10?'0':'')+ss,pw+6,yp2+20)}
+  // crosshair
+  var hj=null,hv=S.hov;
+  if(hv&&hv[0]<pw&&hv[1]>padT&&hv[1]<h-padB){hj=clamp(Math.round(last-((pw-hv[0])/slot-R-0.5)),0,n-1);var hx=Math.round(X(hj))+0.5;ctx.strokeStyle='#8a8a8a';ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(hx,padT);ctx.lineTo(hx,h-padB);ctx.moveTo(0,hv[1]);ctx.lineTo(pw,hv[1]);ctx.stroke();ctx.setLineDash([]);
+   ctx.fillStyle='#363a45';ctx.fillRect(pw,hv[1]-9,padR,18);ctx.fillStyle='#fff';ctx.font='11px system-ui,sans-serif';ctx.fillText(fmt(P(hv[1])),pw+6,hv[1]+4);
+   var tl=hm(A[hj][0]),tw2=ctx.measureText(tl).width+14;ctx.fillStyle='#363a45';ctx.fillRect(clamp(hx-tw2/2,0,pw-tw2),h-padB+1,tw2,18);ctx.fillStyle='#fff';ctx.fillText(tl,clamp(hx-tw2/2,0,pw-tw2)+7,h-padB+14)}
+  var ro=A[hj===null?n-1:hj];ctx.font='11px system-ui,sans-serif';ctx.fillStyle='#e5e5e5';ctx.fillText((o?o.symbol:'')+' · '+tfName(o?o.tf:'')+(o&&o.grade?' · '+o.grade+' setup':'')+(o&&o.htf?' · 1H IDEA, 30M ENTRY':'')+(o&&o.re_of?' · RE-ENTRY':''),8,padT+10);
+  ctx.fillStyle=ro[4]>=ro[1]?GREEN:RED;ctx.fillText('O '+fmt(ro[1])+'  H '+fmt(ro[2])+'  L '+fmt(ro[3])+'  C '+fmt(ro[4]),8,padT+24);
+  var bd=bar.querySelector('.tcbadge');if(bd&&badge){bd.style.display='inline-block';bd.style.background=badge[1];bd.textContent=badge[0]}
+  var inf=bar.querySelector('.tcinfo');if(inf&&S.info)inf.textContent=S.info;
+ }
+ function load(){
+  if(S.busy||document.hidden)return;S.busy=true;
+  fetch(opt.dataUrl,{credentials:'same-origin'}).then(function(r){return r.json().then(function(j){return [r.ok,j]})}).then(function(a){
+   S.busy=false;
+   if(!a[0]){S.err=a[1].error||'The chart is not available.';var inf=bar.querySelector('.tcinfo');inf.textContent=S.err;kick();return}
+   var d=a[1],first=!S.D;S.D=d;S.C=d.candles;S.F=d.forming||null;S.cur=(d.bid!==null&&d.bid!==undefined)?d.bid:null;S.err='';
+   if(first)defView();kick();
+  }).catch(function(){S.busy=false;S.err=S.C.length?'':'Connection problem. Retrying...';kick()})
+ }
+ var ptrs={},drag=null,pinch=null;
+ function pc(){var c=0,k;for(k in ptrs)c++;return c}
+ function pd(){var k,v=[];for(k in ptrs)v.push(ptrs[k]);return Math.hypot(v[0][0]-v[1][0],v[0][1]-v[1][1])||1}
+ function sw(){return (cnv.clientWidth-82)/(S.vis+8)}
+ cnv.addEventListener('pointerdown',function(e){try{cnv.setPointerCapture(e.pointerId)}catch(x){}ptrs[e.pointerId]=[e.clientX,e.clientY];if(pc()===1)drag={x:e.clientX,off:S.off};else if(pc()===2){pinch={d:pd(),vis:S.vis};drag=null}});
+ cnv.addEventListener('pointermove',function(e){var r=cnv.getBoundingClientRect();
+  if(ptrs[e.pointerId]){ptrs[e.pointerId]=[e.clientX,e.clientY];
+   if(pinch&&pc()===2)S.vis=clamp(Math.round(pinch.vis*pinch.d/pd()),15,300);
+   else if(drag)S.off=clamp(Math.round(drag.off+(e.clientX-drag.x)/sw()),-30,Math.max(0,all().length-10))}
+  if(e.pointerType==='mouse')S.hov=[e.clientX-r.left,e.clientY-r.top];kick()});
+ function up(e){delete ptrs[e.pointerId];if(pc()<2)pinch=null;if(pc()===0)drag=null;else if(pc()===1){var k;for(k in ptrs)drag={x:ptrs[k][0],off:S.off}}if(e.pointerType!=='mouse')S.hov=null;kick()}
+ cnv.addEventListener('pointerup',up);cnv.addEventListener('pointercancel',up);cnv.addEventListener('pointerleave',function(){S.hov=null;kick()});
+ cnv.addEventListener('dblclick',function(){defView();kick()});
+ cnv.addEventListener('wheel',function(e){e.preventDefault();S.vis=clamp(Math.round(S.vis*(e.deltaY>0?1.12:0.89)),15,300);kick()},{passive:false});
+ bar.addEventListener('click',function(e){var a=e.target.getAttribute&&e.target.getAttribute('data-a');if(!a)return;
+  if(a==='in')S.vis=clamp(Math.round(S.vis*0.8),15,300);else if(a==='out')S.vis=clamp(Math.round(S.vis*1.25),15,300);
+  else if(a==='left')S.off=clamp(S.off+Math.round(S.vis/4),-30,Math.max(0,all().length-10));else if(a==='right')S.off=clamp(S.off-Math.round(S.vis/4),-30,Math.max(0,all().length-10));else defView();kick()});
+ window.addEventListener('resize',fit);
+ function visible(){var r=box.getBoundingClientRect();return r.bottom>0&&r.top<(window.innerHeight||800)}
+ function tick(){if(!document.hidden&&visible()){if(!S.seen){S.seen=true;load()}else load()}}
+ fit();setTimeout(tick,50);setInterval(tick,opt.pollMs||8000);setInterval(function(){if(!document.hidden&&S.F&&visible())kick()},1000);
+ window.addEventListener('scroll',function(){if(!S.seen&&visible()){S.seen=true;load()}},{passive:true});
+};
+})();
+"""
+
+TCHART_CSS = """<style>
+.tcbox{background:#000;border:1px solid #2b2b2b;border-radius:12px;padding:8px;margin-top:8px}
+.tcbar{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:6px}
+.tcbar button{background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:8px;padding:5px 11px;font-weight:700;font-size:13px;cursor:pointer}
+.tcbar button:hover{background:#374151}
+.tcinfo{font-size:12px;color:#cbd5e1;font-weight:600;margin-left:6px}
+.tcitem{border-top:1px solid #e2e8f0;padding:14px 0}
+.tchead{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center}
+.tcchips{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0}
+.tcchips button{border:1px solid #cbd5e1;background:#fff;border-radius:999px;padding:5px 12px;font-weight:700;font-size:12px;cursor:pointer}
+.tcchips button.on{background:#0f172a;color:#fff;border-color:#0f172a}
+.tcpill{display:inline-block;border-radius:999px;padding:2px 10px;font-size:11px;font-weight:800;color:#0b0e14}
+</style>"""
+
+def _tc_pill(outcome):
+    m = {"PENDING": ("#9aa4b2", "PENDING · NOT TAKEN"), "OPEN": ("#6c9bff", "TAKEN · RUNNING"), "WIN": ("#26a69a", "TAKEN · WIN"), "LOSS": ("#ef5350", "TAKEN · LOSS")}.get(outcome, ("#f59e0b", "EXPIRED · NOT TAKEN"))
+    return f"<span class='tcpill' style='background:{m[0]}'>{m[1]}</span>"
+
 def _snap_card(s):
     days = float(s.get("snapshot_days") or 0)
-    if days <= 0: return "<div class='card' id='charts'><h2>Robot trade charts</h2><p class='muted'>Switched off. Set <b>snapshot_days</b> in the settings below to a number above 0 (for example 2) and every new trade gets a picture here.</p></div>"
-    rows = db.q("SELECT skey, symbol, tf, created, updated, outcome, side, svg FROM snaps ORDER BY updated DESC LIMIT 20")
+    if days <= 0: return "<div class='card' id='charts'><h2>Robot trade charts</h2><p class='muted'>Switched off. Set <b>snapshot_days</b> in the settings below to a number above 0 (for example 2) and the robot will keep a live chart of every trade it takes.</p></div>"
+    rows = db.q("SELECT skey, symbol, tf, created, updated, outcome, side FROM snaps ORDER BY updated DESC LIMIT 30")
     total = db.one("SELECT COUNT(*) AS n FROM snaps")["n"]
-    items = "".join(f"<div style='border-top:1px solid #e2e8f0;padding:12px 0'><div style='display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px'>"
-                    f"<b>{escape(r['symbol'])} · {escape(r['tf'])} · {escape(r['side'])} · {escape(r['outcome'])}</b><span class='muted'>placed {escape(str(r['created'])[:16])} UTC</span>"
-                    f"<form action='/admin/snap' method='post' style='display:inline'><input type='hidden' name='op' value='delete'><input type='hidden' name='id' value='{escape(r['skey'])}'><button class='btn' style='padding:4px 10px;font-size:11px;background:#dc2626'>Delete</button></form></div>{r['svg']}</div>" for r in rows)
-    return (f"<div class='card' id='charts'><h2>Robot trade charts ({total})</h2><p class='muted' style='margin-bottom:8px'>A picture of every trade the robot takes: the break of structure, the liquidity, the entry order block, and the entry, stop loss and take profit lines. "
-            f"Pictures are removed automatically {days:g} day(s) after the trade last changed. Change this with <b>snapshot_days</b> in the settings below (0 = do not make pictures).</p>"
-            + ("<form action='/admin/snap' method='post' onsubmit='return confirm(&quot;Delete all trade pictures?&quot;)'><input type='hidden' name='op' value='all'><button class='btn' style='background:#dc2626'>Delete all pictures</button></form>" if total else "")
-            + (items or "<p class='muted' style='margin-top:10px'>No trades yet. A picture appears here as soon as the robot takes a trade.</p>") + (f"<p class='muted'>Showing the latest 20 of {total}.</p>" if total > 20 else "") + "</div>")
+    def grp(o): return "pending" if o == "PENDING" else "taken" if o in ("OPEN", "WIN", "LOSS") else "expired"
+    items = "".join(f"<div class='tcitem' data-g='{grp(r['outcome'])}'><div class='tchead'><b>{escape(r['symbol'])} · {escape(r['tf'])} · {escape(r['side'])}</b>{_tc_pill(r['outcome'])}<span class='muted'>placed {escape(str(r['created'])[:16])} UTC</span>"
+                    f"<form action='/admin/snap' method='post' style='display:inline' onsubmit='return confirm(&quot;Delete this chart?&quot;)'><input type='hidden' name='op' value='delete'><input type='hidden' name='id' value='{escape(r['skey'])}'><button class='btn' style='padding:4px 10px;font-size:11px;background:#dc2626'>Delete</button></form></div>"
+                    f"<div class='tcbox' data-k='{escape(r['skey'])}'></div></div>" for r in rows)
+    chips = "<div class='tcchips' id='tcchips'><button type='button' class='on' data-g=''>All</button><button type='button' data-g='pending'>Pending</button><button type='button' data-g='taken'>Taken</button><button type='button' data-g='expired'>Expired</button></div>"
+    return (TCHART_CSS + f"<div class='card' id='charts'><h2>Robot trade charts ({total})</h2><p class='muted' style='margin-bottom:4px'>A LIVE chart of every trade the robot takes, pending, taken or expired, drawn like MT5: drag to move it, scroll or pinch to zoom, double-click to go back to the trade. "
+            f"It shows the major break of structure (red box), the BOS line, the liquidity (boxed candle and a dot), the entry order block, and the entry, stop loss and take profit lines. "
+            f"Charts are removed automatically {days:g} day(s) after the trade last changed (<b>snapshot_days</b> in the settings below, 0 = do not keep charts).</p>"
+            + chips
+            + ("<form action='/admin/snap' method='post' onsubmit='return confirm(&quot;Delete all trade charts?&quot;)'><input type='hidden' name='op' value='all'><button class='btn' style='background:#dc2626'>Delete all charts</button></form>" if total else "")
+            + (items or "<p class='muted' style='margin-top:10px'>No trades yet. A chart appears here as soon as the robot takes a trade.</p>") + (f"<p class='muted'>Showing the latest 30 of {total}.</p>" if total > 30 else "")
+            + "</div><script>" + TCHART_JS + "(function(){var boxes=document.querySelectorAll('.tcbox');for(var i=0;i<boxes.length;i++){new TChart(boxes[i],{dataUrl:'/admin/chartdata/'+boxes[i].getAttribute('data-k'),pollMs:8000})}"
+            "var ch=document.getElementById('tcchips');if(ch)ch.addEventListener('click',function(e){var g=e.target.getAttribute('data-g');if(g===null)return;var bs=ch.querySelectorAll('button');for(var i=0;i<bs.length;i++)bs[i].className=bs[i].getAttribute('data-g')===g?'on':'';"
+            "var it=document.querySelectorAll('.tcitem');for(var j=0;j<it.length;j++)it[j].style.display=(!g||it[j].getAttribute('data-g')===g)?'':'none';window.dispatchEvent(new Event('resize'))})})();</script>")
 
 
 
@@ -1964,6 +2180,34 @@ def admin_snap():
     if op == "all": db.x("DELETE FROM snaps"); _flash("All trade pictures deleted.")
     elif op == "delete": db.x("DELETE FROM snaps WHERE skey=:k", k=request.form.get("id", "")); _flash("Picture deleted.")
     return redirect("/admin#charts")
+
+@app.route("/admin/chartdata/<skey>")
+@admin_only
+def admin_chartdata(skey):
+    """Everything one live trade chart needs: the candles (and the forming one), the live price, and the robot's trade with all its marks."""
+    hdr = {"Cache-Control": "no-store"}
+    r = db.one("SELECT * FROM snaps WHERE skey=:k", k=skey)
+    if not r: return jsonify(error="This chart was deleted."), 404, hdr
+    row = db.one("SELECT * FROM orders WHERE sig_key=:k AND symbol=:s ORDER BY CASE WHEN platform='SIGNAL' THEN 0 ELSE 1 END, created DESC LIMIT 1", k=r["sig_key"], s=r["symbol"])
+    if not row: return jsonify(error="The trade behind this chart is no longer stored."), 404, hdr
+    o, s = row_to_order(row), S(); sym = o["symbol"]; tf = o.get("tf") or s["timeframe"]
+    try: closed = candles_cached(sym, tf)
+    except Exception as e: return jsonify(error="Prices are unavailable right now: " + str(e)[:100]), 503, hdr
+    forming, bid = None, None
+    try: forming = live_market(sym, tf).get("forming")
+    except Exception: pass
+    try: bid = quote_cached(sym)[0]
+    except Exception: pass
+    closed = closed[-260:]
+    ft = int(o.get("found_t") or o.get("bos_t") or 0); taken = None
+    if o.get("outcome") in ("OPEN", "WIN", "LOSS") and "entry" in o:
+        bull = o["side"] == "BUY"
+        for x in closed:
+            if x["t"] > ft and ((x["l"] <= o["entry"]) if bull else (x["h"] >= o["entry"])): taken = x["t"]; break
+    keys = ("symbol", "tf", "side", "entry", "sl", "tp", "rr", "outcome", "status", "prot", "brk", "brk_t", "bos_t", "leg_t", "ob_t", "ob_hi", "ob_lo", "liq_t", "liquidity", "found_t", "last_t", "r", "sl_pips", "htf", "re_of", "grade", "time")
+    ov = {k: o.get(k) for k in keys}; ov["tf"] = tf
+    row_ = lambda x: [x["t"], x["o"], x["h"], x["l"], x["c"]]
+    return jsonify(candles=[row_(x) for x in closed], forming=row_(forming) if forming else None, bid=bid, o=ov, taken_t=taken, pip=pip_size(sym, o.get("entry") or 1), tfms=TF_MS(tf), ts=int(time.time())), 200, hdr
 
 def _warnings(s):
     w = []
@@ -3075,7 +3319,7 @@ def api_live():
     except ValueError: cv = 0
     return jsonify({"symbol": sym, "tf": tf, "tfms": TF_MS(tf), "cv": m["cv"], "candles": [cl(c) for c in m["closed"]] if cv != m["cv"] else None,
                     "forming": cl(m["forming"]) if m["forming"] else None, "bid": bid, "ask": ask,
-                    "setup": ({k: sig.get(k) for k in ("side", "entry", "sl", "tp", "rr", "liquidity", "session", "ob_hi", "ob_lo", "grade", "bias", "tf")} if sig else None),
+                    "setup": ({k: sig.get(k) for k in ("side", "entry", "sl", "tp", "rr", "liquidity", "session", "ob_hi", "ob_lo", "grade", "bias", "tf", "prot", "brk", "brk_t", "bos_t", "leg_t", "ob_t", "liq_t")} if sig else None),
                     "size": (dict(size_info(sym, sig["entry"], sig["sl"], bal * rp / 100 / fx), risk_amount=round(bal * rp / 100, 2)) if (sig and size_info(sym, sig["entry"], sig["sl"], 1.0)) else None), "currency": cc, "orders": mine,
                     "status": {"code": st[0], "text": st[1]}, "scan_age": age, "scan_every": SCAN_EVERY, "pick_tf": pick["tf"] if pick else None, "aplus": aplus}), 200, hdr
 
@@ -3267,10 +3511,10 @@ PAPER_TPL = """
 var CFG=@@CFG@@;function CUR(){return CFG.cur||''}
 var cnv=document.getElementById('pc'),ctx=cnv.getContext('2d'),dpr=1;
 var C=[],F=null,SF=null,bid=null,ask=null,setup=null,orders=[],cvn=0,cur=null,tgt=null,vis=80,off=0,hov=null,raf=0,lastTs=0,errmsg='',busy=false,busy2=false,T=null,SIG=[],tab='trade',states={},told={},first=true;
-var GREEN='#26a69a',RED='#ef5350',BLUE='#2962ff',GRID='#1e222d',TXT='#787b86',BG='#131722';
+var GREEN='#26a69a',RED='#ef5350',BLUE='#2962ff',GRID='#6a6a6a',TXT='#c8c8c8',BG='#000000';
 function $(i){return document.getElementById(i)}
 function esc(t){return String(t).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
-function dec(p){var a=Math.abs(p);return a>=100?2:a>=10?3:a>=1?4:a>=0.1?5:6}
+function dec(p){var a=Math.abs(p);return a>=1000?2:a>=10?3:a>=0.01?5:6}
 function fmt(p){if(p===null||p===undefined||isNaN(p))return '-';var d=dec(p);return Number(p).toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d})}
 function money(v){return Number(v||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}
 function sgn(v){var n=Number(v||0);return (n>0?'+':n<0?'-':'')+Math.abs(n).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}
@@ -3308,13 +3552,15 @@ function draw(){
  function Y(q){return padT+(hi-q)/(hi-lo)*ph}
  function P(y){return hi-(y-padT)/ph*(hi-lo)}
  ctx.lineWidth=1;ctx.font='11px system-ui,sans-serif';ctx.textBaseline='alphabetic';
- var step=(function(r){var e=Math.pow(10,Math.floor(Math.log10(r))),f=r/e;return (f<1.5?1:f<3?2:f<7?5:10)*e})((hi-lo)/6),cnt=0;
- for(p=Math.ceil(lo/step)*step;p<=hi&&cnt<24;p+=step,cnt++){var gy=Math.round(Y(p))+0.5;ctx.strokeStyle=GRID;ctx.beginPath();ctx.moveTo(0,gy);ctx.lineTo(pw,gy);ctx.stroke();ctx.fillStyle=TXT;ctx.fillText(fmt(p),pw+8,gy+4)}
+ var step=(function(r){var e=Math.pow(10,Math.floor(Math.log10(r))),f=r/e;return (f<1.5?1:f<3?2:f<7?5:10)*e})((hi-lo)/9),cnt=0;
+ for(p=Math.ceil(lo/step)*step;p<=hi&&cnt<40;p+=step,cnt++){var gy=Math.round(Y(p))+0.5;ctx.strokeStyle=GRID;ctx.setLineDash([2,4]);ctx.beginPath();ctx.moveTo(0,gy);ctx.lineTo(pw,gy);ctx.stroke();ctx.setLineDash([]);ctx.fillStyle=TXT;ctx.fillText(fmt(p),pw+8,gy+4)}
  var tk=Math.max(1,Math.ceil(100/slot));
- for(j=j0;j<=j1;j++){if(j%tk!==0)continue;var tx=Math.round(X(j))+0.5,d=new Date(A[j][0]);ctx.strokeStyle=GRID;ctx.beginPath();ctx.moveTo(tx,padT);ctx.lineTo(tx,h-padB);ctx.stroke();
+ for(j=j0;j<=j1;j++){if(j%tk!==0)continue;var tx=Math.round(X(j))+0.5,d=new Date(A[j][0]);ctx.strokeStyle=GRID;ctx.setLineDash([2,4]);ctx.beginPath();ctx.moveTo(tx,padT);ctx.lineTo(tx,h-padB);ctx.stroke();ctx.setLineDash([]);
   var day=(d.getHours()===0&&d.getMinutes()===0),lab=CFG.tfms>=86400000?d.toLocaleDateString(undefined,{day:'2-digit',month:'short'}):(day?d.toLocaleDateString(undefined,{day:'2-digit',month:'short'}):d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}));
   ctx.fillStyle=day?'#d1d4dc':TXT;ctx.textAlign='center';ctx.fillText(lab,clamp(tx,24,pw-24),h-8);ctx.textAlign='left'}
+ ctx.strokeStyle='#555';ctx.beginPath();ctx.moveTo(pw+0.5,0);ctx.lineTo(pw+0.5,h);ctx.moveTo(0,h-padB+0.5);ctx.lineTo(w,h-padB+0.5);ctx.stroke();
  ctx.save();ctx.beginPath();ctx.rect(0,0,pw,h-padB);ctx.clip();
+ if(setup&&setup.prot!=null&&setup.brk!=null){var sl_=idxAt(A,setup.leg_t),sx_=sl_>=0?X(sl_)-slot/2:0,sy1=Y(Math.max(setup.prot,setup.brk)),sy2=Y(Math.min(setup.prot,setup.brk));ctx.fillStyle='rgba(185,28,28,.07)';ctx.fillRect(sx_,sy1,pw-sx_+2,sy2-sy1);ctx.strokeStyle='#b91c1c';ctx.lineWidth=2;ctx.strokeRect(sx_,sy1,pw-sx_+2,sy2-sy1);ctx.lineWidth=1;ctx.font='bold 10px system-ui,sans-serif';ctx.fillStyle='#ef4444';ctx.fillText('MAJOR BREAK OF STRUCTURE',sx_+6,sy1+14)}
  orders.forEach(function(o){
   var ix=idxAt(A,o.t),x0=ix<0?0:clamp(X(ix)-slot/2,0,pw);
   if(o.outcome==='PENDING'||o.outcome==='OPEN'){
@@ -3322,11 +3568,13 @@ function draw(){
    ctx.fillStyle='rgba(239,83,80,.14)';ctx.fillRect(x0,Math.min(Y(o.entry),Y(o.sl)),pw-x0,Math.abs(Y(o.sl)-Y(o.entry)));
   }
  });
- if(setup&&setup.ob_hi&&setup.ob_lo){ctx.fillStyle='rgba(168,85,247,.16)';ctx.fillRect(0,Y(setup.ob_hi),pw,Math.max(2,Y(setup.ob_lo)-Y(setup.ob_hi)))}
+ if(setup&&setup.ob_hi&&setup.ob_lo){var oi_=idxAt(A,setup.ob_t),ox_=oi_>=0?X(oi_)-slot/2:0;ctx.fillStyle='rgba(168,85,247,.24)';ctx.fillRect(ox_,Y(setup.ob_hi),pw-ox_,Math.max(2,Y(setup.ob_lo)-Y(setup.ob_hi)));ctx.strokeStyle='#a855f7';ctx.strokeRect(ox_+0.5,Y(setup.ob_hi)+0.5,pw-ox_,Math.max(2,Y(setup.ob_lo)-Y(setup.ob_hi)));ctx.font='bold 10px system-ui,sans-serif';ctx.fillStyle='#c084fc';ctx.fillText('ENTRY ORDER BLOCK',Math.min(ox_+4,pw-ctx.measureText('ENTRY ORDER BLOCK').width-6),setup.side==='BUY'?Y(setup.ob_lo)+13:Y(setup.ob_hi)-5)}
  var bw=Math.max(1,Math.min(slot*0.7,18));
  for(j=j0;j<=j1;j++){var k=A[j],x=Math.round(X(j))+0.5,col=k[4]>=k[1]?GREEN:RED,yo=Y(k[1]),yc=Y(k[4]);
   ctx.strokeStyle=col;ctx.fillStyle=col;ctx.beginPath();ctx.moveTo(x,Y(k[2]));ctx.lineTo(x,Y(k[3]));ctx.stroke();
   ctx.fillRect(Math.round(x-bw/2),Math.round(Math.min(yo,yc)),Math.max(1,Math.round(bw)),Math.max(1,Math.round(Math.abs(yc-yo))))}
+ if(setup&&setup.brk!=null){var bk_=idxAt(A,setup.brk_t),bb_=idxAt(A,setup.bos_t);if(bb_>=0){var bx0=bk_>=0?X(bk_):0,by_=Y(setup.brk);ctx.strokeStyle='#fbbf24';ctx.lineWidth=3;ctx.beginPath();ctx.moveTo(bx0,by_);ctx.lineTo(X(bb_),by_);ctx.stroke();ctx.lineWidth=1;ctx.fillStyle='#fbbf24';ctx.beginPath();ctx.arc(X(bb_),by_,5.5,0,6.3);ctx.fill();ctx.font='bold 10px system-ui,sans-serif';ctx.fillText('BOS LINE '+fmt(setup.brk),bx0+6,by_+(setup.side==='BUY'?14:-6))}}
+ if(setup&&setup.liq_t){var lq_=idxAt(A,setup.liq_t);if(lq_>=0){var lk_=A[lq_],lcx=X(lq_),lw_=Math.max(slot,9);ctx.fillStyle='rgba(234,179,8,.18)';ctx.fillRect(lcx-lw_/2-2,Y(lk_[2])-3,lw_+4,Y(lk_[3])-Y(lk_[2])+6);ctx.strokeStyle='#eab308';ctx.lineWidth=2;ctx.strokeRect(lcx-lw_/2-2,Y(lk_[2])-3,lw_+4,Y(lk_[3])-Y(lk_[2])+6);ctx.lineWidth=1;var lly=setup.side==='BUY'?lk_[3]:lk_[2];ctx.fillStyle='#eab308';ctx.beginPath();ctx.arc(lcx,Y(lly),6,0,6.3);ctx.fill();ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.stroke();ctx.lineWidth=1;ctx.font='bold 10px system-ui,sans-serif';ctx.fillStyle='#eab308';ctx.fillText('LIQUIDITY',Math.min(lcx+10,pw-ctx.measureText('LIQUIDITY').width-6),setup.side==='BUY'?Y(lk_[2])-8:Y(lk_[3])+18)}}
  orders.forEach(function(o){
   if(o.outcome!=='WIN'&&o.outcome!=='LOSS')return;
   var a=idxAt(A,o.t),b=idxAt(A,o.end);if(a<0||b<0)return;
