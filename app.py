@@ -58,7 +58,7 @@ DEFAULTS = {
     "bos_body_pct": 50.0,           # the candle that breaks the structure must have a body of at least this % of its range; a weaker (wick-like) break needs one more candle closing beyond, and then pays exactly the minimum reward
     "crypto_pattern": True,         # crypto/futures only: with no liquidity, enter a tap of an order block only if the last 2-3 breaks in the trend all did exactly that
     "crypto_pattern_legs": 3, "crypto_pattern_min": 2,
-    "liq_inside_ob_pct": 50.0,      # an ORDER BLOCK (liquidity or entry) only needs this % inside the break of structure (it often straddles the broken level)
+    "liq_inside_ob_pct": 50.0,      # an ORDER BLOCK or WICK (liquidity or entry) only needs this % inside the break of structure (it often straddles the broken level)
     "liq_inside_pct": 70.0,         # the liquidity and the entry block must be at least this % inside the break of structure
     "liq_overlap_pct": 50.0,        # the liquidity may touch the entry block; only when it has covered this % of the block (or more) is the block skipped
     "reentry": True,                # after a stop loss with the protected level still unbroken, look for ONE re-entry (FVG / new order block / breaker / 5m MSS)
@@ -586,12 +586,14 @@ def _setup_core(c, s, tf, no_msg, sym, tp_fixed, n, bull, run, L):
     inside = lambda k: inside_frac(c[k]["l"], c[k]["h"], zlo, zhi) >= inpct - 1e-9
     # LIQUIDITY = the LAST order block (opposing candle) in the BOS leg right before the breakout; only if the last pullback WICK is used instead (no usable order block) it must also be inside the zone.
     obs = [k for k in range(origin, bos_i) if is_ob(c[k])]                     # real opposing candles inside the leg only
-    if bull: pivs = [k for k in range(origin + 1, bos_i) if c[k]["l"] <= c[k - 1]["l"] and c[k]["l"] <= c[k + 1]["l"]]       # last pullback low (a wick)
-    else:    pivs = [k for k in range(origin + 1, bos_i) if c[k]["h"] >= c[k - 1]["h"] and c[k]["h"] >= c[k + 1]["h"]]       # last pullback high (a wick)
+    tol_ = lambda k: 0.1 * (c[k]["h"] - c[k]["l"])                              # wicks at about the same level count together: a small tolerance on the neighbours
+    if bull: pivs = [k for k in range(origin + 1, bos_i) if c[k]["l"] <= c[k - 1]["l"] + tol_(k) and c[k]["l"] <= c[k + 1]["l"] + tol_(k)]       # pullback lows (wicks)
+    else:    pivs = [k for k in range(origin + 1, bos_i) if c[k]["h"] >= c[k - 1]["h"] - tol_(k) and c[k]["h"] >= c[k + 1]["h"] - tol_(k)]       # pullback highs (wicks)
     obpct = min(inpct, float(s.get("liq_inside_ob_pct", 50)) / 100)
     inside_ob = lambda k: inside_frac(c[k]["l"], c[k]["h"], zlo, zhi) >= obpct - 1e-9
-    ob_in, pv_in = [k for k in obs if inside_ob(k)], [k for k in pivs if inside(k)]
+    ob_in, pv_in = [k for k in obs if inside_ob(k)], [k for k in pivs if inside_ob(k)]      # blocks AND wicks only need about half inside the box; the latest one that is inside counts (the very last wick may sit outside)
     options = ([(ob_in[-1], "order_block")] if ob_in else []) + ([(pv_in[-1], "wick")] if pv_in else [])
+    options.sort(key=lambda x: -x[0])                                           # the liquidity is whatever sits CLOSEST to the break (a pullback wick after the last block beats that block; the block then becomes the entry)
     fail_msg = None
     if not options: fail_msg = f"no order block or wick that is at least {round(inpct * 100)}% inside the break of structure, so there is no liquidity to trade from"
     # ENTRY = the nearest valid ORDER BLOCK further back than the liquidity (above it for sells, below it for buys), inside the zone.
@@ -1365,14 +1367,13 @@ def snap_svg(o, candles):
         e.append(f"<rect x='{x0b:.1f}' y='{y1:.1f}' width='{pw - x0b:.1f}' height='{y2 - y1:.1f}' fill='rgba(220,38,38,.07)' stroke='#dc2626' stroke-width='2'/>")
         yb = Y(brk)
         e.append(f"<line x1='{x0b:.1f}' x2='{pw}' y1='{yb:.1f}' y2='{yb:.1f}' stroke='#f59e0b' stroke-width='1.4' stroke-dasharray='3 4'/>")
-        labels.append(tag(x0b + 6, y1 + 16, "MAJOR BREAK OF STRUCTURE (box)", "#ef4444", fs=11))
-        labels.append(tag(x0b + 6, (yb - 5) if not bull else (yb + 16), f"BOS LINE = broken level {_fp(brk)}", "#f59e0b"))
+        labels.append(tag(x0b + 6, y1 + 16, "BOS", "#ef4444", fs=10))
     sx = X(bi if bi is not None else max(0, len(w) - 8))
     ye, ys, yt = Y(o["entry"]), Y(o["sl"]), Y(o["tp"])
     e.append(f"<rect x='{sx:.1f}' y='{min(ye, yt):.1f}' width='{pw - sx:.1f}' height='{abs(yt - ye):.1f}' fill='rgba(38,166,154,.13)'/><rect x='{sx:.1f}' y='{min(ye, ys):.1f}' width='{pw - sx:.1f}' height='{abs(ys - ye):.1f}' fill='rgba(239,83,80,.13)'/>")
     if oi is not None and o.get("ob_hi") is not None:                                          # the entry order block
         y1, y2 = Y(o["ob_hi"]), Y(o["ob_lo"])
-        e.append(f"<rect x='{X(oi) - slot / 2:.1f}' y='{y1:.1f}' width='{pw - X(oi) + slot / 2:.1f}' height='{max(2.0, y2 - y1):.1f}' fill='rgba(168,85,247,.25)' stroke='#a855f7'/><text x='{X(oi):.1f}' y='{(y1 - 5) if not bull else (y2 + 13):.1f}' font-size='10' font-weight='700' fill='#c084fc'>ENTRY ORDER BLOCK</text>")
+        e.append(f"<rect x='{X(oi) - slot / 2:.1f}' y='{y1:.1f}' width='{pw - X(oi) + slot / 2:.1f}' height='{max(2.0, y2 - y1):.1f}' fill='rgba(168,85,247,.25)' stroke='#a855f7'/><text x='{X(oi):.1f}' y='{(y1 - 5) if not bull else (y2 + 13):.1f}' font-size='10' font-weight='700' fill='#c084fc'>OB</text>")
     bw = max(1.0, min(slot * 0.7, 9.0))
     for i, c in enumerate(w):
         col = "#26a69a" if c["c"] >= c["o"] else "#ef5350"; x = X(i)
@@ -1380,23 +1381,22 @@ def snap_svg(o, candles):
     for lab, v, col, y in (("TP", o["tp"], "#26a69a", yt), ("ENTRY", o["entry"], "#2962ff", ye), ("SL", o["sl"], "#ef5350", ys)):
         e.append(f"<line x1='0' x2='{pw}' y1='{y:.1f}' y2='{y:.1f}' stroke='{col}' stroke-width='1.6'/><rect x='{pw}' y='{y - 9:.1f}' width='{PR}' height='18' fill='{col}'/><text x='{pw + 5}' y='{y + 4:.1f}' font-size='10' font-weight='700' fill='#fff'>{lab} {_fp(v)}</text>")
     pp = pip_size(o.get("symbol"), o["entry"]) or 1e-4
-    labels.append(tag(6, yt - 6, f"TAKE PROFIT · {abs(o['tp'] - o['entry']) / pp:.1f} pips · 1:{o.get('rr', '')}", "#26a69a", fs=10))
-    labels.append(tag(6, ye - 6, f"ENTRY ({o['side'].lower()} limit)", "#6c9bff", fs=10))
-    labels.append(tag(6, ys + 16, f"STOP LOSS · {abs(o['sl'] - o['entry']) / pp:.1f} pips (just beyond the entry block)", "#ef5350", fs=10))
+    labels.append(tag(6, yt - 6, f"TP {abs(o['tp'] - o['entry']) / pp:.0f}p · 1:{o.get('rr', '')}", "#26a69a", fs=10))
+    labels.append(tag(6, ye - 6, "ENTRY", "#6c9bff", fs=10))
+    labels.append(tag(6, ys + 16, f"SL {abs(o['sl'] - o['entry']) / pp:.0f}p", "#ef5350", fs=10))
     if o.get("prot") is not None:                                                              # the protected high/low: if price CLOSES beyond it the idea is dead (it is not the stop loss)
         yp = Y(o["prot"])
         e.append(f"<line x1='0' x2='{pw}' y1='{yp:.1f}' y2='{yp:.1f}' stroke='#a1a1aa' stroke-width='1.2' stroke-dasharray='6 5'/>")
-        labels.append(tag(pw - 4, (yp + 15) if bull else (yp - 5), f"PROTECTED {'LOW' if bull else 'HIGH'} {_fp(o['prot'])} (idea dead if price closes beyond)", "#a1a1aa", "end", 9))
+        labels.append(tag(pw - 4, (yp + 15) if bull else (yp - 5), "PROT", "#a1a1aa", "end", 9))
     if ci is not None:                                                                         # the LIQUIDITY candle: boxed and labelled
         cx = X(ci); yt_, yb_ = Y(w[ci]["h"]), Y(w[ci]["l"]); bwx = max(slot, 9.0)
         e.append(f"<rect x='{cx - bwx / 2 - 2:.1f}' y='{yt_ - 3:.1f}' width='{bwx + 4:.1f}' height='{yb_ - yt_ + 6:.1f}' fill='rgba(234,179,8,.18)' stroke='#eab308' stroke-width='2.2'/>")
         ly = (yb_ + 22) if not bull else (yt_ - 14)
         e.append(f"<line x1='{cx:.1f}' x2='{cx:.1f}' y1='{(yb_ + 3) if not bull else (yt_ - 3):.1f}' y2='{(ly - 11) if not bull else (ly + 5):.1f}' stroke='#eab308' stroke-width='1.4'/>")
-        labels.append(tag(min(max(cx, 70), pw - 70), ly, "LIQUIDITY (last order block)" if o.get("liquidity") == "order_block" else "LIQUIDITY (wick)", "#eab308", "middle", 10))
+        labels.append(tag(min(max(cx, 70), pw - 70), ly, "LIQ", "#eab308", "middle", 10))
     if bi is not None:                                                                         # the candle that broke structure
         cx = X(bi); yy = Y(w[bi]["l"] if not bull else w[bi]["h"]); sgn = 1 if not bull else -1
         e.append(f"<line x1='{cx:.1f}' x2='{cx:.1f}' y1='{PT}' y2='{PT + ph}' stroke='#f59e0b' stroke-width='1' stroke-dasharray='2 4' opacity='.7'/>")
-        labels.append(tag(min(max(cx, 60), pw - 60), (yy + sgn * 16) if not bull else (yy - 8), "BOS: candle closed beyond", "#f59e0b", "middle", 10))
     if brk is not None and bi is not None:                                                     # THE BOS LINE: the broken level from the candle that made it to the candle that closed beyond it
         bk = idx(o.get("brk_t")); xs0 = X(bk if bk is not None else (li if li is not None else 0)); yb = Y(brk)
         e.append(f"<line x1='{xs0:.1f}' x2='{X(bi):.1f}' y1='{yb:.1f}' y2='{yb:.1f}' stroke='#fbbf24' stroke-width='3'/><circle cx='{xs0:.1f}' cy='{yb:.1f}' r='4' fill='#fbbf24'/><circle cx='{X(bi):.1f}' cy='{yb:.1f}' r='5.5' fill='#fbbf24' stroke='#fff' stroke-width='1.5'/>")
@@ -1408,7 +1408,7 @@ def snap_svg(o, candles):
         ti = next((i for i, x in enumerate(w) if x["t"] > ft_ and ((x["l"] <= o["entry"]) if bull else (x["h"] >= o["entry"]))), None)
         if ti is not None:
             e.append(f"<circle cx='{X(ti):.1f}' cy='{ye:.1f}' r='6.5' fill='#2962ff' stroke='#fff' stroke-width='2'/>")
-            labels.append(tag(min(max(X(ti), 70), pw - 70), ye + (-12 if not bull else 20), "TRADE TAKEN HERE (entry touched)", "#6c9bff", "middle", 10))
+            labels.append(tag(min(max(X(ti), 70), pw - 70), ye + (-12 if not bull else 20), "TAKEN", "#6c9bff", "middle", 10))
     elif o.get("outcome") == "PENDING":                                                        # not taken yet: how far price still has to travel to reach the entry
         lc = w[-1]["c"]; dist = abs(lc - o["entry"]) / pp; yl = Y(lc)
         e.append(f"<line x1='{pw - 14:.1f}' x2='{pw - 14:.1f}' y1='{yl:.1f}' y2='{ye:.1f}' stroke='#9aa4b2' stroke-width='1.5' stroke-dasharray='4 3'/><circle cx='{pw - 14:.1f}' cy='{yl:.1f}' r='3.5' fill='#fff'/>")
@@ -1501,7 +1501,7 @@ window.TChart=function(box,opt){
   ctx.setLineDash([]);ctx.strokeStyle='#555';ctx.beginPath();ctx.moveTo(pw+0.5,0);ctx.lineTo(pw+0.5,h);ctx.moveTo(0,h-padB+0.5);ctx.lineTo(w,h-padB+0.5);ctx.stroke();
   ctx.save();ctx.beginPath();ctx.rect(0,0,pw,h-padB);ctx.clip();
   var pills=[],compact=w<560;
-  function pill(x,y,txt,col,anchor,fs,prio,short){pills.push({x:x,y:y,t:(compact&&short)?short:txt,col:col,an:anchor||'start',fs:compact?9:(fs||10),pr:prio||5})}
+  function pill(x,y,txt,col,anchor,fs,prio,short){var tt=(short!==undefined)?short:txt;if(tt==='')return;pills.push({x:x,y:y,t:tt,col:col,an:anchor||'start',fs:compact?9:Math.min(fs||10,10),pr:prio||5})}
   function drawPills(){
    var boxes=[[0,0,320,padT+32]];
    function free(r){for(var i=0;i<boxes.length;i++){var b=boxes[i];if(r[0]<b[0]+b[2]+2&&r[0]+r[2]+2>b[0]&&r[1]<b[1]+b[3]+2&&r[1]+r[3]+2>b[1])return false}return true}
@@ -1527,12 +1527,12 @@ window.TChart=function(box,opt){
    if(o.prot!==null&&o.prot!==undefined&&brk!==null&&brk!==undefined&&isFinite(brk)){
     var yt=Y(Math.max(o.prot,brk)),yb=Y(Math.min(o.prot,brk));
     ctx.fillStyle='rgba(185,28,28,.07)';ctx.fillRect(xl,yt,pw-xl+2,yb-yt);ctx.strokeStyle=DARKRED;ctx.lineWidth=2;ctx.strokeRect(xl,yt,pw-xl+2,yb-yt);ctx.lineWidth=1;
-    pill(xl+6,yt+16,'MAJOR BREAK OF STRUCTURE','#ef4444','start',11,5,'MAJOR BOS');
+    pill(xl+6,yt+16,'BOS','#ef4444','start',11,5,'BOS');
    }
    // entry order block
-   if(oi>=0&&o.ob_hi!==null&&o.ob_hi!==undefined){var xo=X(oi)-slot/2,y1=Y(o.ob_hi),y2=Y(o.ob_lo);ctx.fillStyle='rgba(168,85,247,.24)';ctx.fillRect(xo,y1,pw-xo,Math.max(2,y2-y1));ctx.strokeStyle=PUR;ctx.strokeRect(xo+0.5,y1+0.5,pw-xo,Math.max(2,y2-y1));pill(xo+4,bull?y2+16:y1-5,'ENTRY ORDER BLOCK',PUR,'start',10,4,'ENTRY OB')}
+   if(oi>=0&&o.ob_hi!==null&&o.ob_hi!==undefined){var xo=X(oi)-slot/2,y1=Y(o.ob_hi),y2=Y(o.ob_lo);ctx.fillStyle='rgba(168,85,247,.24)';ctx.fillRect(xo,y1,pw-xo,Math.max(2,y2-y1));ctx.strokeStyle=PUR;ctx.strokeRect(xo+0.5,y1+0.5,pw-xo,Math.max(2,y2-y1));pill(xo+4,bull?y2+16:y1-5,'OB',PUR,'start',10,4,'OB')}
    // protected level
-   if(o.prot!==null&&o.prot!==undefined){var yp=Y(o.prot);ctx.strokeStyle='#a1a1aa';ctx.setLineDash([6,5]);ctx.beginPath();ctx.moveTo(0,yp);ctx.lineTo(pw,yp);ctx.stroke();ctx.setLineDash([]);pill(pw-4,bull?yp+16:yp-5,'PROTECTED '+(bull?'LOW ':'HIGH ')+fmt(o.prot),'#a1a1aa','end',9,6,'PROTECTED')}
+   if(o.prot!==null&&o.prot!==undefined){var yp=Y(o.prot);ctx.strokeStyle='#a1a1aa';ctx.setLineDash([6,5]);ctx.beginPath();ctx.moveTo(0,yp);ctx.lineTo(pw,yp);ctx.stroke();ctx.setLineDash([]);pill(pw-4,bull?yp+16:yp-5,'PROTECTED '+(bull?'LOW ':'HIGH ')+fmt(o.prot),'#a1a1aa','end',9,6,'PROT')}
   }
   // candles
   var bw=Math.max(1,Math.min(slot*0.7,18));
@@ -1544,14 +1544,14 @@ window.TChart=function(box,opt){
    // BOS line + dots
    if(brk!==null&&brk!==undefined&&isFinite(brk)&&bi>=0){var xb0=kb>=0?X(kb):(li>=0?X(li):0),yb2=Y(brk);ctx.strokeStyle=AMB;ctx.lineWidth=3;ctx.beginPath();ctx.moveTo(xb0,yb2);ctx.lineTo(X(bi),yb2);ctx.stroke();ctx.lineWidth=1;
     ctx.fillStyle=AMB;ctx.beginPath();ctx.arc(xb0,yb2,4,0,6.3);ctx.fill();ctx.beginPath();ctx.arc(X(bi),yb2,6,0,6.3);ctx.fill();ctx.strokeStyle='#fff';ctx.lineWidth=1.5;ctx.stroke();ctx.lineWidth=1;
-    pill(xb0+6,bull2?yb2+16:yb2-6,'BOS LINE '+fmt(brk),AMB,'start',10,7,'BOS LINE');
-    var ybc=bull2?Y(A[bi][2])-10:Y(A[bi][3])+22;pill(X(bi),ybc,'BOS: closed beyond',AMB,'middle',10,3,'BOS')}
+    pill(xb0+6,bull2?yb2+16:yb2-6,'',AMB,'start',10,7,'');
+    var ybc=bull2?Y(A[bi][2])-10:Y(A[bi][3])+22;pill(X(bi),ybc,'',AMB,'middle',10,3,'')}
    // liquidity: boxed candle + dot on the exact point
    if(ci>=0){var cx=X(ci),ytc=Y(A[ci][2]),ybc2=Y(A[ci][3]),bwx=Math.max(slot,9);ctx.fillStyle='rgba(234,179,8,.18)';ctx.fillRect(cx-bwx/2-2,ytc-3,bwx+4,ybc2-ytc+6);ctx.strokeStyle=YEL;ctx.lineWidth=2;ctx.strokeRect(cx-bwx/2-2,ytc-3,bwx+4,ybc2-ytc+6);ctx.lineWidth=1;
     var ly=bull2?A[ci][3]:A[ci][2];ctx.fillStyle=YEL;ctx.beginPath();ctx.arc(cx,Y(ly),6,0,6.3);ctx.fill();ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.stroke();ctx.lineWidth=1;
-    pill(cx,bull2?ytc-14:ybc2+24,o.liquidity==='order_block'?'LIQUIDITY (order block)':'LIQUIDITY (wick)',YEL,'middle',10,2,'LIQUIDITY')}
+    pill(cx,bull2?ytc-14:ybc2+24,'LIQ',YEL,'middle',10,2,'LIQ')}
    // taken dot / result dot
-   if(D.taken_t){var ti=idxAt(A,D.taken_t);if(ti>=0){ctx.fillStyle=BLUE;ctx.beginPath();ctx.arc(X(ti),Y(o.entry),7,0,6.3);ctx.fill();ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.stroke();ctx.lineWidth=1;pill(X(ti),Y(o.entry)+(bull2?22:-12),'TRADE TAKEN HERE','#6c9bff','middle',10,3,'TAKEN')}}
+   if(D.taken_t){var ti=idxAt(A,D.taken_t);if(ti>=0){ctx.fillStyle=BLUE;ctx.beginPath();ctx.arc(X(ti),Y(o.entry),7,0,6.3);ctx.fill();ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.stroke();ctx.lineWidth=1;pill(X(ti),Y(o.entry)+(bull2?22:-12),'TAKEN','#6c9bff','middle',10,3,'TAKEN')}}
    if((o.outcome==='WIN'||o.outcome==='LOSS')&&o.last_t){var ei=idxAt(A,o.last_t);if(ei>=0){var ye=o.outcome==='WIN'?o.tp:o.sl,cc=o.outcome==='WIN'?GREEN:RED;ctx.fillStyle=cc;ctx.beginPath();ctx.arc(X(ei),Y(ye),6,0,6.3);ctx.fill();ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.stroke();ctx.lineWidth=1}}
    // entry / sl / tp lines
    [[o.tp,GREEN,'TAKE PROFIT · '+(Math.abs(o.tp-o.entry)/pip).toFixed(1)+' pips · 1:'+o.rr,-6,'TP '+(Math.abs(o.tp-o.entry)/pip).toFixed(0)+'p · 1:'+o.rr],[o.entry,'#6c9bff','ENTRY ('+o.side.toLowerCase()+' limit)',-6,'ENTRY'],[o.sl,RED,'STOP LOSS · '+(Math.abs(o.sl-o.entry)/pip).toFixed(1)+' pips',16,'SL '+(Math.abs(o.sl-o.entry)/pip).toFixed(0)+'p']].forEach(function(l){var y=Math.round(Y(l[0]))+0.5;ctx.strokeStyle=l[1]===('#6c9bff')?BLUE:l[1];ctx.lineWidth=1.6;ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(pw,y);ctx.stroke();ctx.lineWidth=1;pill(6,y+l[3],l[2],l[1],'start',10,1,l[4])});
@@ -1700,6 +1700,13 @@ def find_reentry(o, c, get5, s):
     if m is not None:
         ext = min(x["l"] for x in c[si:m + 1]) if bull else max(x["h"] for x in c[si:m + 1])
         accept(c, "breaker", o["ob_lo"], o["ob_hi"], m, near(o["ob_lo"], o["ob_hi"]), (min(o["ob_lo"], ext) - buf) if bull else (max(o["ob_hi"], ext) + buf), tf)
+    for j in range(si - 1, 1, -1):                                                                                 # f) an EXISTING Fair Value Gap inside the zone that price has not filled yet
+        if c[j]["t"] < int(o.get("leg_t") or 0): break
+        if bull and c[j - 2]["h"] < c[j]["l"]: lo, hi = c[j - 2]["h"], c[j]["l"]
+        elif not bull and c[j - 2]["l"] > c[j]["h"]: lo, hi = c[j]["h"], c[j - 2]["l"]
+        else: continue
+        if (hi <= o["ob_lo"] and lo >= prot) if bull else (lo >= o["ob_hi"] and hi <= prot):
+            accept(c, "old_fvg", lo, hi, si, near(lo, hi), (lo - buf) if bull else (hi + buf), tf); break
     lt_, bt_ = int(o.get("leg_t") or 0), int(o.get("bos_t") or 0)                                                  # e) an EXISTING untapped order block further back, between the stopped block and the protected level
     for k in range(len(c) - 1, -1, -1):
         x = c[k]
@@ -3638,7 +3645,7 @@ function draw(){
   ctx.fillStyle=day?'#d1d4dc':TXT;ctx.textAlign='center';ctx.fillText(lab,clamp(tx,24,pw-24),h-8);ctx.textAlign='left'}
  ctx.strokeStyle='#555';ctx.beginPath();ctx.moveTo(pw+0.5,0);ctx.lineTo(pw+0.5,h);ctx.moveTo(0,h-padB+0.5);ctx.lineTo(w,h-padB+0.5);ctx.stroke();
  ctx.save();ctx.beginPath();ctx.rect(0,0,pw,h-padB);ctx.clip();
- if(setup&&setup.prot!=null&&setup.brk!=null){var sl_=idxAt(A,setup.leg_t),sx_=sl_>=0?X(sl_)-slot/2:0,sy1=Y(Math.max(setup.prot,setup.brk)),sy2=Y(Math.min(setup.prot,setup.brk));ctx.fillStyle='rgba(185,28,28,.07)';ctx.fillRect(sx_,sy1,pw-sx_+2,sy2-sy1);ctx.strokeStyle='#b91c1c';ctx.lineWidth=2;ctx.strokeRect(sx_,sy1,pw-sx_+2,sy2-sy1);ctx.lineWidth=1;ctx.font='bold 10px system-ui,sans-serif';ctx.fillStyle='#ef4444';ctx.fillText('MAJOR BREAK OF STRUCTURE',sx_+6,sy1+14)}
+ if(setup&&setup.prot!=null&&setup.brk!=null){var sl_=idxAt(A,setup.leg_t),sx_=sl_>=0?X(sl_)-slot/2:0,sy1=Y(Math.max(setup.prot,setup.brk)),sy2=Y(Math.min(setup.prot,setup.brk));ctx.fillStyle='rgba(185,28,28,.07)';ctx.fillRect(sx_,sy1,pw-sx_+2,sy2-sy1);ctx.strokeStyle='#b91c1c';ctx.lineWidth=2;ctx.strokeRect(sx_,sy1,pw-sx_+2,sy2-sy1);ctx.lineWidth=1;ctx.font='bold 10px system-ui,sans-serif';ctx.fillStyle='#ef4444';ctx.fillText('BOS',sx_+6,sy1+14)}
  orders.forEach(function(o){
   var ix=idxAt(A,o.t),x0=ix<0?0:clamp(X(ix)-slot/2,0,pw);
   if(o.outcome==='PENDING'||o.outcome==='OPEN'){
@@ -3646,13 +3653,13 @@ function draw(){
    ctx.fillStyle='rgba(239,83,80,.14)';ctx.fillRect(x0,Math.min(Y(o.entry),Y(o.sl)),pw-x0,Math.abs(Y(o.sl)-Y(o.entry)));
   }
  });
- if(setup&&setup.ob_hi&&setup.ob_lo){var oi_=idxAt(A,setup.ob_t),ox_=oi_>=0?X(oi_)-slot/2:0;ctx.fillStyle='rgba(168,85,247,.24)';ctx.fillRect(ox_,Y(setup.ob_hi),pw-ox_,Math.max(2,Y(setup.ob_lo)-Y(setup.ob_hi)));ctx.strokeStyle='#a855f7';ctx.strokeRect(ox_+0.5,Y(setup.ob_hi)+0.5,pw-ox_,Math.max(2,Y(setup.ob_lo)-Y(setup.ob_hi)));ctx.font='bold 10px system-ui,sans-serif';ctx.fillStyle='#c084fc';ctx.fillText('ENTRY ORDER BLOCK',Math.min(ox_+4,pw-ctx.measureText('ENTRY ORDER BLOCK').width-6),setup.side==='BUY'?Y(setup.ob_lo)+13:Y(setup.ob_hi)-5)}
+ if(setup&&setup.ob_hi&&setup.ob_lo){var oi_=idxAt(A,setup.ob_t),ox_=oi_>=0?X(oi_)-slot/2:0;ctx.fillStyle='rgba(168,85,247,.24)';ctx.fillRect(ox_,Y(setup.ob_hi),pw-ox_,Math.max(2,Y(setup.ob_lo)-Y(setup.ob_hi)));ctx.strokeStyle='#a855f7';ctx.strokeRect(ox_+0.5,Y(setup.ob_hi)+0.5,pw-ox_,Math.max(2,Y(setup.ob_lo)-Y(setup.ob_hi)));ctx.font='bold 10px system-ui,sans-serif';ctx.fillStyle='#c084fc';ctx.fillText('OB',Math.min(ox_+4,pw-ctx.measureText('OB').width-6),setup.side==='BUY'?Y(setup.ob_lo)+13:Y(setup.ob_hi)-5)}
  var bw=Math.max(1,Math.min(slot*0.7,18));
  for(j=j0;j<=j1;j++){var k=A[j],x=Math.round(X(j))+0.5,col=k[4]>=k[1]?GREEN:RED,yo=Y(k[1]),yc=Y(k[4]);
   ctx.strokeStyle=col;ctx.fillStyle=col;ctx.beginPath();ctx.moveTo(x,Y(k[2]));ctx.lineTo(x,Y(k[3]));ctx.stroke();
   ctx.fillRect(Math.round(x-bw/2),Math.round(Math.min(yo,yc)),Math.max(1,Math.round(bw)),Math.max(1,Math.round(Math.abs(yc-yo))))}
- if(setup&&setup.brk!=null){var bk_=idxAt(A,setup.brk_t),bb_=idxAt(A,setup.bos_t);if(bb_>=0){var bx0=bk_>=0?X(bk_):0,by_=Y(setup.brk);ctx.strokeStyle='#fbbf24';ctx.lineWidth=3;ctx.beginPath();ctx.moveTo(bx0,by_);ctx.lineTo(X(bb_),by_);ctx.stroke();ctx.lineWidth=1;ctx.fillStyle='#fbbf24';ctx.beginPath();ctx.arc(X(bb_),by_,5.5,0,6.3);ctx.fill();ctx.font='bold 10px system-ui,sans-serif';ctx.fillText('BOS LINE '+fmt(setup.brk),bx0+6,by_+(setup.side==='BUY'?14:-6))}}
- if(setup&&setup.liq_t){var lq_=idxAt(A,setup.liq_t);if(lq_>=0){var lk_=A[lq_],lcx=X(lq_),lw_=Math.max(slot,9);ctx.fillStyle='rgba(234,179,8,.18)';ctx.fillRect(lcx-lw_/2-2,Y(lk_[2])-3,lw_+4,Y(lk_[3])-Y(lk_[2])+6);ctx.strokeStyle='#eab308';ctx.lineWidth=2;ctx.strokeRect(lcx-lw_/2-2,Y(lk_[2])-3,lw_+4,Y(lk_[3])-Y(lk_[2])+6);ctx.lineWidth=1;var lly=setup.side==='BUY'?lk_[3]:lk_[2];ctx.fillStyle='#eab308';ctx.beginPath();ctx.arc(lcx,Y(lly),6,0,6.3);ctx.fill();ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.stroke();ctx.lineWidth=1;ctx.font='bold 10px system-ui,sans-serif';ctx.fillStyle='#eab308';ctx.fillText('LIQUIDITY',Math.min(lcx+10,pw-ctx.measureText('LIQUIDITY').width-6),setup.side==='BUY'?Y(lk_[2])-8:Y(lk_[3])+18)}}
+ if(setup&&setup.brk!=null){var bk_=idxAt(A,setup.brk_t),bb_=idxAt(A,setup.bos_t);if(bb_>=0){var bx0=bk_>=0?X(bk_):0,by_=Y(setup.brk);ctx.strokeStyle='#fbbf24';ctx.lineWidth=3;ctx.beginPath();ctx.moveTo(bx0,by_);ctx.lineTo(X(bb_),by_);ctx.stroke();ctx.lineWidth=1;ctx.fillStyle='#fbbf24';ctx.beginPath();ctx.arc(X(bb_),by_,5.5,0,6.3);ctx.fill();ctx.font='bold 10px system-ui,sans-serif';ctx.fillText('BOS',bx0+6,by_+(setup.side==='BUY'?14:-6))}}
+ if(setup&&setup.liq_t){var lq_=idxAt(A,setup.liq_t);if(lq_>=0){var lk_=A[lq_],lcx=X(lq_),lw_=Math.max(slot,9);ctx.fillStyle='rgba(234,179,8,.18)';ctx.fillRect(lcx-lw_/2-2,Y(lk_[2])-3,lw_+4,Y(lk_[3])-Y(lk_[2])+6);ctx.strokeStyle='#eab308';ctx.lineWidth=2;ctx.strokeRect(lcx-lw_/2-2,Y(lk_[2])-3,lw_+4,Y(lk_[3])-Y(lk_[2])+6);ctx.lineWidth=1;var lly=setup.side==='BUY'?lk_[3]:lk_[2];ctx.fillStyle='#eab308';ctx.beginPath();ctx.arc(lcx,Y(lly),6,0,6.3);ctx.fill();ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.stroke();ctx.lineWidth=1;ctx.font='bold 10px system-ui,sans-serif';ctx.fillStyle='#eab308';ctx.fillText('LIQ',Math.min(lcx+10,pw-ctx.measureText('LIQ').width-6),setup.side==='BUY'?Y(lk_[2])-8:Y(lk_[3])+18)}}
  orders.forEach(function(o){
   if(o.outcome!=='WIN'&&o.outcome!=='LOSS')return;
   var a=idxAt(A,o.t),b=idxAt(A,o.end);if(a<0||b<0)return;
